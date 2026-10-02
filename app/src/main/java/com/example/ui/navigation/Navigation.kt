@@ -18,6 +18,9 @@ sealed class Screen(val route: String, val title: String, val icon: ImageVector)
     object Settings : Screen("settings", "Settings", Icons.Default.Settings)
 
     companion object {
-        val bottomNavItems = listOf(Chat, Files, Changes, Providers, Analytics, Settings)
+        // Must be a getter: a stored val is built while the Screen base class is still initialising,
+        // which made the objects null (static initialisation cycle) and crashed on startup.
+        val bottomNavItems: List<Screen>
+            get() = listOf(Chat, Files, Changes, Providers, Analytics, Settings)
     }
 }
