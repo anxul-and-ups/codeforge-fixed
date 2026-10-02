@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">CodeForge</string>
+    <string name="channel_agent_name">Agent Execution</string>
+    <string name="channel_agent_desc">Notifications for ongoing agent tasks</string>
+    <string name="agent_running_title">CodeForge Agent Active</string>
+    <string name="agent_running_content">Processing repository and applying code edits…</string>
+</resources>

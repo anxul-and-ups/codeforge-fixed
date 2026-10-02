@@ -1,0 +1,766 @@
+package com.example.data.agent
+
+import android.content.Context
+import com.example.data.api.LlmMessage
+import com.example.data.api.LlmRequest
+import com.example.data.api.LlmResponse
+import com.example.data.api.LlmTool
+import com.example.data.api.LlmToolCall
+import com.example.data.local.dao.ConversationDao
+import com.example.data.local.dao.MessageDao
+import com.example.data.local.dao.UsageDao
+import com.example.data.local.entity.MessageEntity
+import com.example.data.local.entity.ToolStepEntity
+import com.example.data.repository.GitHubRepository
+import com.example.data.repository.ProjectRepository
+import com.example.data.repository.ProviderRepository
+import com.example.data.security.KeyStoreManager
+import com.example.data.service.AgentForegroundService
+import com.example.data.settings.SettingsStore
+import com.example.domain.model.FileNode
+import com.example.domain.model.ReasoningLevel
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.util.Calendar
+import java.util.UUID
+
+sealed class AgentEvent {
+    data class StatusUpdate(val statusText: String) : AgentEvent()
+    data class ToolStarted(val stepIndex: Int, val toolName: String, val argsJson: String) : AgentEvent()
+    data class ToolFinished(val stepIndex: Int, val toolName: String, val result: String, val isError: Boolean) : AgentEvent()
+    data class StreamingChunk(val text: String) : AgentEvent()
+    data class ReasoningChunk(val text: String) : AgentEvent()
+    object StreamingReset : AgentEvent()
+    data class FailoverNotice(val fromProvider: String, val toProvider: String, val reason: String) : AgentEvent()
+    data class Finished(val finalSummary: String, val totalSteps: Int) : AgentEvent()
+    data class Error(val error: String) : AgentEvent()
+}
+
+data class RunRequest(
+    val projectId: String,
+    val conversationId: String,
+    val userPrompt: String,
+    val imagesBase64: List<String> = emptyList(),
+    /** If true: skip the AI step and only push the project to GitHub, wait for the build and auto-fix. */
+    val pushOnly: Boolean = false
+)
+
+data class ApprovalRequest(val id: String, val toolName: String, val summary: String)
+
+private data class ToolResult(val text: String, val isError: Boolean = false, val changed: Boolean = false)
+
+private data class LoopResult(val ok: Boolean, val changed: Boolean, val summary: String)
+
+class AgentEngine(
+    private val appContext: Context,
+    private val scope: CoroutineScope,
+    private val projectRepository: ProjectRepository,
+    private val providerRepository: ProviderRepository,
+    private val gitHubRepository: GitHubRepository,
+    private val messageDao: MessageDao,
+    private val conversationDao: ConversationDao,
+    private val usageDao: UsageDao,
+    private val settings: SettingsStore
+) {
+    private val _agentEvents = MutableSharedFlow<AgentEvent>(extraBufferCapacity = 8192)
+    val agentEvents = _agentEvents.asSharedFlow()
+
+    private val _isRunning = MutableStateFlow(false)
+    val isRunning: StateFlow<Boolean> = _isRunning.asStateFlow()
+
+    private val _runningConversationId = MutableStateFlow<String?>(null)
+    val runningConversationId: StateFlow<String?> = _runningConversationId.asStateFlow()
+
+    private val _approvalRequest = MutableStateFlow<ApprovalRequest?>(null)
+    val approvalRequest: StateFlow<ApprovalRequest?> = _approvalRequest.asStateFlow()
+
+    private var pendingDecision: CompletableDeferred<Boolean>? = null
+    private var job: Job? = null
+
+    fun start(request: RunRequest) {
+        if (_isRunning.value) return
+        _isRunning.value = true
+        _runningConversationId.value = request.conversationId
+        AgentForegroundService.startService(appContext, "Agent is working…")
+        job = scope.launch {
+            try {
+                runFull(request)
+            } catch (e: CancellationException) {
+                // user stopped the run; message finalised inside the loop
+            } catch (e: Exception) {
+                _agentEvents.tryEmit(AgentEvent.Error(e.message ?: e.javaClass.simpleName))
+            } finally {
+                withContext(NonCancellable) {
+                    _approvalRequest.value = null
+                    pendingDecision = null
+                    _isRunning.value = false
+                    _runningConversationId.value = null
+                    AgentForegroundService.stopService(appContext)
+                }
+            }
+        }
+    }
+
+    fun stop() {
+        job?.cancel()
+    }
+
+    fun resolveApproval(approved: Boolean) {
+        pendingDecision?.complete(approved)
+    }
+
+    private fun status(text: String) {
+        _agentEvents.tryEmit(AgentEvent.StatusUpdate(text))
+        AgentForegroundService.updateStatus(appContext, text)
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Top level run
+    // ---------------------------------------------------------------------------------------
+
+    private suspend fun runFull(req: RunRequest) {
+        var changed = false
+        var summary = ""
+        if (!req.pushOnly) {
+            val result = runAgentLoop(req, req.userPrompt, req.imagesBase64)
+            changed = result.changed
+            summary = result.summary
+            if (!result.ok) return
+        } else {
+            changed = true
+            summary = "manual push"
+        }
+        val githubReady = settings.githubConfigured
+        if (req.pushOnly && !githubReady) {
+            postNote(req.conversationId, "⚠️ GitHub is not configured. Add repository and token in Settings.")
+            _agentEvents.tryEmit(AgentEvent.Finished("GitHub not configured", 0))
+            return
+        }
+        if (githubReady && (req.pushOnly || (settings.autoPushBuild && changed))) {
+            buildAndFix(req, summary)
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // GitHub: push -> wait for build -> auto-fix loop
+    // ---------------------------------------------------------------------------------------
+
+    private suspend fun buildAndFix(req: RunRequest, summaryHint: String) {
+        val pat = settings.githubToken
+        val repo = settings.githubRepo
+        val branch = settings.githubBranch
+        val maxAttempts = settings.maxBuildFixAttempts
+        var attempt = 0
+
+        while (true) {
+            status("Pushing changes to GitHub…")
+            val push = try {
+                val files = projectRepository.listFilesForPush(req.projectId)
+                val deleted = projectRepository.computeDiffsFromLastCheckpoint(req.projectId)
+                    .filter { it.isDeletedFile }.map { it.filePath.replace('\\', '/') }.toSet()
+                gitHubRepository.pushProject(
+                    pat, repo, branch, files, deleted,
+                    "CodeForge: ${summaryHint.lineSequence().firstOrNull().orEmpty().take(60).ifBlank { "update" }}"
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                postNote(req.conversationId, "⚠️ GitHub push failed: ${e.message}")
+                _agentEvents.tryEmit(AgentEvent.Finished("Push failed", 0))
+                return
+            }
+            if (push.noChanges) {
+                postNote(req.conversationId, "ℹ️ Nothing to push: the GitHub repo already matches this project.")
+                _agentEvents.tryEmit(AgentEvent.Finished("No changes to push", 0))
+                return
+            }
+            status("Pushed ${push.changedFiles} file(s). Waiting for the build…")
+            val run = gitHubRepository.waitForRun(pat, repo, push.commitSha) { status(it) }
+            val short = push.commitSha.take(7)
+            if (run == null) {
+                postNote(
+                    req.conversationId,
+                    "⚠️ Pushed commit $short, but no GitHub Actions run was found. Make sure `.github/workflows/build.yml` triggers `on: push` for branch `$branch`."
+                )
+                _agentEvents.tryEmit(AgentEvent.Finished("No build run found", 0))
+                return
+            }
+            if (run.conclusion == "success") {
+                postNote(
+                    req.conversationId,
+                    "✅ GitHub build succeeded for commit $short.\nDownload the APK from the Artifacts section: ${run.htmlUrl}"
+                )
+                _agentEvents.tryEmit(AgentEvent.Finished("Build succeeded", 0))
+                return
+            }
+            if (run.conclusion != "failure") {
+                postNote(req.conversationId, "ℹ️ Build finished with status: ${run.conclusion ?: run.status}. ${run.htmlUrl}")
+                _agentEvents.tryEmit(AgentEvent.Finished("Build ${run.conclusion}", 0))
+                return
+            }
+
+            attempt++
+            if (attempt > maxAttempts) {
+                postNote(
+                    req.conversationId,
+                    "❌ Build is still failing after $maxAttempts auto-fix attempt(s). Last run: ${run.htmlUrl}\nTell me what to try next, or send me the error."
+                )
+                _agentEvents.tryEmit(AgentEvent.Finished("Build still failing", 0))
+                return
+            }
+
+            status("Build failed. Reading the error log…")
+            val log = gitHubRepository.fetchFailureLog(pat, repo, run.id)
+            insertUserNote(req.conversationId, "🔧 GitHub build failed (attempt $attempt/$maxAttempts). Auto-fixing from the build log…")
+            val prompt = "The GitHub Actions build FAILED after the last changes. Fix the compile/build errors.\n\n" +
+                "Build log (errors extracted):\n```\n$log\n```\n\n" +
+                "Read the affected files first, fix the root cause with minimal edits, and call finish when done."
+            val result = runAgentLoop(req, prompt, emptyList())
+            if (!result.ok) return
+            if (!result.changed) {
+                postNote(req.conversationId, "⚠️ The AI made no file changes for this build error, so I stopped. Last run: ${run.htmlUrl}")
+                return
+            }
+        }
+    }
+
+    private suspend fun postNote(conversationId: String, text: String) {
+        messageDao.insertMessage(
+            MessageEntity(
+                id = UUID.randomUUID().toString(),
+                conversationId = conversationId,
+                sender = "ASSISTANT",
+                content = text,
+                status = "SUCCESS"
+            )
+        )
+        touchConversation(conversationId)
+    }
+
+    private suspend fun insertUserNote(conversationId: String, text: String) {
+        messageDao.insertMessage(
+            MessageEntity(
+                id = UUID.randomUUID().toString(),
+                conversationId = conversationId,
+                sender = "USER",
+                content = text,
+                status = "SUCCESS"
+            )
+        )
+    }
+
+    private suspend fun touchConversation(conversationId: String) {
+        val c = conversationDao.getConversationById(conversationId) ?: return
+        conversationDao.updateConversation(c.copy(updatedAt = System.currentTimeMillis()))
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The agent loop
+    // ---------------------------------------------------------------------------------------
+
+    private suspend fun loadHistory(conversationId: String): List<LlmMessage> {
+        val all = messageDao.getMessagesForConversationOnce(conversationId)
+            .filter { (it.sender == "USER" || it.sender == "ASSISTANT") && it.content.isNotBlank() && it.status != "STREAMING" && it.status != "ERROR" }
+            .toMutableList()
+        // The newest USER message is the prompt of this run (added by the UI) - it is sent separately.
+        if (all.isNotEmpty() && all.last().sender == "USER") all.removeAt(all.size - 1)
+
+        val picked = ArrayList<MessageEntity>()
+        var chars = 0
+        for (m in all.asReversed()) {
+            if (picked.size >= 30 || chars > 40_000) break
+            picked.add(m)
+            chars += m.content.length
+        }
+        picked.reverse()
+        return picked
+            .map { LlmMessage(role = if (it.sender == "USER") "user" else "assistant", content = it.content.take(6000)) }
+            .dropWhile { it.role == "assistant" }
+    }
+
+    private fun startOfMonth(): Long {
+        val c = Calendar.getInstance()
+        c.set(Calendar.DAY_OF_MONTH, 1)
+        c.set(Calendar.HOUR_OF_DAY, 0)
+        c.set(Calendar.MINUTE, 0)
+        c.set(Calendar.SECOND, 0)
+        c.set(Calendar.MILLISECOND, 0)
+        return c.timeInMillis
+    }
+
+    private fun resolveReasoning(setting: ReasoningLevel, prompt: String, step: Int, lastToolError: Boolean): ReasoningLevel {
+        if (setting != ReasoningLevel.AUTO) return setting
+        val p = prompt.lowercase()
+        val complex = prompt.length > 300 || listOf(
+            "bug", "error", "crash", "fix", "refactor", "architecture", "build failed", "exception", "why", "not working"
+        ).any { p.contains(it) }
+        return when {
+            step == 1 && complex -> ReasoningLevel.HIGH
+            lastToolError -> ReasoningLevel.MEDIUM
+            complex -> ReasoningLevel.MEDIUM
+            prompt.length < 80 -> ReasoningLevel.LOW
+            else -> ReasoningLevel.MEDIUM
+        }
+    }
+
+    private fun buildSystemPrompt(projectName: String, projectPrompt: String?): String {
+        val sb = StringBuilder()
+        sb.append(
+            """
+You are CodeForge, an expert AI coding agent working inside an Android app on the user's phone. The user's project (ZIP) is "$projectName". You work like Claude Code: explore, understand, plan, edit, verify.
+
+WORKFLOW
+1. Explore first: use list_files and search_code, then read_file the relevant files. Never guess file contents or invent files.
+2. Make the smallest correct change. Prefer edit_file (exact unique match) over rewriting whole files. Use write_file only for new files or when a file must be fully replaced; for large files edit in several small edit_file calls so your output is not cut off.
+3. read_file output has line-number prefixes ("   12<tab>code"). The prefix is NOT part of the file: never include it in old_str/new_str.
+4. After editing, re-read the changed region to verify it is syntactically correct and imports/types are right.
+5. The project cannot be compiled on this device. Builds happen later on GitHub Actions, so be extremely careful about compile correctness (imports, nullability, signatures, brackets).
+6. If the user only asks a question or reports a bug without wanting changes yet, answer or investigate first; do not edit unless fixing is the clear intent.
+7. When completely done, call finish with a short summary of what you changed and why. Keep explanations concise.
+
+RULES
+- Paths are relative to the project root. Do not touch build output folders.
+- Never read or print secrets (.env, keystores, google-services.json). Those tools will refuse.
+- Earlier chat turns only contain text summaries, not file contents; files may have changed since. Re-read before editing.
+- If a tool returns an error, read the message, adjust, and retry differently. Do not repeat the same failing call.
+            """.trimIndent()
+        )
+        val global = settings.globalSystemPrompt.trim()
+        if (global.isNotEmpty()) sb.append("\n\nUSER INSTRUCTIONS (global):\n").append(global)
+        if (!projectPrompt.isNullOrBlank()) sb.append("\n\nPROJECT INSTRUCTIONS:\n").append(projectPrompt.trim())
+        val lang = settings.language
+        if (lang != "English") sb.append("\n\nReply to the user in $lang (keep code, identifiers and file paths unchanged).")
+        return sb.toString()
+    }
+
+    private suspend fun runAgentLoop(req: RunRequest, prompt: String, images: List<String>): LoopResult {
+        val project = projectRepository.getProject(req.projectId)
+        if (project == null) {
+            _agentEvents.tryEmit(AgentEvent.Error("Project not found. Select or import a project first."))
+            return LoopResult(false, false, "")
+        }
+
+        val history = loadHistory(req.conversationId)
+        val assistantId = UUID.randomUUID().toString()
+        messageDao.insertMessage(
+            MessageEntity(
+                id = assistantId,
+                conversationId = req.conversationId,
+                sender = "ASSISTANT",
+                content = "",
+                status = "STREAMING"
+            )
+        )
+
+        try {
+            projectRepository.createCheckpoint(req.projectId, "Before: ${prompt.lineSequence().firstOrNull().orEmpty().take(50)}")
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // continue without checkpoint
+        }
+
+        val systemPrompt = buildSystemPrompt(project.name, project.systemPrompt)
+        val messages = ArrayList<LlmMessage>(history)
+        messages.add(LlmMessage(role = "user", content = prompt, imagesBase64 = images))
+
+        val maxSteps = settings.maxSteps
+        val fullText = StringBuilder()
+        val reasoningAll = StringBuilder()
+        var totalPrompt = 0
+        var totalCompletion = 0
+        var totalCached = 0
+        var providerName: String? = null
+        var modelName: String? = null
+        var toolIndex = 0
+        var anyChange = false
+        var finishSummary: String? = null
+        var lastToolError = false
+        var errorText: String? = null
+        var hitStepLimit = false
+
+        try {
+            var step = 0
+            while (true) {
+                step++
+                if (step > maxSteps) {
+                    hitStepLimit = true
+                    break
+                }
+
+                if (settings.budgetHardStop && settings.monthlyBudgetUsd > 0) {
+                    val spent = usageDao.getCostSince(startOfMonth())
+                    if (spent >= settings.monthlyBudgetUsd) {
+                        errorText = "Monthly budget of $${"%.2f".format(settings.monthlyBudgetUsd)} reached (spent $${"%.2f".format(spent)}). " +
+                            "Increase the budget in Settings or turn off the hard stop."
+                        break
+                    }
+                }
+
+                status(if (step == 1) "Thinking…" else "Working (step $step)…")
+                val stepText = StringBuilder()
+                val level = resolveReasoning(settings.reasoningLevel, prompt, step, lastToolError)
+
+                val response: LlmResponse = providerRepository.executeWithFailover(
+                    projectId = req.projectId,
+                    conversationId = req.conversationId,
+                    request = LlmRequest(
+                        systemPrompt = systemPrompt,
+                        messages = messages,
+                        tools = toolsList,
+                        reasoningLevel = level
+                    ),
+                    onChunk = { t ->
+                        stepText.append(t)
+                        _agentEvents.tryEmit(AgentEvent.StreamingChunk(t))
+                    },
+                    onReasoning = { t -> _agentEvents.tryEmit(AgentEvent.ReasoningChunk(t)) },
+                    onFailoverNotice = { ev ->
+                        _agentEvents.tryEmit(AgentEvent.FailoverNotice(ev.fromProvider, ev.toProvider, ev.reason))
+                    },
+                    onAttempt = {
+                        stepText.clear()
+                        _agentEvents.tryEmit(AgentEvent.StreamingReset)
+                    }
+                )
+
+                totalPrompt += response.promptTokens
+                totalCompletion += response.completionTokens
+                totalCached += response.cachedTokens
+                providerName = response.providerUsed
+                modelName = response.modelUsed
+                if (!response.reasoning.isNullOrBlank()) {
+                    if (reasoningAll.isNotEmpty()) reasoningAll.append("\n\n")
+                    reasoningAll.append(response.reasoning)
+                }
+                if (response.content.isNotBlank()) {
+                    if (fullText.isNotEmpty()) fullText.append("\n\n")
+                    fullText.append(response.content.trim())
+                }
+
+                messages.add(
+                    LlmMessage(
+                        role = "assistant",
+                        content = response.content,
+                        toolCalls = response.toolCalls.ifEmpty { null },
+                        rawContentJson = response.rawContentJson,
+                        rawFormat = response.rawFormat
+                    )
+                )
+
+                if (response.toolCalls.isEmpty()) {
+                    val fr = (response.finishReason ?: "").lowercase()
+                    if ((fr == "max_tokens" || fr == "length") && response.content.isBlank()) {
+                        errorText = "The model ran out of output tokens before answering. Try a smaller request."
+                    }
+                    break
+                }
+
+                var finished = false
+                lastToolError = false
+                for (call in response.toolCalls) {
+                    toolIndex++
+                    val stepId = UUID.randomUUID().toString()
+                    _agentEvents.tryEmit(AgentEvent.ToolStarted(toolIndex, call.name, call.argumentsJson))
+                    status(describeCall(call))
+                    messageDao.insertToolStep(
+                        ToolStepEntity(
+                            id = stepId, messageId = assistantId, stepIndex = toolIndex,
+                            toolName = call.name, argumentsJson = call.argumentsJson,
+                            resultText = "", isError = false, status = "RUNNING", durationMs = 0L
+                        )
+                    )
+                    val t0 = System.currentTimeMillis()
+                    val result = if (call.name == "finish") {
+                        val s = try { JSONObject(call.argumentsJson).optString("summary") } catch (e: Exception) { "" }
+                        finishSummary = s
+                        finished = true
+                        ToolResult("Done.")
+                    } else {
+                        executeTool(req.projectId, call)
+                    }
+                    if (result.changed) anyChange = true
+                    if (result.isError) lastToolError = true
+                    messageDao.insertToolStep(
+                        ToolStepEntity(
+                            id = stepId, messageId = assistantId, stepIndex = toolIndex,
+                            toolName = call.name, argumentsJson = call.argumentsJson,
+                            resultText = result.text.take(4000), isError = result.isError,
+                            status = if (result.isError) "FAILED" else "COMPLETED",
+                            durationMs = System.currentTimeMillis() - t0
+                        )
+                    )
+                    _agentEvents.tryEmit(AgentEvent.ToolFinished(toolIndex, call.name, result.text.take(500), result.isError))
+                    messages.add(
+                        LlmMessage(
+                            role = "tool",
+                            content = result.text,
+                            toolCallId = call.id,
+                            toolName = call.name
+                        )
+                    )
+                }
+                if (finished) break
+            }
+        } catch (e: CancellationException) {
+            withContext(NonCancellable) {
+                finalizeMessage(
+                    assistantId, req.conversationId,
+                    (fullText.toString() + "\n\n⏹ Stopped by user.").trim(),
+                    reasoningAll.toString(), "SUCCESS", providerName, modelName, totalPrompt, totalCompletion, totalCached
+                )
+                _agentEvents.tryEmit(AgentEvent.Finished("Stopped", toolIndex))
+            }
+            throw e
+        } catch (e: Exception) {
+            val msg = e.message ?: e.javaClass.simpleName
+            finalizeMessage(
+                assistantId, req.conversationId,
+                (fullText.toString() + "\n\n⚠️ $msg").trim(),
+                reasoningAll.toString(), "ERROR", providerName, modelName, totalPrompt, totalCompletion, totalCached
+            )
+            _agentEvents.tryEmit(AgentEvent.Error(msg))
+            return LoopResult(false, anyChange, "")
+        }
+
+        val body = StringBuilder(fullText.toString())
+        val fs = finishSummary
+        if (!fs.isNullOrBlank() && !body.contains(fs.trim().take(40))) {
+            if (body.isNotEmpty()) body.append("\n\n")
+            body.append(fs.trim())
+        }
+        if (hitStepLimit) {
+            body.append("\n\n⏸ Reached the step limit ($maxSteps). Send \"continue\" to keep going, or raise the limit in Settings.")
+        }
+        errorText?.let { body.append("\n\n⚠️ ").append(it) }
+
+        finalizeMessage(
+            assistantId, req.conversationId, body.toString().trim().ifEmpty { "(no response)" },
+            reasoningAll.toString(), if (errorText != null) "ERROR" else "SUCCESS",
+            providerName, modelName, totalPrompt, totalCompletion, totalCached
+        )
+        _agentEvents.tryEmit(AgentEvent.Finished(fs ?: fullText.toString().take(200), toolIndex))
+        return LoopResult(errorText == null, anyChange, fs ?: fullText.toString())
+    }
+
+    private suspend fun finalizeMessage(
+        id: String, conversationId: String, content: String, reasoning: String, status: String,
+        provider: String?, model: String?, promptTokens: Int, completionTokens: Int, cached: Int
+    ) {
+        val existing = messageDao.getMessageById(id) ?: return
+        messageDao.updateMessage(
+            existing.copy(
+                content = content,
+                reasoning = reasoning.ifBlank { null },
+                status = status,
+                providerUsed = provider,
+                modelUsed = model,
+                promptTokens = promptTokens,
+                completionTokens = completionTokens,
+                cachedTokens = cached
+            )
+        )
+        touchConversation(conversationId)
+    }
+
+    private fun describeCall(call: LlmToolCall): String {
+        val a = try { JSONObject(call.argumentsJson) } catch (e: Exception) { JSONObject() }
+        return when (call.name) {
+            "list_files" -> "Listing ${a.optString("path", ".")}"
+            "read_file" -> "Reading ${a.optString("path")}"
+            "search_code" -> "Searching for “${a.optString("query").take(40)}”"
+            "edit_file" -> "Editing ${a.optString("path")}"
+            "write_file" -> "Writing ${a.optString("path")}"
+            "delete_file" -> "Deleting ${a.optString("path")}"
+            "move_file" -> "Moving ${a.optString("from_path")}"
+            "finish" -> "Finishing up…"
+            else -> "Running ${call.name}"
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Tools
+    // ---------------------------------------------------------------------------------------
+
+    private suspend fun awaitApproval(toolName: String, summary: String): Boolean {
+        if (!settings.safeMode) return true
+        val d = CompletableDeferred<Boolean>()
+        pendingDecision = d
+        _approvalRequest.value = ApprovalRequest(UUID.randomUUID().toString(), toolName, summary)
+        try {
+            return d.await()
+        } finally {
+            _approvalRequest.value = null
+            pendingDecision = null
+        }
+    }
+
+    private fun findNode(root: FileNode, path: String): FileNode? {
+        val clean = path.trim().removePrefix("./").trim('/').ifEmpty { "." }
+        if (clean == ".") return root
+        fun walk(n: FileNode): FileNode? {
+            if (n.path == clean) return n
+            for (c in n.children) {
+                val r = walk(c)
+                if (r != null) return r
+            }
+            return null
+        }
+        return walk(root)
+    }
+
+    private fun renderTree(node: FileNode, depth: Int, out: StringBuilder, counter: IntArray) {
+        for (child in node.children) {
+            if (counter[0] >= 500) return
+            counter[0]++
+            val indent = "  ".repeat(depth)
+            if (child.isDirectory) {
+                out.append(indent).append(child.name).append("/\n")
+                renderTree(child, depth + 1, out, counter)
+            } else {
+                out.append(indent).append(child.name).append("  (").append(child.sizeBytes).append(" B)\n")
+            }
+        }
+    }
+
+    private suspend fun executeTool(projectId: String, call: LlmToolCall): ToolResult {
+        val args = try {
+            JSONObject(if (call.argumentsJson.isBlank()) "{}" else call.argumentsJson)
+        } catch (e: Exception) {
+            return ToolResult(
+                "Error: tool arguments were not valid JSON (your output was probably cut off). " +
+                    "Retry with a smaller payload, e.g. several small edit_file calls instead of one huge write_file.",
+                isError = true
+            )
+        }
+        return try {
+            when (call.name) {
+                "list_files" -> {
+                    val root = projectRepository.getFileTree(projectId)
+                        ?: return ToolResult("Error: project folder not found", true)
+                    val path = args.optString("path", ".")
+                    val node = findNode(root, path) ?: return ToolResult("Error: path not found: $path", true)
+                    if (!node.isDirectory) return ToolResult("${node.path} is a file (${node.sizeBytes} B)")
+                    val sb = StringBuilder()
+                    val counter = intArrayOf(0)
+                    renderTree(node, 0, sb, counter)
+                    if (counter[0] >= 500) sb.append("\n[Listing truncated at 500 entries. Narrow with a sub-path.]")
+                    ToolResult(sb.toString().ifEmpty { "(empty directory)" })
+                }
+                "read_file" -> {
+                    val path = args.getString("path")
+                    if (KeyStoreManager.isPotentialSecretFile(path)) {
+                        return ToolResult("Blocked: $path looks like a secrets/credentials file and will not be read.", true)
+                    }
+                    val start = if (args.has("start_line")) args.optInt("start_line") else null
+                    val end = if (args.has("end_line")) args.optInt("end_line") else null
+                    ToolResult(projectRepository.readFile(projectId, path, start, end))
+                }
+                "search_code" -> {
+                    ToolResult(projectRepository.searchCode(projectId, args.getString("query"), args.optBoolean("regex", false)))
+                }
+                "edit_file" -> {
+                    val path = args.getString("path")
+                    if (!awaitApproval("edit_file", "Edit $path")) return ToolResult("The user denied this edit.", true)
+                    ToolResult(
+                        projectRepository.editFile(projectId, path, args.getString("old_str"), args.getString("new_str")),
+                        changed = true
+                    )
+                }
+                "write_file" -> {
+                    val path = args.getString("path")
+                    if (!awaitApproval("write_file", "Write file $path")) return ToolResult("The user denied this write.", true)
+                    ToolResult(projectRepository.writeFile(projectId, path, args.getString("content")), changed = true)
+                }
+                "delete_file" -> {
+                    val path = args.getString("path")
+                    if (!awaitApproval("delete_file", "Delete $path")) return ToolResult("The user denied this deletion.", true)
+                    ToolResult(projectRepository.deleteFile(projectId, path), changed = true)
+                }
+                "move_file" -> {
+                    val from = args.getString("from_path")
+                    val to = args.getString("to_path")
+                    if (!awaitApproval("move_file", "Move $from → $to")) return ToolResult("The user denied this move.", true)
+                    ToolResult(projectRepository.moveFile(projectId, from, to), changed = true)
+                }
+                else -> ToolResult("Error: unknown tool '${call.name}'", true)
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: org.json.JSONException) {
+            ToolResult("Error: missing or invalid argument (${e.message}). Check the tool schema and retry.", true)
+        } catch (e: Exception) {
+            ToolResult("Error: ${e.message ?: e.javaClass.simpleName}", true)
+        }
+    }
+
+    private val toolsList = listOf(
+        LlmTool(
+            name = "list_files",
+            description = "List files and folders under a relative directory path (use '.' for the project root). Large folders are truncated.",
+            parametersJsonSchema = """
+                {"type":"object","properties":{"path":{"type":"string","description":"Relative directory, e.g. '.' or 'app/src/main'"}},"required":["path"]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "read_file",
+            description = "Read a text file with line numbers. Optionally pass start_line/end_line (1-based). Long files are truncated unless a range is given.",
+            parametersJsonSchema = """
+                {"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "search_code",
+            description = "Search (case-insensitive) for text or a regex across all project text files. Returns path:line: match.",
+            parametersJsonSchema = """
+                {"type":"object","properties":{"query":{"type":"string"},"regex":{"type":"boolean","description":"Treat query as a regex"}},"required":["query"]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "edit_file",
+            description = "Replace ONE exact, unique occurrence of old_str with new_str in a file. old_str must match exactly (indentation included, without line-number prefixes) and be unique; include surrounding lines if needed.",
+            parametersJsonSchema = """
+                {"type":"object","properties":{"path":{"type":"string"},"old_str":{"type":"string"},"new_str":{"type":"string"}},"required":["path","old_str","new_str"]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "write_file",
+            description = "Create a new file or fully replace an existing one with the given content. For big files prefer several edit_file calls.",
+            parametersJsonSchema = """
+                {"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "delete_file",
+            description = "Delete a file or directory.",
+            parametersJsonSchema = """
+                {"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "move_file",
+            description = "Move or rename a file or directory.",
+            parametersJsonSchema = """
+                {"type":"object","properties":{"from_path":{"type":"string"},"to_path":{"type":"string"}},"required":["from_path","to_path"]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "finish",
+            description = "Call when the task is completely done. Provide a concise summary of what was changed and why.",
+            parametersJsonSchema = """
+                {"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}
+            """.trimIndent()
+        )
+    )
+}
