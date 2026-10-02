@@ -1,8 +1,8 @@
 package com.example.ui.screens.providers
 
 import android.widget.Toast
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -12,34 +12,26 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Dns
-import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
-import androidx.compose.material.icons.filled.NetworkCheck
-import androidx.compose.material.icons.filled.Visibility
-import androidx.compose.material.icons.filled.VisibilityOff
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -51,661 +43,684 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import com.example.data.local.entity.ProviderConfigEntity
 import com.example.data.repository.ProviderRepository
 import com.example.data.security.KeyStoreManager
-import com.example.ui.theme.CyberCyan
-import com.example.ui.theme.EmeraldSuccess
-import com.example.ui.theme.ForgeAmber
-import com.example.ui.theme.RoseError
+import com.example.ui.screens.chat.providerModels
+import com.example.ui.theme.AppColors
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
-import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
-import androidx.compose.material3.Surface
+
+private val PRESET_IDS = setOf("anthropic", "openai", "gemini", "deepseek", "groq", "openrouter", "mistral", "ollama")
 
 @Composable
 fun ProvidersScreen(
     providerRepository: ProviderRepository,
     modifier: Modifier = Modifier
 ) {
-    val context = LocalContext.current
-    val scope = rememberCoroutineScope()
     val providers by providerRepository.allProviders.collectAsState(initial = emptyList())
+    val scope = rememberCoroutineScope()
+    var editingId by remember { mutableStateOf<String?>(null) }
+    var showAdd by remember { mutableStateOf(false) }
 
-    var showAddCustomDialog by remember { mutableStateOf(false) }
-    var editingKeyProviderId by remember { mutableStateOf<String?>(null) }
-    var rawKeyInput by remember { mutableStateOf("") }
-    var keyVisible by remember { mutableStateOf(false) }
-
-    val testingState = remember { mutableStateMapOf<String, Boolean>() }
-    val testResult = remember { mutableStateMapOf<String, Boolean?>() }
-    val testError = remember { mutableStateMapOf<String, String?>() }
-    val fetchingState = remember { mutableStateMapOf<String, Boolean>() }
+    val editing = providers.firstOrNull { it.id == editingId }
 
     Column(
         modifier = modifier
             .fillMaxSize()
-            .background(Color(0xFF0B0F17))
+            .background(AppColors.bg)
     ) {
-        // Top Toolbar
-        Surface(
-            color = Color(0xFF111827),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 14.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Column {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            imageVector = Icons.Default.Dns,
-                            contentDescription = "Providers",
-                            tint = CyberCyan,
-                            modifier = Modifier.size(20.dp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "AI Providers & Failover",
-                            fontSize = 15.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = Color(0xFFF1F5F9)
-                        )
-                    }
+        Column(modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "Ordered by priority. Auto-switches on 429 rate limit or outage.",
-                        fontSize = 11.sp,
-                        color = Color(0xFF94A3B8)
+                        text = "Models & API keys",
+                        fontSize = 20.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = AppColors.textPrimary
+                    )
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = "Tap a provider to add its API key. They are used from top to bottom: when one hits a limit, the next takes over.",
+                        fontSize = 12.sp,
+                        lineHeight = 17.sp,
+                        color = AppColors.textSecondary
                     )
                 }
-
+                Spacer(modifier = Modifier.width(12.dp))
                 Button(
-                    onClick = { showAddCustomDialog = true },
-                    colors = ButtonDefaults.buttonColors(containerColor = CyberCyan),
-                    modifier = Modifier.height(34.dp)
-                ) {
-                    Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(14.dp), tint = Color(0xFF003549))
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("Custom", fontSize = 12.sp, color = Color(0xFF003549))
-                }
+                    onClick = { showAdd = true },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = AppColors.accent,
+                        contentColor = AppColors.onAccent
+                    )
+                ) { Text("Add", fontSize = 13.sp) }
             }
         }
 
-        // Failover Chain List
         LazyColumn(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(10.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             itemsIndexed(providers, key = { _, p -> p.id }) { index, provider ->
-                ProviderCard(
+                ProviderRow(
+                    index = index + 1,
                     provider = provider,
-                    isFirst = index == 0,
-                    isLast = index == providers.size - 1,
-                    isTesting = testingState[provider.id] == true,
-                    testSuccess = testResult[provider.id],
-                    testError = testError[provider.id],
-                    isFetching = fetchingState[provider.id] == true,
+                    canMoveUp = index > 0,
+                    canMoveDown = index < providers.size - 1,
+                    onClick = { editingId = provider.id },
                     onMoveUp = {
-                        val reordered = providers.map { it.id }.toMutableList()
-                        val item = reordered.removeAt(index)
-                        reordered.add(index - 1, item)
-                        scope.launch { providerRepository.reorderProviders(reordered) }
+                        val ids = providers.map { it.id }.toMutableList()
+                        val item = ids.removeAt(index)
+                        ids.add(index - 1, item)
+                        scope.launch { providerRepository.reorderProviders(ids) }
                     },
                     onMoveDown = {
-                        val reordered = providers.map { it.id }.toMutableList()
-                        val item = reordered.removeAt(index)
-                        reordered.add(index + 1, item)
-                        scope.launch { providerRepository.reorderProviders(reordered) }
-                    },
-                    onToggleEnabled = { enabled ->
-                        scope.launch { providerRepository.updateProvider(provider.copy(isEnabled = enabled)) }
-                    },
-                    onEditKey = {
-                        editingKeyProviderId = provider.id
-                        rawKeyInput = KeyStoreManager.decrypt(provider.encryptedApiKey)
-                        keyVisible = false
-                    },
-                    onTestConnection = {
-                        scope.launch {
-                            testingState[provider.id] = true
-                            testResult[provider.id] = null
-                            val error = providerRepository.testConnectionError(provider)
-                            testingState[provider.id] = false
-                            testResult[provider.id] = (error == null)
-                            testError[provider.id] = error
-                            Toast.makeText(
-                                context,
-                                if (error == null) "Connection OK!" else "Connection failed. See the error under the provider.",
-                                Toast.LENGTH_SHORT
-                            ).show()
-                        }
-                    },
-                    onFetchModels = {
-                        scope.launch {
-                            fetchingState[provider.id] = true
-                            try {
-                                val list = providerRepository.fetchModels(provider)
-                                if (list.isEmpty()) {
-                                    Toast.makeText(context, "The provider returned no models.", Toast.LENGTH_SHORT).show()
-                                } else {
-                                    val selected = if (provider.selectedModel in list) provider.selectedModel else list.first()
-                                    providerRepository.updateProvider(
-                                        provider.copy(modelsJson = JSONArray(list).toString(), selectedModel = selected)
-                                    )
-                                    Toast.makeText(context, "Loaded ${list.size} models. Tap one to select.", Toast.LENGTH_SHORT).show()
-                                }
-                            } catch (e: kotlinx.coroutines.CancellationException) {
-                                throw e
-                            } catch (e: Exception) {
-                                Toast.makeText(context, "Could not fetch models: ${e.message?.take(140)}", Toast.LENGTH_LONG).show()
-                            } finally {
-                                fetchingState[provider.id] = false
-                            }
-                        }
-                    },
-                    onSelectModel = { model ->
-                        scope.launch { providerRepository.updateProvider(provider.copy(selectedModel = model)) }
+                        val ids = providers.map { it.id }.toMutableList()
+                        val item = ids.removeAt(index)
+                        ids.add(index + 1, item)
+                        scope.launch { providerRepository.reorderProviders(ids) }
                     }
                 )
             }
+            item { Spacer(modifier = Modifier.height(24.dp)) }
         }
     }
 
-    // Edit API Key Dialog
-    if (editingKeyProviderId != null) {
-        val targetProvider = providers.find { it.id == editingKeyProviderId }
-        AlertDialog(
-            onDismissRequest = { editingKeyProviderId = null },
-            title = { Text("Configure API Key: ${targetProvider?.name}") },
-            text = {
-                Column {
-                    Text(
-                        "Stored securely with Android Keystore AES-GCM hardware encryption.",
-                        fontSize = 12.sp,
-                        color = Color(0xFF94A3B8),
-                        modifier = Modifier.padding(bottom = 8.dp)
-                    )
-                    OutlinedTextField(
-                        value = rawKeyInput,
-                        onValueChange = { rawKeyInput = it },
-                        label = { Text("API Key") },
-                        trailingIcon = {
-                            IconButton(onClick = { keyVisible = !keyVisible }) {
-                                Icon(
-                                    imageVector = if (keyVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
-                                    contentDescription = "Toggle visibility"
-                                )
-                            }
-                        },
-                        visualTransformation = if (keyVisible) androidx.compose.ui.text.input.VisualTransformation.None else androidx.compose.ui.text.input.PasswordVisualTransformation(),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        scope.launch {
-                            providerRepository.saveProviderApiKey(editingKeyProviderId!!, rawKeyInput.trim())
-                            editingKeyProviderId = null
-                            Toast.makeText(context, "API Key saved securely.", Toast.LENGTH_SHORT).show()
-                        }
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = CyberCyan)
-                ) {
-                    Text("Save Key", color = Color(0xFF003549))
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { editingKeyProviderId = null }) { Text("Cancel") }
-            }
+    if (editing != null) {
+        ProviderEditor(
+            provider = editing,
+            repo = providerRepository,
+            onDismiss = { editingId = null }
         )
     }
+    if (showAdd) {
+        AddProviderDialog(repo = providerRepository, onDismiss = { showAdd = false })
+    }
+}
 
-    // Add Custom Provider Dialog
-    if (showAddCustomDialog) {
-        var customName by remember { mutableStateOf("") }
-        var customUrl by remember { mutableStateOf("https://") }
-        var customFormat by remember { mutableStateOf("OPENAI") }
-        var customKey by remember { mutableStateOf("") }
-        var customModel by remember { mutableStateOf("default-model") }
-        var customHeaders by remember { mutableStateOf("") }
-        var customVision by remember { mutableStateOf(true) }
-        var customTools by remember { mutableStateOf(true) }
-        var customFetching by remember { mutableStateOf(false) }
-        var customModels by remember { mutableStateOf<List<String>>(emptyList()) }
-        var customError by remember { mutableStateOf<String?>(null) }
-        var customSaving by remember { mutableStateOf(false) }
+@Composable
+private fun ProviderRow(
+    index: Int,
+    provider: ProviderConfigEntity,
+    canMoveUp: Boolean,
+    canMoveDown: Boolean,
+    onClick: () -> Unit,
+    onMoveUp: () -> Unit,
+    onMoveDown: () -> Unit
+) {
+    val hasKey = provider.encryptedApiKey.isNotEmpty() || provider.id == "ollama"
+    val now = System.currentTimeMillis()
+    val cooling = provider.cooldownUntilTimestamp > now
+    val (statusText, statusColor) = when {
+        !provider.isEnabled -> Pair("Off", AppColors.textMuted)
+        !hasKey -> Pair("No API key", AppColors.textMuted)
+        cooling -> Pair("Paused · limit or error, back in ${(provider.cooldownUntilTimestamp - now) / 1000}s", AppColors.warn)
+        else -> Pair("Ready", AppColors.ok)
+    }
 
-        AlertDialog(
-            onDismissRequest = { showAddCustomDialog = false },
-            title = { Text("Add Custom Provider") },
-            text = {
-                Column(
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                    modifier = Modifier.verticalScroll(rememberScrollState())
-                ) {
-                    Text("API format", fontSize = 11.sp, color = Color(0xFF94A3B8))
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        for (fmt in listOf("OPENAI", "ANTHROPIC", "GEMINI")) {
-                            Surface(
-                                shape = RoundedCornerShape(6.dp),
-                                color = if (customFormat == fmt) CyberCyan else Color(0xFF1E293B),
-                                modifier = Modifier.clickable { customFormat = fmt }
-                            ) {
-                                Text(
-                                    text = fmt,
-                                    fontSize = 11.sp,
-                                    color = if (customFormat == fmt) Color(0xFF003549) else Color(0xFFCBD5E1),
-                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
-                                )
-                            }
-                        }
-                    }
-                    OutlinedTextField(
-                        value = customName,
-                        onValueChange = { customName = it },
-                        label = { Text("Provider Name (e.g. My LM Studio)") },
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    OutlinedTextField(
-                        value = customUrl,
-                        onValueChange = { customUrl = it },
-                        label = { Text("Base URL (e.g. https://host/v1 or http://localhost:1234/v1)") },
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    OutlinedTextField(
-                        value = customModel,
-                        onValueChange = { customModel = it },
-                        label = { Text("Model ID") },
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    OutlinedTextField(
-                        value = customKey,
-                        onValueChange = { customKey = it },
-                        label = { Text("API Key (optional for local)") },
-                        singleLine = true,
-                        visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    OutlinedTextField(
-                        value = customHeaders,
-                        onValueChange = { customHeaders = it },
-                        label = { Text("Custom headers JSON (optional)") },
-                        placeholder = { Text("{\"X-Header\": \"value\"}") },
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text("Supports images", fontSize = 12.sp)
-                        Switch(checked = customVision, onCheckedChange = { customVision = it })
-                    }
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text("Supports tool calling (required for the agent)", fontSize = 12.sp, modifier = Modifier.weight(1f))
-                        Switch(checked = customTools, onCheckedChange = { customTools = it })
-                    }
-                    TextButton(
-                        enabled = !customFetching && customUrl.length > 8,
-                        onClick = {
-                            scope.launch {
-                                customFetching = true
-                                try {
-                                    val temp = ProviderConfigEntity(
-                                        id = "temp",
-                                        name = customName,
-                                        baseUrl = customUrl.trim().trimEnd('/'),
-                                        apiFormat = customFormat,
-                                        encryptedApiKey = KeyStoreManager.encrypt(customKey.trim()),
-                                        modelsJson = "[]",
-                                        selectedModel = customModel,
-                                        priority = 0,
-                                        customHeadersJson = customHeaders.ifBlank { null }
-                                    )
-                                    customModels = providerRepository.fetchModels(temp)
-                                    if (customModels.isNotEmpty() && customModel in listOf("", "default-model")) {
-                                        customModel = customModels.first()
-                                    }
-                                    Toast.makeText(context, "Loaded ${customModels.size} models", Toast.LENGTH_SHORT).show()
-                                } catch (e: kotlinx.coroutines.CancellationException) {
-                                    throw e
-                                } catch (e: Exception) {
-                                    Toast.makeText(context, "Could not fetch models: ${e.message?.take(140)}", Toast.LENGTH_LONG).show()
-                                } finally {
-                                    customFetching = false
-                                }
-                            }
-                        }
-                    ) {
-                        Text(if (customFetching) "Fetching…" else "Fetch models from URL", fontSize = 12.sp, color = CyberCyan)
-                    }
-                    if (customError != null) {
-                        Text(customError ?: "", fontSize = 12.sp, color = RoseError)
-                    }
-                    if (customModels.isNotEmpty()) {
-                        LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            items(customModels) { m ->
-                                Surface(
-                                    shape = RoundedCornerShape(6.dp),
-                                    color = if (m == customModel) CyberCyan else Color(0xFF1E293B),
-                                    modifier = Modifier.clickable { customModel = m }
-                                ) {
-                                    Text(
-                                        text = m,
-                                        fontSize = 11.sp,
-                                        color = if (m == customModel) Color(0xFF003549) else Color(0xFFCBD5E1),
-                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            confirmButton = {
-                Button(
-                    enabled = !customSaving,
-                    onClick = {
-                        val url = customUrl.trim()
-                        val headersOk = customHeaders.isBlank() || try {
-                            JSONObject(customHeaders); true
-                        } catch (e: Exception) {
-                            false
-                        }
-                        when {
-                            customName.isBlank() -> customError = "Enter a name for the provider."
-                            !(url.startsWith("http://") || url.startsWith("https://")) || url.length < 10 ->
-                                customError = "Enter the full base URL, e.g. https://api.example.com/v1"
-                            customModel.isBlank() -> customError = "Enter a model name (or tap Fetch models)."
-                            !headersOk -> customError = "Custom headers must be valid JSON."
-                            else -> {
-                                customError = null
-                                customSaving = true
-                                scope.launch {
-                                    try {
-                                        providerRepository.addCustomProvider(
-                                            name = customName.trim(),
-                                            baseUrl = url,
-                                            apiFormat = customFormat,
-                                            rawApiKey = customKey.trim(),
-                                            models = (customModels.ifEmpty { listOf(customModel.trim()) }),
-                                            selectedModel = customModel.trim(),
-                                            customHeadersJson = customHeaders.ifBlank { null },
-                                            supportsVision = customVision,
-                                            supportsTools = customTools
-                                        )
-                                        Toast.makeText(context, "Provider added", Toast.LENGTH_SHORT).show()
-                                        showAddCustomDialog = false
-                                    } catch (e: kotlinx.coroutines.CancellationException) {
-                                        throw e
-                                    } catch (e: Exception) {
-                                        customError = "Could not save: ${e.message ?: e.javaClass.simpleName}"
-                                    } finally {
-                                        customSaving = false
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = CyberCyan)
-                ) {
-                    Text("Add Provider", color = Color(0xFF003549))
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showAddCustomDialog = false }) { Text("Cancel") }
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = AppColors.surface,
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(1.dp, AppColors.border, RoundedCornerShape(14.dp))
+            .clip(RoundedCornerShape(14.dp))
+            .clickable { onClick() }
+    ) {
+        Row(
+            modifier = Modifier.padding(start = 12.dp, top = 10.dp, bottom = 10.dp, end = 4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(28.dp)
+                    .clip(CircleShape)
+                    .background(AppColors.surfaceAlt),
+                contentAlignment = Alignment.Center
+            ) {
+                Text("$index", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = AppColors.textSecondary)
             }
+            Spacer(modifier = Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = provider.name,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = AppColors.textPrimary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = provider.selectedModel,
+                    fontSize = 12.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = AppColors.textSecondary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 3.dp)) {
+                    Box(
+                        modifier = Modifier
+                            .size(7.dp)
+                            .clip(CircleShape)
+                            .background(statusColor)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(statusText, fontSize = 11.sp, color = statusColor)
+                }
+            }
+            Column {
+                IconButton(onClick = onMoveUp, enabled = canMoveUp, modifier = Modifier.size(32.dp)) {
+                    Icon(
+                        Icons.Default.KeyboardArrowUp,
+                        contentDescription = "Move up",
+                        tint = if (canMoveUp) AppColors.textSecondary else AppColors.border
+                    )
+                }
+                IconButton(onClick = onMoveDown, enabled = canMoveDown, modifier = Modifier.size(32.dp)) {
+                    Icon(
+                        Icons.Default.KeyboardArrowDown,
+                        contentDescription = "Move down",
+                        tint = if (canMoveDown) AppColors.textSecondary else AppColors.border
+                    )
+                }
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------------
+// Shared form widgets
+// ------------------------------------------------------------------------------------------
+
+@Composable
+private fun fieldColors() = OutlinedTextFieldDefaults.colors(
+    focusedBorderColor = AppColors.accent,
+    unfocusedBorderColor = AppColors.border,
+    focusedLabelColor = AppColors.accent,
+    unfocusedLabelColor = AppColors.textMuted,
+    focusedTextColor = AppColors.textPrimary,
+    unfocusedTextColor = AppColors.textPrimary,
+    cursorColor = AppColors.accent,
+    focusedContainerColor = Color.Transparent,
+    unfocusedContainerColor = Color.Transparent,
+    focusedPlaceholderColor = AppColors.textMuted,
+    unfocusedPlaceholderColor = AppColors.textMuted
+)
+
+@Composable
+private fun FormField(
+    label: String,
+    value: String,
+    onChange: (String) -> Unit,
+    placeholder: String = "",
+    secret: Boolean = false,
+    mono: Boolean = false
+) {
+    var visible by remember { mutableStateOf(false) }
+    OutlinedTextField(
+        value = value,
+        onValueChange = onChange,
+        label = { Text(label) },
+        placeholder = if (placeholder.isNotEmpty()) ({ Text(placeholder, fontSize = 13.sp) }) else null,
+        singleLine = true,
+        visualTransformation = if (secret && !visible) PasswordVisualTransformation() else VisualTransformation.None,
+        trailingIcon = if (secret) ({
+            TextButton(onClick = { visible = !visible }) {
+                Text(if (visible) "Hide" else "Show", fontSize = 12.sp, color = AppColors.accent)
+            }
+        }) else null,
+        textStyle = androidx.compose.ui.text.TextStyle(
+            fontSize = 14.sp,
+            fontFamily = if (mono || secret) FontFamily.Monospace else FontFamily.Default
+        ),
+        colors = fieldColors(),
+        shape = RoundedCornerShape(12.dp),
+        modifier = Modifier.fillMaxWidth()
+    )
+}
+
+@Composable
+private fun SelectChip(text: String, selected: Boolean, onClick: () -> Unit) {
+    Surface(
+        shape = RoundedCornerShape(8.dp),
+        color = if (selected) AppColors.accentSoft else AppColors.surfaceAlt,
+        modifier = Modifier
+            .clip(RoundedCornerShape(8.dp))
+            .clickable { onClick() }
+    ) {
+        Text(
+            text = text,
+            fontSize = 12.sp,
+            fontFamily = FontFamily.Monospace,
+            color = if (selected) AppColors.accent else AppColors.textSecondary,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp)
         )
     }
 }
 
 @Composable
-fun ProviderCard(
-    provider: ProviderConfigEntity,
-    isFirst: Boolean,
-    isLast: Boolean,
-    isTesting: Boolean,
-    testSuccess: Boolean?,
-    testError: String?,
-    isFetching: Boolean,
-    onMoveUp: () -> Unit,
-    onMoveDown: () -> Unit,
-    onToggleEnabled: (Boolean) -> Unit,
-    onEditKey: () -> Unit,
-    onTestConnection: () -> Unit,
-    onFetchModels: () -> Unit,
-    onSelectModel: (String) -> Unit
-) {
-    val plainKey = remember(provider.encryptedApiKey) { KeyStoreManager.decrypt(provider.encryptedApiKey) }
-    val hasKey = plainKey.isNotEmpty() || provider.id == "ollama"
-    val isCoolingDown = provider.cooldownUntilTimestamp > System.currentTimeMillis()
+private fun SectionLabel(text: String) {
+    Text(
+        text = text,
+        fontSize = 12.sp,
+        fontWeight = FontWeight.SemiBold,
+        color = AppColors.textMuted,
+        modifier = Modifier.padding(top = 4.dp)
+    )
+}
 
-    Card(
-        shape = RoundedCornerShape(12.dp),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF111827)),
-        border = androidx.compose.foundation.BorderStroke(
-            1.dp,
-            if (isCoolingDown) ForgeAmber.copy(alpha = 0.5f) else Color(0xFF1F2937)
-        ),
-        modifier = Modifier.fillMaxWidth()
+// ------------------------------------------------------------------------------------------
+// Edit provider
+// ------------------------------------------------------------------------------------------
+
+@Composable
+private fun ProviderEditor(
+    provider: ProviderConfigEntity,
+    repo: ProviderRepository,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    val originalKey = remember(provider.id) { KeyStoreManager.decrypt(provider.encryptedApiKey) }
+    var keyText by remember(provider.id) { mutableStateOf(originalKey) }
+    var modelText by remember(provider.id) { mutableStateOf(provider.selectedModel) }
+    var urlText by remember(provider.id) { mutableStateOf(provider.baseUrl) }
+    var enabled by remember(provider.id) { mutableStateOf(provider.isEnabled) }
+    var modelList by remember(provider.id) { mutableStateOf(providerModels(provider)) }
+    var testing by remember { mutableStateOf(false) }
+    var fetching by remember { mutableStateOf(false) }
+    var testMessage by remember { mutableStateOf<String?>(null) }
+    var testOk by remember { mutableStateOf(false) }
+    var confirmDelete by remember { mutableStateOf(false) }
+
+    fun draft(): ProviderConfigEntity = provider.copy(
+        baseUrl = urlText.trim().trimEnd('/'),
+        selectedModel = modelText.trim(),
+        encryptedApiKey = KeyStoreManager.encrypt(keyText.trim())
+    )
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
     ) {
-        Column(modifier = Modifier.padding(12.dp)) {
-            // Header: Priority, Name, Enabled Switch
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
+        Surface(
+            shape = RoundedCornerShape(20.dp),
+            color = AppColors.surface,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 24.dp)
+                .heightIn(max = 640.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .verticalScroll(rememberScrollState())
+                    .padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    // Priority Badge
-                    Box(
-                        modifier = Modifier
-                            .size(24.dp)
-                            .background(CyberCyan.copy(alpha = 0.2f), RoundedCornerShape(4.dp)),
-                        contentAlignment = Alignment.Center
-                    ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(provider.name, fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = AppColors.textPrimary)
                         Text(
-                            text = "#${provider.priority}",
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = CyberCyan
+                            text = provider.apiFormat.lowercase().replaceFirstChar { it.uppercase() } + " API",
+                            fontSize = 12.sp,
+                            color = AppColors.textMuted
                         )
                     }
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Column {
-                        Text(
-                            text = provider.name,
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = Color(0xFFF1F5F9)
-                        )
-                        Text(
-                            text = provider.apiFormat,
-                            fontSize = 10.sp,
-                            color = Color(0xFF64748B)
-                        )
-                    }
-                }
-
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    // Up/Down reorder arrows
-                    IconButton(onClick = onMoveUp, enabled = !isFirst, modifier = Modifier.size(28.dp)) {
-                        Icon(Icons.Default.KeyboardArrowUp, contentDescription = "Move Up", tint = if (!isFirst) Color(0xFF94A3B8) else Color(0xFF334155))
-                    }
-                    IconButton(onClick = onMoveDown, enabled = !isLast, modifier = Modifier.size(28.dp)) {
-                        Icon(Icons.Default.KeyboardArrowDown, contentDescription = "Move Down", tint = if (!isLast) Color(0xFF94A3B8) else Color(0xFF334155))
-                    }
-                    Spacer(modifier = Modifier.width(4.dp))
                     Switch(
-                        checked = provider.isEnabled,
-                        onCheckedChange = onToggleEnabled,
+                        checked = enabled,
+                        onCheckedChange = { enabled = it },
                         colors = SwitchDefaults.colors(
-                            checkedThumbColor = CyberCyan,
-                            checkedTrackColor = CyberCyan.copy(alpha = 0.4f)
+                            checkedThumbColor = AppColors.onAccent,
+                            checkedTrackColor = AppColors.accent
                         )
                     )
                 }
-            }
 
-            Spacer(modifier = Modifier.height(8.dp))
-
-            // Models dropdown / chip
-            val modelsList = remember(provider.modelsJson) {
-                try {
-                    val arr = JSONArray(provider.modelsJson)
-                    List(arr.length()) { arr.getString(it) }
-                } catch (e: Exception) {
-                    listOf(provider.selectedModel)
-                }
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Text(
-                    text = "Model: ${provider.selectedModel}",
-                    fontSize = 12.sp,
-                    fontFamily = FontFamily.Monospace,
-                    color = Color(0xFFCBD5E1)
+                FormField(
+                    label = if (provider.id == "ollama") "API key (not needed for local)" else "API key",
+                    value = keyText,
+                    onChange = { keyText = it },
+                    placeholder = "Paste your key",
+                    secret = true
                 )
 
-                // Key configuration button
-                OutlinedButton(
-                    onClick = onEditKey,
-                    modifier = Modifier.height(28.dp)
-                ) {
-                    Text(
-                        text = if (plainKey.isNotEmpty()) "Key: ${KeyStoreManager.maskKey(plainKey)}" else if (hasKey) "Local (no key)" else "Set Key",
-                        fontSize = 11.sp,
-                        color = if (hasKey) EmeraldSuccess else ForgeAmber
-                    )
-                }
-            }
-
-            if (modelsList.size > 1) {
-                Spacer(modifier = Modifier.height(6.dp))
-                LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    items(modelsList) { m ->
-                        val sel = m == provider.selectedModel
-                        Surface(
-                            shape = RoundedCornerShape(6.dp),
-                            color = if (sel) CyberCyan else Color(0xFF1E293B),
-                            modifier = Modifier.clickable { onSelectModel(m) }
-                        ) {
-                            Text(
-                                text = m,
-                                fontSize = 11.sp,
-                                fontFamily = FontFamily.Monospace,
-                                color = if (sel) Color(0xFF003549) else Color(0xFFCBD5E1),
-                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
-                            )
+                SectionLabel("MODEL")
+                FormField(label = "Model name", value = modelText, onChange = { modelText = it }, mono = true)
+                if (modelList.isNotEmpty()) {
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        items(modelList) { m ->
+                            SelectChip(text = m, selected = m == modelText.trim(), onClick = { modelText = m })
                         }
                     }
                 }
-            }
+                TextButton(
+                    enabled = !fetching,
+                    onClick = {
+                        scope.launch {
+                            fetching = true
+                            try {
+                                val list = repo.fetchModels(draft())
+                                if (list.isEmpty()) {
+                                    Toast.makeText(context, "No models returned. Check the key and URL.", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    modelList = list
+                                    if (modelText.isBlank() || modelText.trim() !in list) modelText = list.first()
+                                    Toast.makeText(context, "Loaded ${list.size} models", Toast.LENGTH_SHORT).show()
+                                }
+                            } catch (e: kotlinx.coroutines.CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                Toast.makeText(context, "Could not load models: ${e.message?.take(140)}", Toast.LENGTH_LONG).show()
+                            } finally {
+                                fetching = false
+                            }
+                        }
+                    }
+                ) {
+                    Text(if (fetching) "Loading…" else "Load model list from provider", fontSize = 13.sp, color = AppColors.accent)
+                }
 
-            if (!provider.lastError.isNullOrBlank() && !isCoolingDown) {
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                    text = "Last error: ${provider.lastError}",
-                    fontSize = 10.sp,
-                    color = Color(0xFF94A3B8),
-                    maxLines = 3
-                )
-            }
+                SectionLabel("ADVANCED")
+                FormField(label = "Base URL", value = urlText, onChange = { urlText = it }, mono = true)
 
-            // Cooldown alert if rate limited
-            if (isCoolingDown) {
-                val remainingSec = (provider.cooldownUntilTimestamp - System.currentTimeMillis()) / 1000
-                Spacer(modifier = Modifier.height(4.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.Error, contentDescription = null, tint = ForgeAmber, modifier = Modifier.size(12.dp))
-                    Spacer(modifier = Modifier.width(4.dp))
+                OutlinedButton(
+                    enabled = !testing,
+                    onClick = {
+                        scope.launch {
+                            testing = true
+                            testMessage = null
+                            val err = repo.testConnectionError(draft())
+                            testOk = err == null
+                            testMessage = err ?: "Connection works"
+                            testing = false
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    if (testing) {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = AppColors.accent)
+                        Spacer(modifier = Modifier.width(8.dp))
+                    }
+                    Text("Test connection", color = AppColors.textPrimary)
+                }
+                if (testMessage != null) {
                     Text(
-                        text = "Temporarily skipped (limit/error). Auto-failover uses the next provider; retry in ${remainingSec}s.",
-                        fontSize = 11.sp,
-                        color = ForgeAmber
+                        text = testMessage ?: "",
+                        fontSize = 12.sp,
+                        color = if (testOk) AppColors.ok else AppColors.error
                     )
                 }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (provider.id !in PRESET_IDS) {
+                        TextButton(onClick = { confirmDelete = true }) {
+                            Text("Delete", color = AppColors.error)
+                        }
+                    }
+                    Spacer(modifier = Modifier.weight(1f))
+                    TextButton(onClick = onDismiss) { Text("Cancel", color = AppColors.textSecondary) }
+                    Button(
+                        onClick = {
+                            scope.launch {
+                                repo.updateProvider(
+                                    provider.copy(
+                                        baseUrl = urlText.trim().trimEnd('/'),
+                                        selectedModel = modelText.trim().ifEmpty { provider.selectedModel },
+                                        isEnabled = enabled,
+                                        modelsJson = JSONArray(modelList).toString(),
+                                        cooldownUntilTimestamp = 0L,
+                                        lastError = null
+                                    )
+                                )
+                                if (keyText.trim() != originalKey) repo.saveProviderApiKey(provider.id, keyText)
+                                Toast.makeText(context, "Saved", Toast.LENGTH_SHORT).show()
+                                onDismiss()
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = AppColors.accent,
+                            contentColor = AppColors.onAccent
+                        )
+                    ) { Text("Save") }
+                }
             }
+        }
+    }
 
-            Spacer(modifier = Modifier.height(6.dp))
+    if (confirmDelete) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = { Text("Delete provider?") },
+            text = { Text("${provider.name} and its saved API key will be removed.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    scope.launch {
+                        repo.deleteProvider(provider.id)
+                        confirmDelete = false
+                        onDismiss()
+                    }
+                }) { Text("Delete", color = AppColors.error) }
+            },
+            dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("Cancel") } }
+        )
+    }
+}
 
-            // Test connection row
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
+// ------------------------------------------------------------------------------------------
+// Add provider
+// ------------------------------------------------------------------------------------------
+
+@Composable
+private fun AddProviderDialog(
+    repo: ProviderRepository,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    var name by remember { mutableStateOf("") }
+    var format by remember { mutableStateOf("OPENAI") }
+    var url by remember { mutableStateOf("https://") }
+    var key by remember { mutableStateOf("") }
+    var model by remember { mutableStateOf("") }
+    var models by remember { mutableStateOf<List<String>>(emptyList()) }
+    var headers by remember { mutableStateOf("") }
+    var vision by remember { mutableStateOf(true) }
+    var tools by remember { mutableStateOf(true) }
+    var showAdvanced by remember { mutableStateOf(false) }
+    var fetching by remember { mutableStateOf(false) }
+    var saving by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Surface(
+            shape = RoundedCornerShape(20.dp),
+            color = AppColors.surface,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 24.dp)
+                .heightIn(max = 660.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .verticalScroll(rememberScrollState())
+                    .padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    if (isTesting) {
-                        CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp, color = CyberCyan)
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Testing ping…", fontSize = 11.sp, color = CyberCyan)
-                    } else if (testSuccess == true) {
-                        Icon(Icons.Default.CheckCircle, contentDescription = null, tint = EmeraldSuccess, modifier = Modifier.size(14.dp))
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("Connection Verified", fontSize = 11.sp, color = EmeraldSuccess)
-                    } else if (testSuccess == false) {
-                        Icon(Icons.Default.Error, contentDescription = null, tint = RoseError, modifier = Modifier.size(14.dp))
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("Connection Failed", fontSize = 11.sp, color = RoseError)
+                Text("Add provider", fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = AppColors.textPrimary)
+                Text(
+                    "Any service with an OpenAI-compatible, Anthropic or Gemini API.",
+                    fontSize = 12.sp,
+                    color = AppColors.textSecondary
+                )
+
+                FormField(label = "Name", value = name, onChange = { name = it }, placeholder = "e.g. My provider")
+
+                SectionLabel("API TYPE")
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    SelectChip("OpenAI-compatible", format == "OPENAI") { format = "OPENAI" }
+                    SelectChip("Anthropic", format == "ANTHROPIC") { format = "ANTHROPIC" }
+                    SelectChip("Gemini", format == "GEMINI") { format = "GEMINI" }
+                }
+
+                FormField(
+                    label = "Base URL",
+                    value = url,
+                    onChange = { url = it },
+                    placeholder = "https://api.example.com/v1",
+                    mono = true
+                )
+                FormField(label = "API key", value = key, onChange = { key = it }, placeholder = "Paste your key", secret = true)
+                FormField(label = "Model", value = model, onChange = { model = it }, placeholder = "model name", mono = true)
+
+                if (models.isNotEmpty()) {
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        items(models) { m -> SelectChip(text = m, selected = m == model.trim(), onClick = { model = m }) }
+                    }
+                }
+                TextButton(
+                    enabled = !fetching && url.trim().length > 10,
+                    onClick = {
+                        scope.launch {
+                            fetching = true
+                            error = null
+                            try {
+                                val temp = ProviderConfigEntity(
+                                    id = "temp",
+                                    name = name,
+                                    baseUrl = url.trim().trimEnd('/'),
+                                    apiFormat = format,
+                                    encryptedApiKey = KeyStoreManager.encrypt(key.trim()),
+                                    modelsJson = "[]",
+                                    selectedModel = model,
+                                    priority = 0,
+                                    customHeadersJson = headers.ifBlank { null }
+                                )
+                                models = repo.fetchModels(temp)
+                                if (models.isNotEmpty() && model.isBlank()) model = models.first()
+                                if (models.isEmpty()) error = "The provider returned no models."
+                            } catch (e: kotlinx.coroutines.CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                error = "Could not load models: ${e.message?.take(160)}"
+                            } finally {
+                                fetching = false
+                            }
+                        }
+                    }
+                ) {
+                    Text(if (fetching) "Loading…" else "Load model list from provider", fontSize = 13.sp, color = AppColors.accent)
+                }
+
+                TextButton(onClick = { showAdvanced = !showAdvanced }) {
+                    Text(if (showAdvanced) "Hide advanced" else "Advanced options", fontSize = 13.sp, color = AppColors.textSecondary)
+                }
+                if (showAdvanced) {
+                    FormField(
+                        label = "Custom headers (JSON, optional)",
+                        value = headers,
+                        onChange = { headers = it },
+                        placeholder = "{\"X-Header\": \"value\"}",
+                        mono = true
+                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Supports images", fontSize = 14.sp, color = AppColors.textPrimary, modifier = Modifier.weight(1f))
+                        Switch(checked = vision, onCheckedChange = { vision = it })
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Supports tool calling (needed by the agent)", fontSize = 14.sp, color = AppColors.textPrimary, modifier = Modifier.weight(1f))
+                        Switch(checked = tools, onCheckedChange = { tools = it })
                     }
                 }
 
-                TextButton(
-                    onClick = onFetchModels,
-                    enabled = !isFetching,
-                    modifier = Modifier.height(30.dp)
-                ) {
-                    Text(if (isFetching) "Fetching…" else "Fetch models", fontSize = 11.sp, color = CyberCyan)
+                if (error != null) {
+                    Text(error ?: "", fontSize = 12.sp, color = AppColors.error)
                 }
 
-                TextButton(
-                    onClick = onTestConnection,
-                    enabled = !isTesting,
-                    modifier = Modifier.height(30.dp)
-                ) {
-                    Icon(Icons.Default.NetworkCheck, contentDescription = null, modifier = Modifier.size(14.dp), tint = CyberCyan)
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("Test Connection", fontSize = 11.sp, color = CyberCyan)
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    TextButton(onClick = onDismiss) { Text("Cancel", color = AppColors.textSecondary) }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Button(
+                        enabled = !saving,
+                        onClick = {
+                            val u = url.trim()
+                            val headersOk = headers.isBlank() || try {
+                                JSONObject(headers)
+                                true
+                            } catch (e: Exception) {
+                                false
+                            }
+                            when {
+                                name.isBlank() -> error = "Enter a name."
+                                !(u.startsWith("http://") || u.startsWith("https://")) || u.length < 10 ->
+                                    error = "Enter the full base URL, for example https://api.example.com/v1"
+                                model.isBlank() -> error = "Enter a model name, or load the list from the provider."
+                                !headersOk -> error = "Custom headers must be valid JSON."
+                                else -> {
+                                    error = null
+                                    saving = true
+                                    scope.launch {
+                                        try {
+                                            repo.addCustomProvider(
+                                                name = name.trim(),
+                                                baseUrl = u,
+                                                apiFormat = format,
+                                                rawApiKey = key.trim(),
+                                                models = models.ifEmpty { listOf(model.trim()) },
+                                                selectedModel = model.trim(),
+                                                customHeadersJson = headers.ifBlank { null },
+                                                supportsVision = vision,
+                                                supportsTools = tools
+                                            )
+                                            Toast.makeText(context, "Provider added", Toast.LENGTH_SHORT).show()
+                                            onDismiss()
+                                        } catch (e: kotlinx.coroutines.CancellationException) {
+                                            throw e
+                                        } catch (e: Exception) {
+                                            error = "Could not save: ${e.message ?: e.javaClass.simpleName}"
+                                        } finally {
+                                            saving = false
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = AppColors.accent,
+                            contentColor = AppColors.onAccent
+                        )
+                    ) { Text("Add provider") }
                 }
-            }
-            if (testSuccess == false && !testError.isNullOrBlank()) {
-                Text(
-                    text = testError.take(300),
-                    fontSize = 10.sp,
-                    color = RoseError,
-                    modifier = Modifier.padding(top = 2.dp)
-                )
             }
         }
     }

@@ -1,6 +1,7 @@
 package com.example.ui.screens.analytics
 
 import android.content.Context
+import com.example.ui.theme.AppColors
 import android.content.Intent
 import android.net.Uri
 import android.widget.Toast
@@ -158,7 +159,7 @@ fun AnalyticsScreen(
     LazyColumn(
         modifier = modifier
             .fillMaxSize()
-            .background(Color(0xFF0B0F17))
+            .background(AppColors.bg)
             .padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
@@ -182,13 +183,13 @@ fun AnalyticsScreen(
                             text = "API Usage & Cost",
                             fontSize = 17.sp,
                             fontWeight = FontWeight.Bold,
-                            color = Color(0xFFF1F5F9)
+                            color = AppColors.textPrimary
                         )
                     }
                     Text(
                         text = "Real-time token counts, estimated spend, and failover tracking.",
                         fontSize = 11.sp,
-                        color = Color(0xFF94A3B8)
+                        color = AppColors.textSecondary
                     )
                 }
 
@@ -216,7 +217,7 @@ fun AnalyticsScreen(
                         label = { Text(p, fontSize = 11.sp) },
                         colors = FilterChipDefaults.filterChipColors(
                             selectedContainerColor = CyberCyan,
-                            selectedLabelColor = Color(0xFF003549)
+                            selectedLabelColor = AppColors.onAccent
                         )
                     )
                 }
@@ -254,7 +255,7 @@ fun AnalyticsScreen(
                         title = "Input Tokens",
                         value = formatTokenCount(totalInputTokens),
                         subtitle = "Sent to models",
-                        accentColor = Color(0xFF38BDF8),
+                        accentColor = AppColors.accent,
                         modifier = Modifier.weight(1f)
                     )
                     MetricBox(
@@ -278,9 +279,9 @@ fun AnalyticsScreen(
         // Budget Progress
         item {
             Card(
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF111827)),
+                colors = CardDefaults.cardColors(containerColor = AppColors.surface),
                 shape = RoundedCornerShape(12.dp),
-                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF1F2937)),
+                border = androidx.compose.foundation.BorderStroke(1.dp, AppColors.border),
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(modifier = Modifier.padding(12.dp)) {
@@ -289,7 +290,7 @@ fun AnalyticsScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("Monthly Budget Guard", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFFF1F5F9))
+                        Text("Monthly Budget Guard", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = AppColors.textPrimary)
                         Text("$${String.format(Locale.US, "%.2f", monthCost)} / $${String.format(Locale.US, "%.0f", monthlyBudget)}", fontSize = 12.sp, color = ForgeAmber)
                     }
                     Spacer(modifier = Modifier.height(6.dp))
@@ -300,7 +301,7 @@ fun AnalyticsScreen(
                             .fillMaxWidth()
                             .height(6.dp),
                         color = if (progress > 0.8f) RoseError else CyberCyan,
-                        trackColor = Color(0xFF1E293B)
+                        trackColor = AppColors.surfaceAlt
                     )
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -312,7 +313,7 @@ fun AnalyticsScreen(
                             TextButton(onClick = { monthlyBudget += 5.0 }) { Text("+$5", fontSize = 12.sp) }
                         }
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text("Hard stop", fontSize = 11.sp, color = Color(0xFF94A3B8))
+                            Text("Hard stop", fontSize = 11.sp, color = AppColors.textSecondary)
                             Spacer(modifier = Modifier.width(6.dp))
                             Switch(checked = hardStop, onCheckedChange = { hardStop = it })
                         }
@@ -320,7 +321,7 @@ fun AnalyticsScreen(
                     Text(
                         "Costs are estimates from the pricing table. This month's spend counts toward the budget.",
                         fontSize = 10.sp,
-                        color = Color(0xFF64748B)
+                        color = AppColors.textMuted
                     )
                     if (progress >= 0.8f) {
                         Spacer(modifier = Modifier.height(4.dp))
@@ -347,9 +348,9 @@ fun AnalyticsScreen(
             }
 
             Card(
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF111827)),
+                colors = CardDefaults.cardColors(containerColor = AppColors.surface),
                 shape = RoundedCornerShape(12.dp),
-                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF1F2937)),
+                border = androidx.compose.foundation.BorderStroke(1.dp, AppColors.border),
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(modifier = Modifier.padding(12.dp)) {
@@ -357,7 +358,7 @@ fun AnalyticsScreen(
                         text = "Token Usage by Provider",
                         fontSize = 13.sp,
                         fontWeight = FontWeight.SemiBold,
-                        color = Color(0xFFF1F5F9)
+                        color = AppColors.textPrimary
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     val maxVal = providerBreakdown.values.maxOrNull() ?: 1
@@ -367,7 +368,7 @@ fun AnalyticsScreen(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.SpaceBetween
                             ) {
-                                Text(prov, fontSize = 12.sp, color = Color(0xFFE2E8F0))
+                                Text(prov, fontSize = 12.sp, color = AppColors.textPrimary)
                                 Text("${formatTokenCount(tokens)} tokens", fontSize = 11.sp, color = CyberCyan)
                             }
                             Spacer(modifier = Modifier.height(2.dp))
@@ -377,7 +378,7 @@ fun AnalyticsScreen(
                                     .fillMaxWidth()
                                     .height(4.dp),
                                 color = CyberCyan,
-                                trackColor = Color(0xFF1E293B)
+                                trackColor = AppColors.surfaceAlt
                             )
                         }
                     }
@@ -392,9 +393,9 @@ fun AnalyticsScreen(
             }
 
             Card(
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF111827)),
+                colors = CardDefaults.cardColors(containerColor = AppColors.surface),
                 shape = RoundedCornerShape(12.dp),
-                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF1F2937)),
+                border = androidx.compose.foundation.BorderStroke(1.dp, AppColors.border),
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(modifier = Modifier.padding(12.dp)) {
@@ -407,7 +408,7 @@ fun AnalyticsScreen(
                             text = "Failover Events Log (${failovers.size})",
                             fontSize = 13.sp,
                             fontWeight = FontWeight.SemiBold,
-                            color = Color(0xFFF1F5F9)
+                            color = AppColors.textPrimary
                         )
                     }
 
@@ -416,7 +417,7 @@ fun AnalyticsScreen(
                         Text(
                             text = "No failovers occurred. All primary provider requests succeeded.",
                             fontSize = 11.sp,
-                            color = Color(0xFF64748B)
+                            color = AppColors.textMuted
                         )
                     } else {
                         Spacer(modifier = Modifier.height(8.dp))
@@ -424,7 +425,7 @@ fun AnalyticsScreen(
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .background(Color(0xFF1E293B), RoundedCornerShape(6.dp))
+                                    .background(AppColors.surfaceAlt, RoundedCornerShape(6.dp))
                                     .padding(8.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
@@ -435,13 +436,13 @@ fun AnalyticsScreen(
                                         text = f.failoverReason ?: "Automatic failover",
                                         fontSize = 11.sp,
                                         fontWeight = FontWeight.Medium,
-                                        color = Color(0xFFFDE68A)
+                                        color = AppColors.warn
                                     )
                                     val dateStr = SimpleDateFormat("MMM dd, HH:mm", Locale.getDefault()).format(Date(f.timestamp))
                                     Text(
                                         text = "$dateStr • Switched to ${f.providerName} (${f.model})",
                                         fontSize = 10.sp,
-                                        color = Color(0xFF94A3B8)
+                                        color = AppColors.textSecondary
                                     )
                                 }
                             }
@@ -458,7 +459,7 @@ fun AnalyticsScreen(
                 text = "UNDERSTANDING TOKENS & BILLING",
                 fontSize = 11.sp,
                 fontWeight = FontWeight.Bold,
-                color = Color(0xFF64748B),
+                color = AppColors.textMuted,
                 modifier = Modifier.padding(top = 8.dp)
             )
         }
@@ -503,12 +504,12 @@ fun MetricBox(
 ) {
     Card(
         shape = RoundedCornerShape(10.dp),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF111827)),
-        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF1F2937)),
+        colors = CardDefaults.cardColors(containerColor = AppColors.surface),
+        border = androidx.compose.foundation.BorderStroke(1.dp, AppColors.border),
         modifier = modifier
     ) {
         Column(modifier = Modifier.padding(10.dp)) {
-            Text(title, fontSize = 11.sp, color = Color(0xFF94A3B8))
+            Text(title, fontSize = 11.sp, color = AppColors.textSecondary)
             Spacer(modifier = Modifier.height(4.dp))
             Text(
                 value,
@@ -517,7 +518,7 @@ fun MetricBox(
                 color = accentColor
             )
             Spacer(modifier = Modifier.height(2.dp))
-            Text(subtitle, fontSize = 9.sp, color = Color(0xFF64748B))
+            Text(subtitle, fontSize = 9.sp, color = AppColors.textMuted)
         }
     }
 }
@@ -531,8 +532,8 @@ fun ExplanationAccordionCard(
 
     Card(
         shape = RoundedCornerShape(10.dp),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF111827)),
-        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF1F2937)),
+        colors = CardDefaults.cardColors(containerColor = AppColors.surface),
+        border = androidx.compose.foundation.BorderStroke(1.dp, AppColors.border),
         modifier = Modifier
             .fillMaxWidth()
             .clickable { expanded = !expanded }
@@ -555,13 +556,13 @@ fun ExplanationAccordionCard(
                         text = title,
                         fontSize = 13.sp,
                         fontWeight = FontWeight.SemiBold,
-                        color = Color(0xFFF1F5F9)
+                        color = AppColors.textPrimary
                     )
                 }
                 Icon(
                     imageVector = if (expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
                     contentDescription = null,
-                    tint = Color(0xFF94A3B8),
+                    tint = AppColors.textSecondary,
                     modifier = Modifier.size(18.dp)
                 )
             }
@@ -572,7 +573,7 @@ fun ExplanationAccordionCard(
                         text = content,
                         fontSize = 12.sp,
                         lineHeight = 18.sp,
-                        color = Color(0xFFCBD5E1)
+                        color = AppColors.textSecondary
                     )
                 }
             }

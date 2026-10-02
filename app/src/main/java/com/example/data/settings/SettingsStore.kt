@@ -3,6 +3,7 @@ package com.example.data.settings
 import android.content.Context
 import com.example.data.security.KeyStoreManager
 import com.example.domain.model.ReasoningLevel
+import com.example.ui.theme.ThemeMode
 
 /**
  * Small persistent settings store (SharedPreferences). Read synchronously from anywhere.
@@ -71,6 +72,23 @@ class SettingsStore(context: Context) {
     var activeProjectId: String?
         get() = prefs.getString("active_project_id", null)
         set(value) { prefs.edit().putString("active_project_id", value).apply() }
+
+    var themeMode: ThemeMode
+        get() = try {
+            ThemeMode.valueOf(prefs.getString("theme_mode", ThemeMode.SYSTEM.name) ?: ThemeMode.SYSTEM.name)
+        } catch (e: Exception) {
+            ThemeMode.SYSTEM
+        }
+        set(value) { prefs.edit().putString("theme_mode", value.name).apply() }
+
+    /** Provider chosen in the chat model picker. It is tried first; others are used as failover. */
+    var preferredProviderId: String?
+        get() = prefs.getString("preferred_provider_id", null)
+        set(value) { prefs.edit().putString("preferred_provider_id", value).apply() }
+
+    var activeConversationId: String?
+        get() = prefs.getString("active_conversation_id", null)
+        set(value) { prefs.edit().putString("active_conversation_id", value).apply() }
 
     val githubConfigured: Boolean
         get() = githubRepo.contains("/") && githubToken.isNotBlank()

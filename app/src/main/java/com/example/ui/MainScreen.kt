@@ -1,6 +1,7 @@
 package com.example.ui
 
 import androidx.activity.compose.BackHandler
+import com.example.ui.theme.AppColors
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -54,10 +55,11 @@ fun MainScreen(
     Scaffold(
         modifier = modifier
             .fillMaxSize()
+            .background(AppColors.bg)
             .statusBarsPadding(),
         bottomBar = {
             NavigationBar(
-                containerColor = Color(0xFF111827),
+                containerColor = AppColors.surface,
                 modifier = Modifier
                     .navigationBarsPadding()
                     .testTag("bottom_nav_bar")
@@ -67,6 +69,7 @@ fun MainScreen(
                     NavigationBarItem(
                         selected = isSelected,
                         onClick = { currentScreen = screen },
+                        alwaysShowLabel = false,
                         icon = {
                             Icon(
                                 imageVector = screen.icon,
@@ -82,9 +85,9 @@ fun MainScreen(
                         colors = NavigationBarItemDefaults.colors(
                             selectedIconColor = CyberCyan,
                             selectedTextColor = CyberCyan,
-                            unselectedIconColor = Color(0xFF64748B),
-                            unselectedTextColor = Color(0xFF64748B),
-                            indicatorColor = Color(0xFF1E293B)
+                            unselectedIconColor = AppColors.textMuted,
+                            unselectedTextColor = AppColors.textMuted,
+                            indicatorColor = AppColors.surfaceAlt
                         ),
                         modifier = Modifier.testTag("nav_item_${screen.route}")
                     )
@@ -96,13 +99,14 @@ fun MainScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
-                .background(Color(0xFF0B0F17))
+                .background(AppColors.bg)
         ) {
             when (currentScreen) {
                 Screen.Chat -> {
                     ChatScreen(
                         viewModel = chatViewModel,
-                        modifier = Modifier.fillMaxSize()
+                        modifier = Modifier.fillMaxSize(),
+                        onOpenProviders = { currentScreen = Screen.Providers }
                     )
                 }
                 Screen.Files -> {

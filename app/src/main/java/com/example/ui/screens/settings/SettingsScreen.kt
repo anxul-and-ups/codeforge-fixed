@@ -1,6 +1,11 @@
 package com.example.ui.screens.settings
 
 import android.widget.Toast
+import com.example.ui.theme.AppColors
+import com.example.ui.theme.ThemeMode
+import androidx.compose.material3.Surface
+import androidx.compose.ui.draw.clip
+import androidx.compose.foundation.clickable
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -113,35 +118,79 @@ fun SettingsScreen(
     LazyColumn(
         modifier = modifier
             .fillMaxSize()
-            .background(Color(0xFF0B0F17))
+            .background(AppColors.bg)
             .padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         // Top Toolbar
         item {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(
-                    imageVector = Icons.Default.Settings,
-                    contentDescription = "Settings",
-                    tint = CyberCyan,
-                    modifier = Modifier.size(22.dp)
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = "Agent & System Settings",
-                    fontSize = 17.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color(0xFFF1F5F9)
-                )
+            Text(
+                text = "Settings",
+                fontSize = 20.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = AppColors.textPrimary,
+                modifier = Modifier.padding(start = 4.dp, top = 4.dp)
+            )
+        }
+
+        // Appearance
+        item {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = AppColors.surface),
+                shape = RoundedCornerShape(12.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, AppColors.border),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Text(
+                        text = "Appearance",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = AppColors.textPrimary
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        val options = listOf(
+                            ThemeMode.SYSTEM to "System",
+                            ThemeMode.LIGHT to "Light",
+                            ThemeMode.DARK to "Dark"
+                        )
+                        for ((mode, label) in options) {
+                            val selected = AppColors.mode == mode
+                            Surface(
+                                shape = RoundedCornerShape(10.dp),
+                                color = if (selected) AppColors.accentSoft else AppColors.surfaceAlt,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .clickable {
+                                        AppColors.mode = mode
+                                        settingsStore.themeMode = mode
+                                    }
+                            ) {
+                                Text(
+                                    text = label,
+                                    fontSize = 13.sp,
+                                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                                    color = if (selected) AppColors.accent else AppColors.textSecondary,
+                                    modifier = Modifier
+                                        .padding(vertical = 10.dp)
+                                        .fillMaxWidth(),
+                                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                                )
+                            }
+                        }
+                    }
+                }
             }
         }
 
         // Global System Instructions
         item {
             Card(
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF111827)),
+                colors = CardDefaults.cardColors(containerColor = AppColors.surface),
                 shape = RoundedCornerShape(12.dp),
-                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF1F2937)),
+                border = androidx.compose.foundation.BorderStroke(1.dp, AppColors.border),
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(modifier = Modifier.padding(12.dp)) {
@@ -149,13 +198,13 @@ fun SettingsScreen(
                         text = "Global System Instructions",
                         fontSize = 13.sp,
                         fontWeight = FontWeight.SemiBold,
-                        color = Color(0xFFF1F5F9)
+                        color = AppColors.textPrimary
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
                         text = "Rules injected into every agent prompt across all projects.",
                         fontSize = 11.sp,
-                        color = Color(0xFF94A3B8)
+                        color = AppColors.textSecondary
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     OutlinedTextField(
@@ -171,9 +220,9 @@ fun SettingsScreen(
         // Reasoning / Thinking Level
         item {
             Card(
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF111827)),
+                colors = CardDefaults.cardColors(containerColor = AppColors.surface),
                 shape = RoundedCornerShape(12.dp),
-                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF1F2937)),
+                border = androidx.compose.foundation.BorderStroke(1.dp, AppColors.border),
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(modifier = Modifier.padding(12.dp)) {
@@ -184,14 +233,14 @@ fun SettingsScreen(
                             text = "Thinking / Reasoning Effort",
                             fontSize = 13.sp,
                             fontWeight = FontWeight.SemiBold,
-                            color = Color(0xFFF1F5F9)
+                            color = AppColors.textPrimary
                         )
                     }
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
                         text = "Maps to Claude extended thinking tokens, OpenAI reasoning effort, or Gemini thinking budget.",
                         fontSize = 11.sp,
-                        color = Color(0xFF94A3B8)
+                        color = AppColors.textSecondary
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Row(
@@ -202,7 +251,7 @@ fun SettingsScreen(
                             val isSel = selectedReasoningLevel == level
                             Surface(
                                 shape = RoundedCornerShape(6.dp),
-                                color = if (isSel) ReasoningPurple else Color(0xFF1E293B),
+                                color = if (isSel) ReasoningPurple else AppColors.surfaceAlt,
                                 modifier = Modifier
                                     .weight(1f)
                                     .clickable { selectedReasoningLevel = level }
@@ -216,7 +265,7 @@ fun SettingsScreen(
                                         text = level.displayName,
                                         fontSize = 11.sp,
                                         fontWeight = FontWeight.Medium,
-                                        color = if (isSel) Color.White else Color(0xFFCBD5E1)
+                                        color = if (isSel) Color.White else AppColors.textSecondary
                                     )
                                 }
                             }
@@ -229,9 +278,9 @@ fun SettingsScreen(
         // Safety & Guardrails
         item {
             Card(
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF111827)),
+                colors = CardDefaults.cardColors(containerColor = AppColors.surface),
                 shape = RoundedCornerShape(12.dp),
-                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF1F2937)),
+                border = androidx.compose.foundation.BorderStroke(1.dp, AppColors.border),
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(modifier = Modifier.padding(12.dp)) {
@@ -244,9 +293,9 @@ fun SettingsScreen(
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Icon(Icons.Default.Security, contentDescription = null, tint = EmeraldSuccess, modifier = Modifier.size(16.dp))
                                 Spacer(modifier = Modifier.width(6.dp))
-                                Text("Safe Mode (Confirm before write)", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFFF1F5F9))
+                                Text("Safe Mode (Confirm before write)", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = AppColors.textPrimary)
                             }
-                            Text("Asks your confirmation before the agent edits, writes, moves or deletes files.", fontSize = 11.sp, color = Color(0xFF94A3B8))
+                            Text("Asks your confirmation before the agent edits, writes, moves or deletes files.", fontSize = 11.sp, color = AppColors.textSecondary)
                         }
                         Switch(
                             checked = safeModeEnabled,
@@ -261,9 +310,9 @@ fun SettingsScreen(
         // Language & Max Steps
         item {
             Card(
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF111827)),
+                colors = CardDefaults.cardColors(containerColor = AppColors.surface),
                 shape = RoundedCornerShape(12.dp),
-                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF1F2937)),
+                border = androidx.compose.foundation.BorderStroke(1.dp, AppColors.border),
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -275,7 +324,7 @@ fun SettingsScreen(
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(Icons.Default.Language, contentDescription = null, tint = CyberCyan, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Agent Response Language", fontSize = 13.sp, color = Color(0xFFF1F5F9))
+                            Text("Agent Response Language", fontSize = 13.sp, color = AppColors.textPrimary)
                         }
                         Text(
                             "$selectedLanguage  ▸",
@@ -298,7 +347,7 @@ fun SettingsScreen(
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(Icons.Default.Build, contentDescription = null, tint = ForgeAmber, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Max Steps Per Agent Loop", fontSize = 13.sp, color = Color(0xFFF1F5F9))
+                            Text("Max Steps Per Agent Loop", fontSize = 13.sp, color = AppColors.textPrimary)
                         }
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             TextButton(onClick = { maxSteps = (maxSteps - 5).coerceAtLeast(5) }) { Text("−5", fontSize = 12.sp) }
@@ -313,21 +362,21 @@ fun SettingsScreen(
         // GitHub Actions CI Integration
         item {
             Card(
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF111827)),
+                colors = CardDefaults.cardColors(containerColor = AppColors.surface),
                 shape = RoundedCornerShape(12.dp),
-                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF1F2937)),
+                border = androidx.compose.foundation.BorderStroke(1.dp, AppColors.border),
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Default.Code, contentDescription = null, tint = CyberCyan, modifier = Modifier.size(18.dp))
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("GitHub Actions CI & Push", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFFF1F5F9))
+                        Text("GitHub Actions CI & Push", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = AppColors.textPrimary)
                     }
                     Text(
                         "Push your project to GitHub as one commit, run the Actions build, and let the AI read failure logs and fix them. Token is stored encrypted on this device.",
                         fontSize = 11.sp,
-                        color = Color(0xFF94A3B8)
+                        color = AppColors.textSecondary
                     )
 
                     OutlinedTextField(
@@ -360,11 +409,11 @@ fun SettingsScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
-                            Text("Auto push, build & fix", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFFF1F5F9))
+                            Text("Auto push, build & fix", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = AppColors.textPrimary)
                             Text(
                                 "After every AI change: push one commit, wait for the GitHub build, and let the AI fix compile errors automatically.",
                                 fontSize = 11.sp,
-                                color = Color(0xFF94A3B8)
+                                color = AppColors.textSecondary
                             )
                         }
                         Switch(
@@ -378,7 +427,7 @@ fun SettingsScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("Max auto-fix attempts", fontSize = 12.sp, color = Color(0xFFF1F5F9))
+                        Text("Max auto-fix attempts", fontSize = 12.sp, color = AppColors.textPrimary)
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             TextButton(onClick = { maxFixAttempts = (maxFixAttempts - 1).coerceAtLeast(1) }) { Text("−", fontSize = 14.sp) }
                             Text("$maxFixAttempts", fontSize = 12.sp, color = ForgeAmber, fontWeight = FontWeight.SemiBold)
@@ -400,7 +449,7 @@ fun SettingsScreen(
                         modifier = Modifier.fillMaxWidth(),
                         colors = ButtonDefaults.buttonColors(containerColor = EmeraldSuccess)
                     ) {
-                        Text("Push project & build now", fontSize = 12.sp, color = Color(0xFF002B1A))
+                        Text("Push project & build now", fontSize = 12.sp, color = AppColors.onAccent)
                     }
 
                     Row(
@@ -444,27 +493,27 @@ fun SettingsScreen(
                             },
                             colors = ButtonDefaults.buttonColors(containerColor = CyberCyan)
                         ) {
-                            Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(14.dp), tint = Color(0xFF003549))
+                            Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(14.dp), tint = AppColors.onAccent)
                             Spacer(modifier = Modifier.width(4.dp))
-                            Text("Trigger Build", fontSize = 11.sp, color = Color(0xFF003549))
+                            Text("Trigger Build", fontSize = 11.sp, color = AppColors.onAccent)
                         }
                     }
 
                     // Recent Workflow Runs
                     if (workflowRuns.isNotEmpty()) {
                         Spacer(modifier = Modifier.height(4.dp))
-                        Text("Recent Workflow Runs:", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFFE2E8F0))
+                        Text("Recent Workflow Runs:", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = AppColors.textPrimary)
                         for (run in workflowRuns.take(3)) {
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .background(Color(0xFF0F172A), RoundedCornerShape(6.dp))
+                                    .background(AppColors.codeBg, RoundedCornerShape(6.dp))
                                     .padding(8.dp),
                                 horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Column(modifier = Modifier.weight(1f)) {
-                                    Text("${run.name} (#${run.id})", fontSize = 11.sp, color = Color(0xFFF1F5F9))
+                                    Text("${run.name} (#${run.id})", fontSize = 11.sp, color = AppColors.textPrimary)
                                     Text(
                                         "${run.status} • conclusion: ${run.conclusion ?: "in progress"}",
                                         fontSize = 10.sp,
@@ -496,22 +545,22 @@ fun SettingsScreen(
         // Backup & Restore
         item {
             Card(
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF111827)),
+                colors = CardDefaults.cardColors(containerColor = AppColors.surface),
                 shape = RoundedCornerShape(12.dp),
-                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF1F2937)),
+                border = androidx.compose.foundation.BorderStroke(1.dp, AppColors.border),
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(modifier = Modifier.padding(12.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Default.Backup, contentDescription = null, tint = ForgeAmber, modifier = Modifier.size(16.dp))
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("Backup & Security", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFFF1F5F9))
+                        Text("Backup & Security", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = AppColors.textPrimary)
                     }
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
                         "CodeForge never transmits user telemetry or keys off-device. All API keys remain strictly hardware-encrypted in Android Keystore.",
                         fontSize = 11.sp,
-                        color = Color(0xFF94A3B8)
+                        color = AppColors.textSecondary
                     )
                 }
             }

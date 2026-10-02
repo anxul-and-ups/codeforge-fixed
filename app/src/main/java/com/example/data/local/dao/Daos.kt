@@ -40,6 +40,9 @@ interface ProjectDao {
 
 @Dao
 interface ConversationDao {
+    @Query("SELECT * FROM conversations ORDER BY isPinned DESC, updatedAt DESC")
+    fun getAllConversations(): Flow<List<ConversationEntity>>
+
     @Query("SELECT * FROM conversations WHERE projectId = :projectId ORDER BY isPinned DESC, updatedAt DESC")
     fun getConversationsForProject(projectId: String): Flow<List<ConversationEntity>>
 

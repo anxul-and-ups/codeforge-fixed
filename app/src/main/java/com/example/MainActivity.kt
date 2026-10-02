@@ -16,6 +16,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import com.example.ui.CrashScreen
+import com.example.ui.theme.AppColors
 import com.example.util.CrashReporter
 import com.example.ui.MainScreen
 import com.example.ui.theme.CodeForgeTheme
@@ -37,9 +38,15 @@ class MainActivity : ComponentActivity() {
             notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
 
+        // Theme: saved choice (System / Light / Dark); system value read before the first frame
+        AppColors.systemDark =
+            (resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
+                android.content.res.Configuration.UI_MODE_NIGHT_YES
+        AppColors.mode = app.settingsStore.themeMode
+
         val lastCrash = CrashReporter.readLastCrash(this)
         setContent {
-            CodeForgeTheme(darkTheme = true) {
+            CodeForgeTheme {
                 var crashText by remember { mutableStateOf(lastCrash) }
                 val crash = crashText
                 if (crash != null) {

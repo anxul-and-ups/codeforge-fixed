@@ -1,6 +1,7 @@
 package com.example.ui.screens.diff
 
 import android.content.Context
+import com.example.ui.theme.AppColors
 import android.content.Intent
 import android.net.Uri
 import android.widget.Toast
@@ -126,11 +127,11 @@ fun DiffReviewScreen(
     Column(
         modifier = modifier
             .fillMaxSize()
-            .background(Color(0xFF0B0F17))
+            .background(AppColors.bg)
     ) {
         // Top Toolbar
         Surface(
-            color = Color(0xFF111827),
+            color = AppColors.surface,
             modifier = Modifier.fillMaxWidth()
         ) {
             Row(
@@ -152,13 +153,13 @@ fun DiffReviewScreen(
                         text = "Change Review",
                         fontSize = 15.sp,
                         fontWeight = FontWeight.Bold,
-                        color = Color(0xFFF1F5F9)
+                        color = AppColors.textPrimary
                     )
                 }
 
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     IconButton(onClick = { refreshDiffs() }, modifier = Modifier.size(36.dp)) {
-                        Icon(Icons.Default.Refresh, contentDescription = "Refresh", tint = Color(0xFF94A3B8))
+                        Icon(Icons.Default.Refresh, contentDescription = "Refresh", tint = AppColors.textSecondary)
                     }
 
                     // Export menu
@@ -174,9 +175,9 @@ fun DiffReviewScreen(
                         colors = ButtonDefaults.buttonColors(containerColor = CyberCyan),
                         modifier = Modifier.height(34.dp)
                     ) {
-                        Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(14.dp), tint = Color(0xFF003549))
+                        Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(14.dp), tint = AppColors.onAccent)
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text("Export ZIP", fontSize = 12.sp, color = Color(0xFF003549))
+                        Text("Export ZIP", fontSize = 12.sp, color = AppColors.onAccent)
                     }
                 }
             }
@@ -184,7 +185,7 @@ fun DiffReviewScreen(
 
         // Checkpoints banner accordion
         Card(
-            colors = CardDefaults.cardColors(containerColor = Color(0xFF161F30)),
+            colors = CardDefaults.cardColors(containerColor = AppColors.surface),
             shape = RoundedCornerShape(0.dp),
             modifier = Modifier.fillMaxWidth()
         ) {
@@ -203,7 +204,7 @@ fun DiffReviewScreen(
                             text = "Checkpoints & Snapshots (${checkpoints.size})",
                             fontSize = 13.sp,
                             fontWeight = FontWeight.SemiBold,
-                            color = Color(0xFFFDE68A)
+                            color = AppColors.warn
                         )
                     }
                     Icon(
@@ -223,15 +224,15 @@ fun DiffReviewScreen(
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .background(Color(0xFF0F172A), RoundedCornerShape(6.dp))
+                                    .background(AppColors.codeBg, RoundedCornerShape(6.dp))
                                     .padding(8.dp),
                                 horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Column(modifier = Modifier.weight(1f)) {
-                                    Text(text = cp.title, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = Color(0xFFE2E8F0))
+                                    Text(text = cp.title, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = AppColors.textPrimary)
                                     val dateStr = SimpleDateFormat("MMM dd, HH:mm:ss", Locale.getDefault()).format(Date(cp.timestamp))
-                                    Text(text = dateStr, fontSize = 10.sp, color = Color(0xFF64748B))
+                                    Text(text = dateStr, fontSize = 10.sp, color = AppColors.textMuted)
                                 }
                                 OutlinedButton(
                                     onClick = {
@@ -259,7 +260,7 @@ fun DiffReviewScreen(
         // Summary bar: Accept All / Reject All
         if (diffs.isNotEmpty()) {
             Surface(
-                color = Color(0xFF131D2E),
+                color = AppColors.surface,
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Row(
@@ -274,7 +275,7 @@ fun DiffReviewScreen(
                     Text(
                         text = "${diffs.size} files changed (+$totalAdded, -$totalRemoved)",
                         fontSize = 12.sp,
-                        color = Color(0xFF94A3B8)
+                        color = AppColors.textSecondary
                     )
 
                     Row {
@@ -336,13 +337,13 @@ fun DiffReviewScreen(
                         text = "Working tree clean",
                         fontSize = 15.sp,
                         fontWeight = FontWeight.SemiBold,
-                        color = Color(0xFFF1F5F9)
+                        color = AppColors.textPrimary
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
                         text = "No uncommitted modifications compared to baseline.",
                         fontSize = 13.sp,
-                        color = Color(0xFF94A3B8)
+                        color = AppColors.textSecondary
                     )
                 }
             }

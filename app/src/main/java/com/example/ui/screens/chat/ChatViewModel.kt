@@ -14,6 +14,10 @@ import com.example.data.agent.ApprovalRequest
 import com.example.data.agent.RunRequest
 import com.example.data.local.entity.ConversationEntity
 import com.example.data.local.entity.MessageEntity
+import com.example.data.local.entity.ProviderConfigEntity
+import kotlinx.coroutines.flow.map
+import java.util.UUID
+import java.util.zip.ZipInputStream
 import com.example.data.local.entity.ProjectEntity
 import com.example.data.local.entity.ToolStepEntity
 import com.example.data.security.KeyStoreManager
@@ -72,9 +76,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val refreshTick = MutableStateFlow(0)
     private var creatingDefaultProject = false
 
-    val conversations: StateFlow<List<ConversationEntity>> = activeProjectId
-        .flatMapLatest { id -> if (id == null) flowOf(emptyList()) else chatRepo.getConversations(id) }
+    /** All chats of all projects, so history never "disappears" when another project is imported. */
+    val conversations: StateFlow<List<ConversationEntity>> = chatRepo.getAllConversations()
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    val projectNames: StateFlow<Map<String, String>> = projectRepo.allProjects
+        .map { list -> list.associate { it.id to it.name } }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyMap())
+
+    val providers: StateFlow<List<ProviderConfigEntity>> = app.providerRepository.allProviders
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    private val _preferredProviderId = MutableStateFlow(settings.preferredProviderId)
+    val preferredProviderId: StateFlow<String?> = _preferredProviderId.asStateFlow()
 
     val messages: StateFlow<List<MessageEntity>> = activeConversationId
         .flatMapLatest { id -> if (id == null) flowOf(emptyList()) else chatRepo.getMessages(id) }
@@ -155,8 +169,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         }
                     }
                 } else if (current == null) {
-                    val saved = settings.activeProjectId
-                    selectProject(projects.firstOrNull { it.id == saved } ?: projects.first())
+                    // Restore the last open chat (and its project) after the app was closed
+                    val savedConv = settings.activeConversationId?.let { chatRepo.getConversation(it) }
+                    val project = savedConv?.let { c -> projects.firstOrNull { it.id == c.projectId } }
+                        ?: projects.firstOrNull { it.id == settings.activeProjectId }
+                        ?: projects.first()
+                    val convId = savedConv?.takeIf { it.projectId == project.id }?.id
+                    switchProject(project, convId)
                 } else {
                     val fresh = projects.firstOrNull { it.id == current.id }
                     if (fresh == null) selectProject(projects.first())
@@ -167,14 +186,43 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun selectProject(project: ProjectEntity) {
+        switchProject(project, null)
+    }
+
+    private fun setActiveConversation(id: String?) {
+        activeConversationId.value = id
+        settings.activeConversationId = id
+    }
+
+    /** Opens [project]. If [conversationId] is given that chat stays open, otherwise the latest chat is opened. */
+    private fun switchProject(project: ProjectEntity, conversationId: String?) {
         settings.activeProjectId = project.id
         activeProjectId.value = project.id
-        activeConversationId.value = null
-        _uiState.update { it.copy(activeProject = project, activeConversation = null, streamingContent = "", streamingReasoning = "") }
+        _uiState.update {
+            it.copy(activeProject = project, streamingContent = "", streamingReasoning = "")
+        }
         viewModelScope.launch {
-            val list = chatRepo.getConversations(project.id).first()
-            val conv = list.firstOrNull() ?: chatRepo.createConversation(project.id, "New Chat")
-            activeConversationId.value = conv.id
+            val existing = if (conversationId != null) chatRepo.getConversation(conversationId) else null
+            val conv = if (existing != null && existing.projectId == project.id) {
+                existing
+            } else {
+                chatRepo.getConversations(project.id).first().firstOrNull()
+                    ?: chatRepo.createConversation(project.id, "New Chat")
+            }
+            setActiveConversation(conv.id)
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Model picker
+    // ---------------------------------------------------------------------------------------
+
+    fun selectModel(providerId: String, model: String) {
+        viewModelScope.launch {
+            val p = providers.value.firstOrNull { it.id == providerId } ?: return@launch
+            app.providerRepository.updateProvider(p.copy(selectedModel = model, isEnabled = true))
+            settings.preferredProviderId = providerId
+            _preferredProviderId.value = providerId
         }
     }
 
@@ -183,15 +231,32 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // ---------------------------------------------------------------------------------------
 
     fun selectConversation(conversation: ConversationEntity) {
-        activeConversationId.value = conversation.id
+        if (agentEngine.isRunning.value) {
+            _uiState.update { it.copy(failoverNotice = "The agent is working. Press Stop before switching chats.") }
+            return
+        }
         _uiState.update { it.copy(streamingContent = "", streamingReasoning = "") }
+        val current = _uiState.value.activeProject
+        if (current != null && current.id == conversation.projectId) {
+            setActiveConversation(conversation.id)
+        } else {
+            viewModelScope.launch {
+                val project = projectRepo.getProject(conversation.projectId)
+                if (project != null) {
+                    switchProject(project, conversation.id)
+                } else {
+                    setActiveConversation(conversation.id)
+                }
+            }
+        }
     }
 
     fun newConversation() {
         val proj = _uiState.value.activeProject ?: return
+        if (agentEngine.isRunning.value) return
         viewModelScope.launch {
             val conv = chatRepo.createConversation(proj.id, "New Chat")
-            activeConversationId.value = conv.id
+            setActiveConversation(conv.id)
         }
     }
 
@@ -213,9 +278,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 if (proj != null) {
                     val remaining = chatRepo.getConversations(proj.id).first()
                     val next = remaining.firstOrNull() ?: chatRepo.createConversation(proj.id, "New Chat")
-                    activeConversationId.value = next.id
+                    setActiveConversation(next.id)
                 } else {
-                    activeConversationId.value = null
+                    setActiveConversation(null)
                 }
             }
         }
@@ -227,16 +292,30 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // Attachments
     // ---------------------------------------------------------------------------------------
 
+    /** Imports a ZIP as a project and keeps the CURRENT chat open (the chat moves to the new project). */
     fun importZipAsProject(uri: Uri) {
         viewModelScope.launch {
             _uiState.update { it.copy(failoverNotice = "Importing ZIP…") }
             try {
                 val display = withContext(Dispatchers.IO) { projectRepo.queryDisplayName(uri) } ?: "Imported Project"
                 val project = projectRepo.importProjectFromZip(display.removeSuffix(".zip").removeSuffix(".ZIP"), uri)
-                selectProject(project)
-                _uiState.update {
-                    it.copy(failoverNotice = "✅ Project \"${project.name}\" imported (${project.fileCount} files). Now tell me what to fix.")
+                val conv = _uiState.value.activeConversation
+                if (conv != null) {
+                    chatRepo.moveConversationToProject(conv.id, project.id)
+                    app.database.messageDao().insertMessage(
+                        MessageEntity(
+                            id = UUID.randomUUID().toString(),
+                            conversationId = conv.id,
+                            sender = "ASSISTANT",
+                            content = "📦 Project **${project.name}** imported (${project.fileCount} files). I will work on this project now.",
+                            status = "SUCCESS"
+                        )
+                    )
+                    switchProject(project, conv.id)
+                } else {
+                    switchProject(project, null)
                 }
+                _uiState.update { it.copy(failoverNotice = null) }
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: Throwable) {
@@ -247,7 +326,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun addAttachment(uri: Uri, name: String, isImage: Boolean) {
         val resolverType = try { getApplication<Application>().contentResolver.getType(uri) } catch (e: Exception) { null }
-        if (!isImage && (name.endsWith(".zip", ignoreCase = true) || resolverType == "application/zip" ||
+        val displayName = projectRepo.queryDisplayName(uri) ?: name
+        val lower = displayName.lowercase()
+        if (!isImage && (lower.endsWith(".zip") || resolverType == "application/zip" ||
                 resolverType == "application/x-zip-compressed")) {
             importZipAsProject(uri)
             return
@@ -256,22 +337,25 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             val item = withContext(Dispatchers.IO) {
                 if (isImage) {
                     val b64 = encodeImage(uri)
-                    if (b64 == null) null else AttachmentItem(uri, name, true, base64Data = b64)
+                    if (b64 == null) null else AttachmentItem(uri, displayName, true, base64Data = b64)
                 } else {
-                    val text = readTextAttachment(uri)
-                    if (text == null) null else AttachmentItem(uri, name, false, textContent = text)
+                    val text = readTextAttachment(uri, lower)
+                    if (text == null) null else AttachmentItem(uri, displayName, false, textContent = text)
                 }
             }
             if (item == null) {
-                _uiState.update {
-                    it.copy(failoverNotice = "Could not attach \"$name\" (unsupported or unreadable file)")
+                val hint = if (lower.endsWith(".pdf")) {
+                    "PDF text cannot be read yet. Send a screenshot or paste the text."
+                } else {
+                    "Could not attach \"$displayName\". Supported: images, text/code files, .docx and .zip (project)."
                 }
+                _uiState.update { it.copy(failoverNotice = hint) }
                 return@launch
             }
             _uiState.update {
                 it.copy(
                     pendingAttachments = it.pendingAttachments + item,
-                    warningSecretFile = if (KeyStoreManager.isPotentialSecretFile(name)) name else it.warningSecretFile
+                    warningSecretFile = if (KeyStoreManager.isPotentialSecretFile(displayName)) displayName else it.warningSecretFile
                 )
             }
         }
@@ -285,9 +369,34 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(pendingAttachments = it.pendingAttachments - item) }
     }
 
-    private fun readTextAttachment(uri: Uri): String? {
+    private fun readTextAttachment(uri: Uri, lowerName: String): String? {
         return try {
-            val bytes = getApplication<Application>().contentResolver.openInputStream(uri)?.use { input ->
+            val resolver = getApplication<Application>().contentResolver
+            if (lowerName.endsWith(".docx")) {
+                return resolver.openInputStream(uri)?.use { input ->
+                    ZipInputStream(input).use { zis ->
+                        var entry = zis.nextEntry
+                        var result: String? = null
+                        while (entry != null) {
+                            if (entry.name == "word/document.xml") {
+                                val xml = zis.readBytes().toString(Charsets.UTF_8)
+                                result = xml
+                                    .replace("</w:p>", "\n")
+                                    .replace("<w:tab/>", "\t")
+                                    .replace("<w:br/>", "\n")
+                                    .replace(Regex("<[^>]+>"), "")
+                                    .replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+                                    .replace("&quot;", "\"").replace("&apos;", "'")
+                                    .take(200_000)
+                                break
+                            }
+                            entry = zis.nextEntry
+                        }
+                        result
+                    }
+                }
+            }
+            val bytes = resolver.openInputStream(uri)?.use { input ->
                 val buf = ByteArray(200_000)
                 var total = 0
                 while (total < buf.size) {

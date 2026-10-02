@@ -1,6 +1,7 @@
 package com.example.ui.components
 
 import androidx.compose.animation.AnimatedVisibility
+import com.example.ui.theme.AppColors
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -62,8 +63,8 @@ fun FileDiffCard(
 
     Card(
         shape = RoundedCornerShape(12.dp),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF111827)),
-        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF1F2937)),
+        colors = CardDefaults.cardColors(containerColor = AppColors.surface),
+        border = androidx.compose.foundation.BorderStroke(1.dp, AppColors.border),
         modifier = modifier.fillMaxWidth()
     ) {
         Column {
@@ -71,7 +72,7 @@ fun FileDiffCard(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .background(Color(0xFF1E293B))
+                    .background(AppColors.surfaceAlt)
                     .clickable { expanded = !expanded }
                     .padding(horizontal = 12.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -84,7 +85,7 @@ fun FileDiffCard(
                     Icon(
                         imageVector = Icons.Default.InsertDriveFile,
                         contentDescription = "File",
-                        tint = Color(0xFF94A3B8),
+                        tint = AppColors.textSecondary,
                         modifier = Modifier.size(18.dp)
                     )
                     Spacer(modifier = Modifier.width(8.dp))
@@ -92,7 +93,7 @@ fun FileDiffCard(
                         text = diff.filePath,
                         fontSize = 13.sp,
                         fontWeight = FontWeight.SemiBold,
-                        color = Color(0xFFF1F5F9)
+                        color = AppColors.textPrimary
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     if (diff.linesAdded > 0) {
@@ -118,7 +119,7 @@ fun FileDiffCard(
                     Icon(
                         imageVector = if (expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
                         contentDescription = if (expanded) "Collapse" else "Expand",
-                        tint = Color(0xFF94A3B8),
+                        tint = AppColors.textSecondary,
                         modifier = Modifier.size(20.dp)
                     )
                 }
@@ -130,7 +131,7 @@ fun FileDiffCard(
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .background(Color(0xFF0B0F17))
+                            .background(AppColors.bg)
                             .horizontalScroll(rememberScrollState())
                     ) {
                         Column {
@@ -143,7 +144,7 @@ fun FileDiffCard(
                                 val textColor = when (line.type) {
                                     DiffLineType.ADD -> DiffAddText
                                     DiffLineType.REMOVE -> DiffRemoveText
-                                    DiffLineType.UNCHANGED -> Color(0xFF94A3B8)
+                                    DiffLineType.UNCHANGED -> AppColors.textSecondary
                                 }
                                 val prefix = when (line.type) {
                                     DiffLineType.ADD -> "+ "
@@ -162,7 +163,7 @@ fun FileDiffCard(
                                         text = lineNum.padStart(4, ' '),
                                         fontFamily = FontFamily.Monospace,
                                         fontSize = 11.sp,
-                                        color = Color(0xFF475569),
+                                        color = AppColors.textMuted,
                                         modifier = Modifier.width(36.dp)
                                     )
                                     Text(
@@ -180,7 +181,7 @@ fun FileDiffCard(
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .background(Color(0xFF131A26))
+                            .background(AppColors.surface)
                             .padding(8.dp),
                         horizontalArrangement = Arrangement.End
                     ) {

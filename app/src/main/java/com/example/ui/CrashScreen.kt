@@ -1,6 +1,7 @@
 package com.example.ui
 
 import android.content.ClipData
+import com.example.ui.theme.AppColors
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
@@ -39,20 +40,20 @@ fun CrashScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color(0xFF0B0F17))
+            .background(AppColors.bg)
             .statusBarsPadding()
             .navigationBarsPadding()
             .padding(12.dp)
     ) {
         Text(
             text = "The app crashed last time",
-            color = Color(0xFFF87171),
+            color = AppColors.error,
             fontSize = 18.sp,
             fontWeight = FontWeight.Bold
         )
         Text(
             text = "Tap \"Copy error\" and send it to Claude so the bug can be fixed.",
-            color = Color(0xFF94A3B8),
+            color = AppColors.textSecondary,
             fontSize = 12.sp,
             modifier = Modifier.padding(vertical = 6.dp)
         )
@@ -77,7 +78,7 @@ fun CrashScreen(
         SelectionContainer(modifier = Modifier.weight(1f)) {
             Text(
                 text = crashText,
-                color = Color(0xFFE2E8F0),
+                color = AppColors.textPrimary,
                 fontSize = 10.sp,
                 fontFamily = FontFamily.Monospace,
                 modifier = Modifier

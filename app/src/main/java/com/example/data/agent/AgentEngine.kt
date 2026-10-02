@@ -421,6 +421,7 @@ RULES
                         tools = toolsList,
                         reasoningLevel = level
                     ),
+                    preferredProviderId = settings.preferredProviderId,
                     onChunk = { t ->
                         stepText.append(t)
                         _agentEvents.tryEmit(AgentEvent.StreamingChunk(t))

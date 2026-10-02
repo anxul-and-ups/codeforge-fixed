@@ -1,6 +1,7 @@
 package com.example.ui.screens.files
 
 import android.net.Uri
+import com.example.ui.theme.AppColors
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -142,11 +143,11 @@ fun FilesScreen(
     Column(
         modifier = modifier
             .fillMaxSize()
-            .background(Color(0xFF0B0F17))
+            .background(AppColors.bg)
     ) {
         // Top Toolbar
         Surface(
-            color = Color(0xFF111827),
+            color = AppColors.surface,
             modifier = Modifier.fillMaxWidth()
         ) {
             Row(
@@ -174,12 +175,12 @@ fun FilesScreen(
                         text = activeProject?.name ?: "Select Project",
                         fontSize = 14.sp,
                         fontWeight = FontWeight.Bold,
-                        color = Color(0xFFF1F5F9)
+                        color = AppColors.textPrimary
                     )
                     Icon(
                         imageVector = Icons.Default.KeyboardArrowDown,
                         contentDescription = "Switch",
-                        tint = Color(0xFF94A3B8),
+                        tint = AppColors.textSecondary,
                         modifier = Modifier.size(18.dp)
                     )
 
@@ -234,7 +235,7 @@ fun FilesScreen(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(Color(0xFF1E293B))
+                        .background(AppColors.surfaceAlt)
                         .padding(horizontal = 8.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
@@ -250,7 +251,7 @@ fun FilesScreen(
                             Icon(
                                 imageVector = Icons.Default.ArrowBack,
                                 contentDescription = "Back to Files",
-                                tint = Color(0xFFF1F5F9)
+                                tint = AppColors.textPrimary
                             )
                         }
                         Spacer(modifier = Modifier.width(4.dp))
@@ -258,7 +259,7 @@ fun FilesScreen(
                             text = viewingFilePath ?: "",
                             fontSize = 13.sp,
                             fontWeight = FontWeight.SemiBold,
-                            color = Color(0xFFF1F5F9)
+                            color = AppColors.textPrimary
                         )
                     }
 
@@ -302,13 +303,13 @@ fun FilesScreen(
                         textStyle = androidx.compose.ui.text.TextStyle(
                             fontFamily = FontFamily.Monospace,
                             fontSize = 12.sp,
-                            color = Color(0xFFF1F5F9)
+                            color = AppColors.textPrimary
                         ),
                         colors = OutlinedTextFieldDefaults.colors(
-                            focusedContainerColor = Color(0xFF0F172A),
-                            unfocusedContainerColor = Color(0xFF0F172A),
+                            focusedContainerColor = AppColors.codeBg,
+                            unfocusedContainerColor = AppColors.codeBg,
                             focusedBorderColor = CyberCyan,
-                            unfocusedBorderColor = Color(0xFF1E293B)
+                            unfocusedBorderColor = AppColors.surfaceAlt
                         ),
                         modifier = Modifier
                             .fillMaxSize()
@@ -318,7 +319,7 @@ fun FilesScreen(
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .background(Color(0xFF0F172A))
+                            .background(AppColors.codeBg)
                             .horizontalScroll(rememberScrollState())
                             .padding(12.dp)
                     ) {
@@ -327,7 +328,7 @@ fun FilesScreen(
                             fontFamily = FontFamily.Monospace,
                             fontSize = 12.sp,
                             lineHeight = 18.sp,
-                            color = Color(0xFFE2E8F0)
+                            color = AppColors.textPrimary
                         )
                     }
                 }
@@ -344,21 +345,21 @@ fun FilesScreen(
                         Icon(
                             imageVector = Icons.Default.FolderOpen,
                             contentDescription = "Empty",
-                            tint = Color(0xFF64748B),
+                            tint = AppColors.textMuted,
                             modifier = Modifier.size(48.dp)
                         )
                         Spacer(modifier = Modifier.height(12.dp))
                         Text(
                             text = "No files in project yet",
                             fontSize = 14.sp,
-                            color = Color(0xFF94A3B8)
+                            color = AppColors.textSecondary
                         )
                         Spacer(modifier = Modifier.height(8.dp))
                         Button(
                             onClick = { showCreateStarterDialog = true },
                             colors = ButtonDefaults.buttonColors(containerColor = CyberCyan)
                         ) {
-                            Text("Create Starter Project", color = Color(0xFF003549))
+                            Text("Create Starter Project", color = AppColors.onAccent)
                         }
                     }
                 }
@@ -380,7 +381,7 @@ fun FilesScreen(
                                 text = "PROJECT REPOSITORY",
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold,
-                                color = Color(0xFF64748B)
+                                color = AppColors.textMuted
                             )
                             IconButton(
                                 onClick = { showNewFileDialog = true },
@@ -470,7 +471,7 @@ fun FilesScreen(
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = CyberCyan)
                 ) {
-                    Text("Create", color = Color(0xFF003549))
+                    Text("Create", color = AppColors.onAccent)
                 }
             },
             dismissButton = {
@@ -545,7 +546,7 @@ fun FileNodeItem(
                 Icon(
                     imageVector = if (isExpanded) Icons.Default.KeyboardArrowDown else Icons.Default.KeyboardArrowRight,
                     contentDescription = null,
-                    tint = Color(0xFF94A3B8),
+                    tint = AppColors.textSecondary,
                     modifier = Modifier.size(16.dp)
                 )
                 Spacer(modifier = Modifier.width(4.dp))
@@ -560,7 +561,7 @@ fun FileNodeItem(
                 Icon(
                     imageVector = Icons.Default.Description,
                     contentDescription = "File",
-                    tint = Color(0xFF94A3B8),
+                    tint = AppColors.textSecondary,
                     modifier = Modifier.size(16.dp)
                 )
             }
@@ -569,14 +570,14 @@ fun FileNodeItem(
                 text = node.name,
                 fontSize = 13.sp,
                 fontWeight = if (node.isDirectory) FontWeight.SemiBold else FontWeight.Normal,
-                color = if (node.isDirectory) Color(0xFFE2E8F0) else Color(0xFFCBD5E1),
+                color = if (node.isDirectory) AppColors.textPrimary else AppColors.textSecondary,
                 modifier = Modifier.weight(1f)
             )
             if (!node.isDirectory && node.sizeBytes > 0) {
                 Text(
                     text = "${node.sizeBytes / 1024} KB",
                     fontSize = 10.sp,
-                    color = Color(0xFF64748B)
+                    color = AppColors.textMuted
                 )
             }
         }

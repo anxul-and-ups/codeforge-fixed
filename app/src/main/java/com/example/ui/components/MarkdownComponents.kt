@@ -1,6 +1,7 @@
 package com.example.ui.components
 
 import android.content.ClipData
+import com.example.ui.theme.AppColors
 import android.content.ClipboardManager
 import android.content.Context
 import android.widget.Toast
@@ -128,7 +129,7 @@ fun FormattedRichText(
                     if (endIdx != -1) {
                         withStyle(
                             SpanStyle(
-                                background = Color(0x3338BDF8),
+                                background = AppColors.accent.copy(alpha = 0.2f),
                                 color = CyberCyan,
                                 fontFamily = FontFamily.Monospace,
                                 fontSize = 13.sp
@@ -180,8 +181,8 @@ fun CodeBlockView(
 
     Surface(
         shape = RoundedCornerShape(10.dp),
-        color = Color(0xFF0F172A),
-        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF1E293B)),
+        color = AppColors.codeBg,
+        border = androidx.compose.foundation.BorderStroke(1.dp, AppColors.surfaceAlt),
         modifier = modifier.fillMaxWidth()
     ) {
         Column {
@@ -189,7 +190,7 @@ fun CodeBlockView(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .background(Color(0xFF1E293B))
+                    .background(AppColors.surfaceAlt)
                     .padding(horizontal = 12.dp, vertical = 6.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
@@ -218,14 +219,14 @@ fun CodeBlockView(
                     Icon(
                         imageVector = if (isCopied) Icons.Default.Check else Icons.Default.ContentCopy,
                         contentDescription = "Copy Code",
-                        tint = if (isCopied) Color(0xFF10B981) else Color(0xFF94A3B8),
+                        tint = if (isCopied) AppColors.ok else AppColors.textSecondary,
                         modifier = Modifier.size(14.dp)
                     )
                     Spacer(modifier = Modifier.width(4.dp))
                     Text(
                         text = if (isCopied) "Copied" else "Copy",
                         fontSize = 11.sp,
-                        color = if (isCopied) Color(0xFF10B981) else Color(0xFF94A3B8)
+                        color = if (isCopied) AppColors.ok else AppColors.textSecondary
                     )
                 }
             }
@@ -242,7 +243,7 @@ fun CodeBlockView(
                     fontFamily = FontFamily.Monospace,
                     fontSize = 12.5.sp,
                     lineHeight = 18.sp,
-                    color = Color(0xFFE2E8F0)
+                    color = AppColors.textPrimary
                 )
             }
         }
@@ -258,7 +259,7 @@ fun ThinkingBlockView(
 
     Card(
         colors = CardDefaults.cardColors(
-            containerColor = Color(0xFF1A132F).copy(alpha = 0.8f)
+            containerColor = AppColors.surfaceAlt.copy(alpha = 0.8f)
         ),
         shape = RoundedCornerShape(10.dp),
         border = androidx.compose.foundation.BorderStroke(1.dp, ReasoningPurple.copy(alpha = 0.4f)),
@@ -305,7 +306,7 @@ fun ThinkingBlockView(
                 Column(modifier = Modifier.padding(top = 8.dp)) {
                     Text(
                         text = reasoning,
-                        color = Color(0xFFD8B4FE),
+                        color = AppColors.reasoning,
                         fontSize = 12.sp,
                         lineHeight = 18.sp,
                         fontStyle = FontStyle.Italic

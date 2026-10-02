@@ -2,6 +2,13 @@
 
 Chat-based coding agent for Android (Kotlin + Jetpack Compose). Import a project ZIP, chat about bugs/features, send screenshots and files, and get the fixed project back as a ZIP. Works like Claude Code / Codex, but on a phone, with your own API keys.
 
+## Interface
+- Clean light/dark UI (Settings → Appearance: System / Light / Dark).
+- Chat header shows the active model; tap it to switch provider/model. Each reply shows which model answered.
+- The agent's work is shown live as a terminal-style log (Read / Edit / Search / Write …); tap a line to see details or the exact edit.
+- Chat history keeps all chats of all projects; the last open chat is restored on start.
+- Attaching a .zip in a chat imports it as the project and keeps the same chat. Images, text/code files and .docx can be attached too.
+
 ## How it works
 1. Add an API key in the **Providers** tab (Anthropic, OpenAI, Gemini, DeepSeek, Groq, OpenRouter, Mistral, Ollama, or any custom endpoint).
 2. Import a ZIP in the **Files** tab.

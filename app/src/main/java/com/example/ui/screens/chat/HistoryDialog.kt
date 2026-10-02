@@ -1,6 +1,7 @@
 package com.example.ui.screens.chat
 
 import android.content.Intent
+import com.example.ui.theme.AppColors
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -66,6 +67,7 @@ fun HistoryDialog(
     onDismiss: () -> Unit
 ) {
     val conversations by viewModel.conversations.collectAsState()
+    val projectNames by viewModel.projectNames.collectAsState()
     val uiState by viewModel.uiState.collectAsState()
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -84,7 +86,7 @@ fun HistoryDialog(
     ) {
         Surface(
             modifier = Modifier.fillMaxSize(),
-            color = Color(0xFF0B0F17)
+            color = AppColors.bg
         ) {
             Column(
                 modifier = Modifier
@@ -101,7 +103,7 @@ fun HistoryDialog(
                         text = "Chat history",
                         fontSize = 18.sp,
                         fontWeight = FontWeight.Bold,
-                        color = Color(0xFFF1F5F9)
+                        color = AppColors.textPrimary
                     )
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         TextButton(onClick = {
@@ -113,7 +115,7 @@ fun HistoryDialog(
                             Text("New chat", color = CyberCyan, fontSize = 13.sp)
                         }
                         IconButton(onClick = onDismiss) {
-                            Icon(Icons.Default.Close, contentDescription = "Close", tint = Color(0xFF94A3B8))
+                            Icon(Icons.Default.Close, contentDescription = "Close", tint = AppColors.textSecondary)
                         }
                     }
                 }
@@ -131,7 +133,7 @@ fun HistoryDialog(
                 if (filtered.isEmpty()) {
                     Text(
                         text = if (conversations.isEmpty()) "No chats yet." else "No chats match your search.",
-                        color = Color(0xFF94A3B8),
+                        color = AppColors.textSecondary,
                         fontSize = 13.sp,
                         modifier = Modifier.padding(16.dp)
                     )
@@ -145,12 +147,12 @@ fun HistoryDialog(
                         val isActive = conv.id == uiState.activeConversation?.id
                         Card(
                             colors = CardDefaults.cardColors(
-                                containerColor = if (isActive) Color(0xFF12304A) else Color(0xFF111827)
+                                containerColor = if (isActive) AppColors.accentSoft else AppColors.surface
                             ),
                             shape = RoundedCornerShape(12.dp),
                             border = androidx.compose.foundation.BorderStroke(
                                 1.dp,
-                                if (isActive) CyberCyan.copy(alpha = 0.5f) else Color(0xFF1F2937)
+                                if (isActive) CyberCyan.copy(alpha = 0.5f) else AppColors.border
                             ),
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -178,7 +180,7 @@ fun HistoryDialog(
                                         }
                                         Text(
                                             text = conv.title,
-                                            color = Color(0xFFF1F5F9),
+                                            color = AppColors.textPrimary,
                                             fontSize = 14.sp,
                                             fontWeight = FontWeight.SemiBold,
                                             maxLines = 1,
@@ -186,8 +188,8 @@ fun HistoryDialog(
                                         )
                                     }
                                     Text(
-                                        text = dateFormat.format(Date(conv.updatedAt)),
-                                        color = Color(0xFF64748B),
+                                        text = (projectNames[conv.projectId] ?: "Project") + "  ·  " + dateFormat.format(Date(conv.updatedAt)),
+                                        color = AppColors.textMuted,
                                         fontSize = 11.sp
                                     )
                                 }
@@ -195,7 +197,7 @@ fun HistoryDialog(
                                     Icon(
                                         Icons.Default.PushPin,
                                         contentDescription = "Pin",
-                                        tint = if (conv.isPinned) ForgeAmber else Color(0xFF64748B),
+                                        tint = if (conv.isPinned) ForgeAmber else AppColors.textMuted,
                                         modifier = Modifier.size(16.dp)
                                     )
                                 }
@@ -206,7 +208,7 @@ fun HistoryDialog(
                                     },
                                     modifier = Modifier.size(34.dp)
                                 ) {
-                                    Icon(Icons.Default.Edit, contentDescription = "Rename", tint = Color(0xFF94A3B8), modifier = Modifier.size(16.dp))
+                                    Icon(Icons.Default.Edit, contentDescription = "Rename", tint = AppColors.textSecondary, modifier = Modifier.size(16.dp))
                                 }
                                 IconButton(
                                     onClick = {
@@ -222,7 +224,7 @@ fun HistoryDialog(
                                     },
                                     modifier = Modifier.size(34.dp)
                                 ) {
-                                    Icon(Icons.Default.Share, contentDescription = "Export", tint = Color(0xFF94A3B8), modifier = Modifier.size(16.dp))
+                                    Icon(Icons.Default.Share, contentDescription = "Export", tint = AppColors.textSecondary, modifier = Modifier.size(16.dp))
                                 }
                                 IconButton(onClick = { deleteTarget = conv }, modifier = Modifier.size(34.dp)) {
                                     Icon(Icons.Default.Delete, contentDescription = "Delete", tint = RoseError, modifier = Modifier.size(16.dp))
