@@ -227,7 +227,31 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // Attachments
     // ---------------------------------------------------------------------------------------
 
+    fun importZipAsProject(uri: Uri) {
+        viewModelScope.launch {
+            _uiState.update { it.copy(failoverNotice = "Importing ZIP…") }
+            try {
+                val display = withContext(Dispatchers.IO) { projectRepo.queryDisplayName(uri) } ?: "Imported Project"
+                val project = projectRepo.importProjectFromZip(display.removeSuffix(".zip").removeSuffix(".ZIP"), uri)
+                selectProject(project)
+                _uiState.update {
+                    it.copy(failoverNotice = "✅ Project \"${project.name}\" imported (${project.fileCount} files). Now tell me what to fix.")
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                _uiState.update { it.copy(failoverNotice = "⚠️ ZIP import failed: ${e.message ?: e.javaClass.simpleName}".take(220)) }
+            }
+        }
+    }
+
     fun addAttachment(uri: Uri, name: String, isImage: Boolean) {
+        val resolverType = try { getApplication<Application>().contentResolver.getType(uri) } catch (e: Exception) { null }
+        if (!isImage && (name.endsWith(".zip", ignoreCase = true) || resolverType == "application/zip" ||
+                resolverType == "application/x-zip-compressed")) {
+            importZipAsProject(uri)
+            return
+        }
         viewModelScope.launch {
             val item = withContext(Dispatchers.IO) {
                 if (isImage) {

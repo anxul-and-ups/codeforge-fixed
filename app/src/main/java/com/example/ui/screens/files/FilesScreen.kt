@@ -126,7 +126,7 @@ fun FilesScreen(
             scope.launch {
                 isLoading = true
                 try {
-                    val name = uri.lastPathSegment?.substringAfterLast('/')?.removeSuffix(".zip") ?: "Imported Project"
+                    val name = (projectRepository.queryDisplayName(uri) ?: "Imported Project").removeSuffix(".zip").removeSuffix(".ZIP")
                     val imported = projectRepository.importProjectFromZip(name, uri)
                     onSelectProject(imported)
                     Toast.makeText(context, "ZIP extracted successfully!", Toast.LENGTH_SHORT).show()
@@ -202,7 +202,7 @@ fun FilesScreen(
                 // Actions: Import ZIP & Starter
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     IconButton(
-                        onClick = { zipPickerLauncher.launch(arrayOf("application/zip", "application/x-zip-compressed", "*/*")) },
+                        onClick = { zipPickerLauncher.launch(arrayOf("*/*")) },
                         modifier = Modifier.size(36.dp)
                     ) {
                         Icon(

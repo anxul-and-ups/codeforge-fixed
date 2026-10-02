@@ -77,6 +77,17 @@ class ProjectRepository(
         entity
     }
 
+    /** Human readable file name of a content Uri (e.g. "myapp.zip"), or null. */
+    fun queryDisplayName(uri: Uri): String? {
+        return try {
+            context.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                if (c.moveToFirst()) c.getString(0) else null
+            } ?: uri.lastPathSegment?.substringAfterLast('/')
+        } catch (e: Exception) {
+            uri.lastPathSegment?.substringAfterLast('/')
+        }
+    }
+
     suspend fun importProjectFromZip(name: String, zipUri: Uri): ProjectEntity = withContext(Dispatchers.IO) {
         val id = UUID.randomUUID().toString()
         val projectsDir = File(context.filesDir, "projects")
@@ -85,29 +96,59 @@ class ProjectRepository(
         val projectRoot = File(projectsDir, id)
         projectRoot.mkdirs()
 
-        context.contentResolver.openInputStream(zipUri)?.use { inputStream ->
-            extractZipSafely(inputStream, projectRoot)
+        try {
+            val input = context.contentResolver.openInputStream(zipUri)
+                ?: throw IllegalStateException("Could not open the selected file")
+            input.use { extractZipSafely(it, projectRoot) }
+            flattenSingleRootFolder(projectRoot)
+        } catch (e: Exception) {
+            projectRoot.deleteRecursively()
+            throw e
         }
 
         val fileCount = countFiles(projectRoot)
+        if (fileCount == 0) {
+            projectRoot.deleteRecursively()
+            throw IllegalStateException("The ZIP has no files (is it a valid .zip?)")
+        }
         val entity = ProjectEntity(
             id = id,
-            name = name,
+            name = name.trim().ifEmpty { "Imported Project" }.take(60),
             rootPath = projectRoot.absolutePath,
             fileCount = fileCount,
             updatedAt = System.currentTimeMillis()
         )
         projectDao.insertProject(entity)
-        createCheckpoint(id, "Imported from ZIP")
+        try {
+            createCheckpoint(id, "Imported from ZIP")
+        } catch (e: Exception) {
+            // project is still usable without the baseline snapshot
+        }
         entity
+    }
+
+    /** GitHub-style zips contain one top-level folder ("repo-main/..."). Move its content up. */
+    private fun flattenSingleRootFolder(root: File) {
+        val children = root.listFiles()?.filter { it.name != "__MACOSX" && it.name != ".DS_Store" } ?: return
+        if (children.size == 1 && children[0].isDirectory) {
+            val inner = children[0]
+            val tmp = File(root, ".__flatten_tmp__")
+            if (!inner.renameTo(tmp)) return
+            tmp.listFiles()?.forEach { it.renameTo(File(root, it.name)) }
+            tmp.deleteRecursively()
+        }
+        File(root, "__MACOSX").deleteRecursively()
     }
 
     private fun extractZipSafely(inputStream: InputStream, destinationDir: File) {
         val canonicalDest = destinationDir.canonicalPath
         ZipInputStream(BufferedInputStream(inputStream)).use { zis ->
             var entry = zis.nextEntry
+            var count = 0
             while (entry != null) {
-                val newFile = File(destinationDir, entry.name)
+                count++
+                val entryName = entry.name.replace('\\', '/')
+                val newFile = File(destinationDir, entryName)
                 val canonicalNewFile = newFile.canonicalPath
 
                 // ZipSlip Protection Check!
@@ -117,7 +158,7 @@ class ProjectRepository(
 
                 if (entry.isDirectory) {
                     newFile.mkdirs()
-                } else {
+                } else if (!entryName.startsWith("__MACOSX/")) {
                     newFile.parentFile?.mkdirs()
                     FileOutputStream(newFile).use { fos ->
                         zis.copyTo(fos)
@@ -126,6 +167,7 @@ class ProjectRepository(
                 zis.closeEntry()
                 entry = zis.nextEntry
             }
+            if (count == 0) throw IllegalStateException("This file is not a valid ZIP archive")
         }
     }
 

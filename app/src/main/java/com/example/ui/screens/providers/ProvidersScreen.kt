@@ -294,6 +294,8 @@ fun ProvidersScreen(
         var customTools by remember { mutableStateOf(true) }
         var customFetching by remember { mutableStateOf(false) }
         var customModels by remember { mutableStateOf<List<String>>(emptyList()) }
+        var customError by remember { mutableStateOf<String?>(null) }
+        var customSaving by remember { mutableStateOf(false) }
 
         AlertDialog(
             onDismissRequest = { showAddCustomDialog = false },
@@ -403,6 +405,9 @@ fun ProvidersScreen(
                     ) {
                         Text(if (customFetching) "Fetching…" else "Fetch models from URL", fontSize = 12.sp, color = CyberCyan)
                     }
+                    if (customError != null) {
+                        Text(customError ?: "", fontSize = 12.sp, color = RoseError)
+                    }
                     if (customModels.isNotEmpty()) {
                         LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             items(customModels) { m ->
@@ -425,31 +430,47 @@ fun ProvidersScreen(
             },
             confirmButton = {
                 Button(
+                    enabled = !customSaving,
                     onClick = {
+                        val url = customUrl.trim()
                         val headersOk = customHeaders.isBlank() || try {
                             JSONObject(customHeaders); true
                         } catch (e: Exception) {
                             false
                         }
-                        if (!headersOk) {
-                            Toast.makeText(context, "Custom headers must be valid JSON.", Toast.LENGTH_SHORT).show()
-                        } else if (customName.isNotBlank() && customUrl.length > 8 && customModel.isNotBlank()) {
-                            scope.launch {
-                                providerRepository.addCustomProvider(
-                                    name = customName.trim(),
-                                    baseUrl = customUrl.trim(),
-                                    apiFormat = customFormat,
-                                    rawApiKey = customKey.trim(),
-                                    models = (customModels.ifEmpty { listOf(customModel.trim()) }),
-                                    selectedModel = customModel.trim(),
-                                    customHeadersJson = customHeaders.ifBlank { null },
-                                    supportsVision = customVision,
-                                    supportsTools = customTools
-                                )
-                                showAddCustomDialog = false
+                        when {
+                            customName.isBlank() -> customError = "Enter a name for the provider."
+                            !(url.startsWith("http://") || url.startsWith("https://")) || url.length < 10 ->
+                                customError = "Enter the full base URL, e.g. https://api.example.com/v1"
+                            customModel.isBlank() -> customError = "Enter a model name (or tap Fetch models)."
+                            !headersOk -> customError = "Custom headers must be valid JSON."
+                            else -> {
+                                customError = null
+                                customSaving = true
+                                scope.launch {
+                                    try {
+                                        providerRepository.addCustomProvider(
+                                            name = customName.trim(),
+                                            baseUrl = url,
+                                            apiFormat = customFormat,
+                                            rawApiKey = customKey.trim(),
+                                            models = (customModels.ifEmpty { listOf(customModel.trim()) }),
+                                            selectedModel = customModel.trim(),
+                                            customHeadersJson = customHeaders.ifBlank { null },
+                                            supportsVision = customVision,
+                                            supportsTools = customTools
+                                        )
+                                        Toast.makeText(context, "Provider added", Toast.LENGTH_SHORT).show()
+                                        showAddCustomDialog = false
+                                    } catch (e: kotlinx.coroutines.CancellationException) {
+                                        throw e
+                                    } catch (e: Exception) {
+                                        customError = "Could not save: ${e.message ?: e.javaClass.simpleName}"
+                                    } finally {
+                                        customSaving = false
+                                    }
+                                }
                             }
-                        } else {
-                            Toast.makeText(context, "Name, URL and model are required.", Toast.LENGTH_SHORT).show()
                         }
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = CyberCyan)
