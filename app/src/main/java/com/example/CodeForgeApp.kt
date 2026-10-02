@@ -56,8 +56,13 @@ class CodeForgeApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        com.example.util.CrashReporter.install(this)
         agentScope.launch(Dispatchers.IO) {
-            providerRepository.initializeDefaultPresets()
+            try {
+                providerRepository.initializeDefaultPresets()
+            } catch (e: Exception) {
+                android.util.Log.e("CodeForge", "Could not initialise provider presets", e)
+            }
         }
     }
 }

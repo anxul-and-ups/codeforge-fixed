@@ -10,7 +10,13 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.ui.Modifier
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
+import com.example.ui.CrashScreen
+import com.example.util.CrashReporter
 import com.example.ui.MainScreen
 import com.example.ui.theme.CodeForgeTheme
 
@@ -31,12 +37,25 @@ class MainActivity : ComponentActivity() {
             notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
 
+        val lastCrash = CrashReporter.readLastCrash(this)
         setContent {
             CodeForgeTheme(darkTheme = true) {
-                MainScreen(
-                    app = app,
-                    modifier = Modifier.fillMaxSize()
-                )
+                var crashText by remember { mutableStateOf(lastCrash) }
+                val crash = crashText
+                if (crash != null) {
+                    CrashScreen(
+                        crashText = crash,
+                        onContinue = {
+                            CrashReporter.clear(this@MainActivity)
+                            crashText = null
+                        }
+                    )
+                } else {
+                    MainScreen(
+                        app = app,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
             }
         }
     }
