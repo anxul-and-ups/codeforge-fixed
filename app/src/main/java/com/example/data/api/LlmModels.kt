@@ -2,6 +2,12 @@ package com.example.data.api
 
 import com.example.domain.model.ReasoningLevel
 
+data class LlmDocument(
+    val name: String,
+    val mime: String, // e.g. application/pdf
+    val base64: String
+)
+
 data class LlmMessage(
     val role: String, // "user", "assistant", "tool"
     val content: String,
@@ -9,6 +15,7 @@ data class LlmMessage(
     val toolName: String? = null,
     val toolCalls: List<LlmToolCall>? = null,
     val imagesBase64: List<String> = emptyList(), // data:image/png;base64,...
+    val docs: List<LlmDocument> = emptyList(), // PDFs
     /** Raw provider content (Anthropic blocks incl. thinking signatures / Gemini parts) so tool loops stay valid. */
     val rawContentJson: String? = null,
     val rawFormat: String? = null // "ANTHROPIC" or "GEMINI"

@@ -4,6 +4,12 @@ import androidx.activity.compose.BackHandler
 import com.example.ui.theme.AppColors
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.ime
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TextButton
+import androidx.compose.ui.platform.LocalDensity
+import com.example.ui.screens.builds.BuildLogScreen
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
@@ -49,7 +55,28 @@ fun MainScreen(
 
     // Handle back button on sub-screens
     BackHandler(enabled = currentScreen != Screen.Chat) {
-        currentScreen = Screen.Chat
+        currentScreen = if (currentScreen == Screen.Analytics) Screen.Settings else Screen.Chat
+    }
+
+    // Hide the bottom bar while typing: it caused a big empty gap between keyboard and input box
+    val imeOpen = WindowInsets.ime.getBottom(LocalDensity.current) > 0
+
+    // Permission requests from the agent (safe mode, "fix this build error?") on ANY screen
+    val approval = chatUiState.approval
+    if (approval != null) {
+        AlertDialog(
+            onDismissRequest = { chatViewModel.resolveApproval(false) },
+            title = { Text(approval.title) },
+            text = { Text(approval.summary, fontSize = 14.sp) },
+            confirmButton = {
+                TextButton(onClick = { chatViewModel.resolveApproval(true) }) { Text(approval.allowLabel) }
+            },
+            dismissButton = {
+                TextButton(onClick = { chatViewModel.resolveApproval(false) }) {
+                    Text(approval.denyLabel, color = AppColors.error)
+                }
+            }
+        )
     }
 
     Scaffold(
@@ -58,14 +85,15 @@ fun MainScreen(
             .background(AppColors.bg)
             .statusBarsPadding(),
         bottomBar = {
-            NavigationBar(
+            if (!imeOpen) NavigationBar(
                 containerColor = AppColors.surface,
                 modifier = Modifier
                     .navigationBarsPadding()
                     .testTag("bottom_nav_bar")
             ) {
                 for (screen in Screen.bottomNavItems) {
-                    val isSelected = currentScreen == screen
+                    val isSelected = currentScreen == screen ||
+                        (screen == Screen.Settings && currentScreen == Screen.Analytics)
                     NavigationBarItem(
                         selected = isSelected,
                         onClick = { currentScreen = screen },
@@ -126,6 +154,16 @@ fun MainScreen(
                         modifier = Modifier.fillMaxSize()
                     )
                 }
+                Screen.Builds -> {
+                    BuildLogScreen(
+                        store = app.buildLogStore,
+                        onSendToAi = { prompt ->
+                            currentScreen = Screen.Chat
+                            chatViewModel.sendMessage(prompt)
+                        },
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
                 Screen.Providers -> {
                     ProvidersScreen(
                         providerRepository = app.providerRepository,
@@ -147,6 +185,7 @@ fun MainScreen(
                             currentScreen = Screen.Chat
                             chatViewModel.sendMessage(buildPrompt)
                         },
+                        onOpenUsage = { currentScreen = Screen.Analytics },
                         onPushAndBuild = {
                             currentScreen = Screen.Chat
                             chatViewModel.pushAndBuild()

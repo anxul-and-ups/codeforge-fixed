@@ -80,6 +80,7 @@ fun SettingsScreen(
     settingsStore: SettingsStore,
     onFeedBuildErrorToChat: ((String) -> Unit)? = null,
     onPushAndBuild: (() -> Unit)? = null,
+    onOpenUsage: (() -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -92,6 +93,7 @@ fun SettingsScreen(
     var maxSteps by remember { mutableIntStateOf(settingsStore.maxSteps) }
     var autoPushBuild by remember { mutableStateOf(settingsStore.autoPushBuild) }
     var maxFixAttempts by remember { mutableIntStateOf(settingsStore.maxBuildFixAttempts) }
+    var askBeforeFix by remember { mutableStateOf(settingsStore.askBeforeBuildFix) }
 
     // GitHub Settings
     var githubPat by remember { mutableStateOf(settingsStore.githubToken) }
@@ -106,6 +108,7 @@ fun SettingsScreen(
     LaunchedEffect(maxSteps) { settingsStore.maxSteps = maxSteps }
     LaunchedEffect(autoPushBuild) { settingsStore.autoPushBuild = autoPushBuild }
     LaunchedEffect(maxFixAttempts) { settingsStore.maxBuildFixAttempts = maxFixAttempts }
+    LaunchedEffect(askBeforeFix) { settingsStore.askBeforeBuildFix = askBeforeFix }
     LaunchedEffect(githubPat) { settingsStore.githubToken = githubPat }
     LaunchedEffect(githubRepo) { settingsStore.githubRepo = githubRepo }
     LaunchedEffect(githubBranch) { settingsStore.githubBranch = githubBranch }
@@ -131,6 +134,30 @@ fun SettingsScreen(
                 color = AppColors.textPrimary,
                 modifier = Modifier.padding(start = 4.dp, top = 4.dp)
             )
+        }
+
+        // API usage
+        item {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = AppColors.surface),
+                shape = RoundedCornerShape(12.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, AppColors.border),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .clickable { onOpenUsage?.invoke() }
+            ) {
+                Row(
+                    modifier = Modifier.padding(14.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("API usage & budget", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = AppColors.textPrimary)
+                        Text("Tokens, cost, charts and monthly limit", fontSize = 12.sp, color = AppColors.textSecondary)
+                    }
+                    Text("›", fontSize = 20.sp, color = AppColors.textMuted)
+                }
+            }
         }
 
         // Appearance
@@ -419,6 +446,25 @@ fun SettingsScreen(
                         Switch(
                             checked = autoPushBuild,
                             onCheckedChange = { autoPushBuild = it },
+                            colors = SwitchDefaults.colors(checkedThumbColor = CyberCyan)
+                        )
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Ask before fixing build errors", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = AppColors.textPrimary)
+                            Text(
+                                "When a build fails, the AI waits for your OK before changing code.",
+                                fontSize = 11.sp,
+                                color = AppColors.textSecondary
+                            )
+                        }
+                        Switch(
+                            checked = askBeforeFix,
+                            onCheckedChange = { askBeforeFix = it },
                             colors = SwitchDefaults.colors(checkedThumbColor = CyberCyan)
                         )
                     }

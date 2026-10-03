@@ -40,8 +40,11 @@ interface ProjectDao {
 
 @Dao
 interface ConversationDao {
-    @Query("SELECT * FROM conversations ORDER BY isPinned DESC, updatedAt DESC")
+    @Query("SELECT * FROM conversations WHERE id IN (SELECT DISTINCT conversationId FROM messages) ORDER BY isPinned DESC, updatedAt DESC")
     fun getAllConversations(): Flow<List<ConversationEntity>>
+
+    @Query("SELECT * FROM conversations WHERE id = :id LIMIT 1")
+    fun observeConversation(id: String): Flow<ConversationEntity?>
 
     @Query("SELECT * FROM conversations WHERE projectId = :projectId ORDER BY isPinned DESC, updatedAt DESC")
     fun getConversationsForProject(projectId: String): Flow<List<ConversationEntity>>

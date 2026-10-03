@@ -6,8 +6,11 @@ Chat-based coding agent for Android (Kotlin + Jetpack Compose). Import a project
 - Clean light/dark UI (Settings → Appearance: System / Light / Dark).
 - Chat header shows the active model; tap it to switch provider/model. Each reply shows which model answered.
 - The agent's work is shown live as a terminal-style log (Read / Edit / Search / Write …); tap a line to see details or the exact edit.
-- Chat history keeps all chats of all projects; the last open chat is restored on start.
-- Attaching a .zip in a chat imports it as the project and keeps the same chat. Images, text/code files and .docx can be attached too.
+- Every app start opens a NEW chat. Old chats are in the side drawer (menu button, top left), across all projects.
+- The model selector sits inside the message box next to the send button.
+- While the agent works, a one-line English summary is shown; tap it to open the "Summary" sheet (title + step-by-step progress, with the exact files read/edited).
+- Attachments are sent together with your message: images, PDF (read natively by Claude/Gemini/OpenAI), text/code files, .docx, and project .zip (imported when you press send; the chat stays).
+- Builds tab: every GitHub build result and its error log, with Copy / Share / Send to AI. When a build fails, the AI asks your permission before fixing it (Settings → GitHub).
 
 ## How it works
 1. Add an API key in the **Providers** tab (Anthropic, OpenAI, Gemini, DeepSeek, Groq, OpenRouter, Mistral, Ollama, or any custom endpoint).

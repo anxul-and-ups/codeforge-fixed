@@ -40,6 +40,7 @@ class CodeForgeApp : Application() {
         )
     }
     val gitHubRepository by lazy { GitHubRepository() }
+    val buildLogStore by lazy { com.example.data.logs.BuildLogStore(this) }
     val agentEngine by lazy {
         AgentEngine(
             appContext = this,
@@ -50,7 +51,8 @@ class CodeForgeApp : Application() {
             messageDao = database.messageDao(),
             conversationDao = database.conversationDao(),
             usageDao = database.usageDao(),
-            settings = settingsStore
+            settings = settingsStore,
+            buildLogStore = buildLogStore
         )
     }
 

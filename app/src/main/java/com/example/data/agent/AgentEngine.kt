@@ -1,7 +1,11 @@
 package com.example.data.agent
 
 import android.content.Context
+import com.example.data.api.LlmDocument
 import com.example.data.api.LlmMessage
+import com.example.data.logs.BuildLogEntry
+import com.example.data.logs.BuildLogStore
+import kotlinx.coroutines.withTimeoutOrNull
 import com.example.data.api.LlmRequest
 import com.example.data.api.LlmResponse
 import com.example.data.api.LlmTool
@@ -39,6 +43,7 @@ sealed class AgentEvent {
     data class StatusUpdate(val statusText: String) : AgentEvent()
     data class ToolStarted(val stepIndex: Int, val toolName: String, val argsJson: String) : AgentEvent()
     data class ToolFinished(val stepIndex: Int, val toolName: String, val result: String, val isError: Boolean) : AgentEvent()
+    data class NoteAdded(val text: String) : AgentEvent()
     data class StreamingChunk(val text: String) : AgentEvent()
     data class ReasoningChunk(val text: String) : AgentEvent()
     object StreamingReset : AgentEvent()
@@ -52,11 +57,19 @@ data class RunRequest(
     val conversationId: String,
     val userPrompt: String,
     val imagesBase64: List<String> = emptyList(),
+    val docs: List<LlmDocument> = emptyList(),
     /** If true: skip the AI step and only push the project to GitHub, wait for the build and auto-fix. */
     val pushOnly: Boolean = false
 )
 
-data class ApprovalRequest(val id: String, val toolName: String, val summary: String)
+data class ApprovalRequest(
+    val id: String,
+    val toolName: String,
+    val summary: String,
+    val title: String = "Allow this change?",
+    val allowLabel: String = "Allow",
+    val denyLabel: String = "Deny"
+)
 
 private data class ToolResult(val text: String, val isError: Boolean = false, val changed: Boolean = false)
 
@@ -71,7 +84,8 @@ class AgentEngine(
     private val messageDao: MessageDao,
     private val conversationDao: ConversationDao,
     private val usageDao: UsageDao,
-    private val settings: SettingsStore
+    private val settings: SettingsStore,
+    private val buildLogStore: BuildLogStore
 ) {
     private val _agentEvents = MutableSharedFlow<AgentEvent>(extraBufferCapacity = 8192)
     val agentEvents = _agentEvents.asSharedFlow()
@@ -133,7 +147,7 @@ class AgentEngine(
         var changed = false
         var summary = ""
         if (!req.pushOnly) {
-            val result = runAgentLoop(req, req.userPrompt, req.imagesBase64)
+            val result = runAgentLoop(req, req.userPrompt, req.imagesBase64, req.docs)
             changed = result.changed
             summary = result.summary
             if (!result.ok) return
@@ -196,7 +210,15 @@ class AgentEngine(
                 _agentEvents.tryEmit(AgentEvent.Finished("No build run found", 0))
                 return
             }
+            val projectName = projectRepository.getProject(req.projectId)?.name ?: "Project"
             if (run.conclusion == "success") {
+                buildLogStore.add(
+                    BuildLogEntry(
+                        id = System.currentTimeMillis(), time = System.currentTimeMillis(), projectName = projectName,
+                        repo = repo, commit = short, status = "SUCCESS", attempt = attempt + 1,
+                        runUrl = run.htmlUrl, log = "Build succeeded."
+                    )
+                )
                 postNote(
                     req.conversationId,
                     "✅ GitHub build succeeded for commit $short.\nDownload the APK from the Artifacts section: ${run.htmlUrl}"
@@ -211,18 +233,54 @@ class AgentEngine(
             }
 
             attempt++
+            status("Build failed. Reading the error log…")
+            val log = gitHubRepository.fetchFailureLog(pat, repo, run.id)
+            // Always keep the error in the Builds tab so the user can read and copy it.
+            buildLogStore.add(
+                BuildLogEntry(
+                    id = System.currentTimeMillis(), time = System.currentTimeMillis(), projectName = projectName,
+                    repo = repo, commit = short, status = "FAILED", attempt = attempt,
+                    runUrl = run.htmlUrl, log = log
+                )
+            )
+            val firstError = log.lineSequence()
+                .firstOrNull { it.contains("error", ignoreCase = true) || it.startsWith("e: ") || it.contains("FAILED") }
+                ?.trim()?.take(160) ?: "See the Builds tab for the full log."
+
             if (attempt > maxAttempts) {
                 postNote(
                     req.conversationId,
-                    "❌ Build is still failing after $maxAttempts auto-fix attempt(s). Last run: ${run.htmlUrl}\nTell me what to try next, or send me the error."
+                    "❌ Build is still failing after $maxAttempts auto-fix attempt(s). The error log is saved in the **Builds** tab.\nLast run: ${run.htmlUrl}"
                 )
                 _agentEvents.tryEmit(AgentEvent.Finished("Build still failing", 0))
                 return
             }
 
-            status("Build failed. Reading the error log…")
-            val log = gitHubRepository.fetchFailureLog(pat, repo, run.id)
-            insertUserNote(req.conversationId, "🔧 GitHub build failed (attempt $attempt/$maxAttempts). Auto-fixing from the build log…")
+            postNote(
+                req.conversationId,
+                "❌ GitHub build failed (attempt $attempt/$maxAttempts). The error log is saved in the **Builds** tab.\n`$firstError`"
+            )
+            if (settings.askBeforeBuildFix) {
+                status("Build failed. Waiting for your permission to fix it…")
+                val allowed = withTimeoutOrNull(15 * 60_000L) {
+                    awaitDecision(
+                        ApprovalRequest(
+                            id = UUID.randomUUID().toString(),
+                            toolName = "build_fix",
+                            summary = "The GitHub build failed:\n$firstError\n\nLet the AI read the error log and try to fix the code?",
+                            title = "Build failed",
+                            allowLabel = "Fix with AI",
+                            denyLabel = "Not now"
+                        )
+                    )
+                } ?: false
+                if (!allowed) {
+                    postNote(req.conversationId, "OK, I will not change anything. You can copy the error from the Builds tab, or tell me to fix it later.")
+                    _agentEvents.tryEmit(AgentEvent.Finished("Build failed; waiting", 0))
+                    return
+                }
+            }
+            insertUserNote(req.conversationId, "🔧 Fix the GitHub build error (attempt $attempt/$maxAttempts).")
             val prompt = "The GitHub Actions build FAILED after the last changes. Fix the compile/build errors.\n\n" +
                 "Build log (errors extracted):\n```\n$log\n```\n\n" +
                 "Read the affected files first, fix the root cause with minimal edits, and call finish when done."
@@ -258,6 +316,13 @@ class AgentEngine(
                 status = "SUCCESS"
             )
         )
+    }
+
+    private suspend fun renameConversationIfDefault(conversationId: String, title: String) {
+        val c = conversationDao.getConversationById(conversationId) ?: return
+        if (title.isNotBlank()) {
+            conversationDao.updateConversation(c.copy(title = title.take(60)))
+        }
     }
 
     private suspend fun touchConversation(conversationId: String) {
@@ -329,6 +394,12 @@ WORKFLOW
 6. If the user only asks a question or reports a bug without wanting changes yet, answer or investigate first; do not edit unless fixing is the clear intent.
 7. When completely done, call finish with a short summary of what you changed and why. Keep explanations concise.
 
+PROGRESS NOTES (shown to the user in a "Summary" panel, ALWAYS in English)
+- Every time you are about to call tools, first write ONE short plain-English sentence (max 14 words) saying what you are doing, for example: Reading the chat screen to find the layout bug. No markdown, no code, no file contents.
+- In your very first reply of a task, begin with a line "TITLE: " followed by a 3-8 word English title for the whole task (for example: TITLE: Fix crash on app startup), then the first progress sentence on the next line.
+- After your last tool call, write the real answer for the user (in the user's language setting). Do not repeat the progress sentences there.
+- You can also create brand new apps: write all needed files (Gradle files, manifest, Kotlin sources, workflow) with write_file in the current project.
+
 RULES
 - Paths are relative to the project root. Do not touch build output folders.
 - Never read or print secrets (.env, keystores, google-services.json). Those tools will refuse.
@@ -344,7 +415,12 @@ RULES
         return sb.toString()
     }
 
-    private suspend fun runAgentLoop(req: RunRequest, prompt: String, images: List<String>): LoopResult {
+    private suspend fun runAgentLoop(
+        req: RunRequest,
+        prompt: String,
+        images: List<String>,
+        docs: List<LlmDocument> = emptyList()
+    ): LoopResult {
         val project = projectRepository.getProject(req.projectId)
         if (project == null) {
             _agentEvents.tryEmit(AgentEvent.Error("Project not found. Select or import a project first."))
@@ -373,7 +449,7 @@ RULES
 
         val systemPrompt = buildSystemPrompt(project.name, project.systemPrompt)
         val messages = ArrayList<LlmMessage>(history)
-        messages.add(LlmMessage(role = "user", content = prompt, imagesBase64 = images))
+        messages.add(LlmMessage(role = "user", content = prompt, imagesBase64 = images, docs = docs))
 
         val maxSteps = settings.maxSteps
         val fullText = StringBuilder()
@@ -445,9 +521,44 @@ RULES
                     if (reasoningAll.isNotEmpty()) reasoningAll.append("\n\n")
                     reasoningAll.append(response.reasoning)
                 }
-                if (response.content.isNotBlank()) {
-                    if (fullText.isNotEmpty()) fullText.append("\n\n")
-                    fullText.append(response.content.trim())
+                if (response.toolCalls.isNotEmpty()) {
+                    // Text written before tool calls = progress note for the Summary panel
+                    val raw = response.content.trim()
+                    if (raw.isNotEmpty()) {
+                        var noteText = raw
+                        var title: String? = null
+                        val m = Regex("^TITLE:\\s*(.+?)\\s*(\\n|$)").find(raw)
+                        if (m != null) {
+                            title = m.groupValues[1].trim()
+                            noteText = raw.substring(m.range.last + 1).trim()
+                        }
+                        toolIndex++
+                        val noteArgs = JSONObject().put("text", noteText.take(300))
+                        if (title != null) noteArgs.put("title", title.take(80))
+                        messageDao.insertToolStep(
+                            ToolStepEntity(
+                                id = UUID.randomUUID().toString(), messageId = assistantId, stepIndex = toolIndex,
+                                toolName = "note", argumentsJson = noteArgs.toString(),
+                                resultText = "", isError = false, status = "COMPLETED", durationMs = 0L
+                            )
+                        )
+                        if (title != null && history.isEmpty()) {
+                            renameConversationIfDefault(req.conversationId, title)
+                        }
+                        _agentEvents.tryEmit(AgentEvent.NoteAdded(noteText))
+                    }
+                    _agentEvents.tryEmit(AgentEvent.StreamingReset)
+                } else if (response.content.isNotBlank()) {
+                    var answer = response.content.trim()
+                    val m = Regex("^TITLE:\\s*(.+?)\\s*(\\n|$)").find(answer)
+                    if (m != null) {
+                        if (history.isEmpty()) renameConversationIfDefault(req.conversationId, m.groupValues[1].trim())
+                        answer = answer.substring(m.range.last + 1).trim()
+                    }
+                    if (answer.isNotEmpty()) {
+                        if (fullText.isNotEmpty()) fullText.append("\n\n")
+                        fullText.append(answer)
+                    }
                 }
 
                 messages.add(
@@ -594,11 +705,17 @@ RULES
     // Tools
     // ---------------------------------------------------------------------------------------
 
+    /** Safe mode: ask before each file change. */
     private suspend fun awaitApproval(toolName: String, summary: String): Boolean {
         if (!settings.safeMode) return true
+        return awaitDecision(ApprovalRequest(UUID.randomUUID().toString(), toolName, summary))
+    }
+
+    /** Always asks the user (dialog is shown on any screen) and waits for the answer. */
+    private suspend fun awaitDecision(request: ApprovalRequest): Boolean {
         val d = CompletableDeferred<Boolean>()
         pendingDecision = d
-        _approvalRequest.value = ApprovalRequest(UUID.randomUUID().toString(), toolName, summary)
+        _approvalRequest.value = request
         try {
             return d.await()
         } finally {

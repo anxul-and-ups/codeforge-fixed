@@ -69,6 +69,11 @@ class SettingsStore(context: Context) {
         get() = prefs.getInt("max_build_fix_attempts", 3)
         set(value) { prefs.edit().putInt("max_build_fix_attempts", value.coerceIn(1, 8)).apply() }
 
+    /** Ask the user before the AI tries to fix a failed GitHub build. */
+    var askBeforeBuildFix: Boolean
+        get() = prefs.getBoolean("ask_before_build_fix", true)
+        set(value) { prefs.edit().putBoolean("ask_before_build_fix", value).apply() }
+
     var activeProjectId: String?
         get() = prefs.getString("active_project_id", null)
         set(value) { prefs.edit().putString("active_project_id", value).apply() }

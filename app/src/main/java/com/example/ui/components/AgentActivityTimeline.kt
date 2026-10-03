@@ -118,6 +118,22 @@ fun AgentActivityTimeline(
     }
 }
 
+/** Terminal-style list of tool steps (used inside the Summary sheet). */
+@Composable
+fun ToolLines(steps: List<ToolStepEntity>) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(AppColors.codeBg)
+            .padding(vertical = 4.dp)
+    ) {
+        for (step in steps) {
+            StepLine(step)
+        }
+    }
+}
+
 @Composable
 private fun StepLine(step: ToolStepEntity) {
     var open by remember { mutableStateOf(false) }

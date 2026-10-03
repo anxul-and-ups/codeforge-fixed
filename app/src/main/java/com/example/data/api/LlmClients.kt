@@ -77,7 +77,9 @@ class LlmClient(
         onReasoning: ((String) -> Unit)?
     ): LlmResponse {
         val req = if (provider.supportsVision) request else request.copy(
-            messages = request.messages.map { if (it.imagesBase64.isEmpty()) it else it.copy(imagesBase64 = emptyList()) }
+            messages = request.messages.map {
+                if (it.imagesBase64.isEmpty() && it.docs.isEmpty()) it else it.copy(imagesBase64 = emptyList(), docs = emptyList())
+            }
         )
         return when (provider.apiFormat.uppercase()) {
             "ANTHROPIC" -> executeAnthropic(provider, apiKey, req, flags, onChunk, onReasoning)
@@ -271,6 +273,16 @@ class LlmClient(
                                 .put(
                                     "source",
                                     JSONObject().put("type", "base64").put("media_type", mime).put("data", data)
+                                )
+                        )
+                    }
+                    for (d in m.docs) {
+                        arr.put(
+                            JSONObject()
+                                .put("type", "document")
+                                .put(
+                                    "source",
+                                    JSONObject().put("type", "base64").put("media_type", d.mime).put("data", d.base64)
                                 )
                         )
                     }
@@ -538,9 +550,28 @@ class LlmClient(
                 }
                 else -> {
                     msgObj.put("role", "user")
-                    if (m.imagesBase64.isNotEmpty()) {
+                    val pdfSupported = base.contains("api.openai.com") || base.contains("openrouter.ai")
+                    val sendDocs = pdfSupported && m.docs.isNotEmpty()
+                    if (m.imagesBase64.isNotEmpty() || sendDocs) {
                         val contentArr = JSONArray()
-                        contentArr.put(JSONObject().put("type", "text").put("text", m.content.ifBlank { "(no text)" }))
+                        val extra = if (!pdfSupported && m.docs.isNotEmpty()) {
+                            "\n\n[Note: a PDF was attached but this provider cannot read PDFs.]"
+                        } else ""
+                        contentArr.put(JSONObject().put("type", "text").put("text", (m.content + extra).ifBlank { "(no text)" }))
+                        if (sendDocs) {
+                            for (d in m.docs) {
+                                contentArr.put(
+                                    JSONObject()
+                                        .put("type", "file")
+                                        .put(
+                                            "file",
+                                            JSONObject()
+                                                .put("filename", d.name)
+                                                .put("file_data", "data:${d.mime};base64,${d.base64}")
+                                        )
+                                )
+                            }
+                        }
                         for (img in m.imagesBase64) {
                             val urlStr = if (img.startsWith("data:")) img else "data:image/jpeg;base64,$img"
                             contentArr.put(
@@ -551,7 +582,8 @@ class LlmClient(
                         }
                         msgObj.put("content", contentArr)
                     } else {
-                        msgObj.put("content", m.content.ifBlank { "(no text)" })
+                        val extra = if (m.docs.isNotEmpty()) "\n\n[Note: a PDF was attached but this provider cannot read PDFs.]" else ""
+                        msgObj.put("content", (m.content + extra).ifBlank { "(no text)" })
                     }
                 }
             }
@@ -813,6 +845,14 @@ class LlmClient(
                             JSONObject().put(
                                 "inlineData",
                                 JSONObject().put("mimeType", mime).put("data", data)
+                            )
+                        )
+                    }
+                    for (d in m.docs) {
+                        parts.put(
+                            JSONObject().put(
+                                "inlineData",
+                                JSONObject().put("mimeType", d.mime).put("data", d.base64)
                             )
                         )
                     }
