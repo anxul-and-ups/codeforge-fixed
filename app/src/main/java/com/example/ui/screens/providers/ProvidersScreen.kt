@@ -64,23 +64,28 @@ import androidx.compose.ui.window.DialogProperties
 import com.example.data.local.entity.ProviderConfigEntity
 import com.example.data.repository.ProviderRepository
 import com.example.data.security.KeyStoreManager
+import com.example.ui.components.ProviderIcon
+import com.example.ui.screens.chat.isProviderReady
 import com.example.ui.screens.chat.providerModels
 import com.example.ui.theme.AppColors
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
 
-private val PRESET_IDS = setOf("anthropic", "openai", "gemini", "deepseek", "groq", "openrouter", "mistral", "ollama")
+private val PRESET_IDS = setOf("anthropic", "openai", "gemini", "deepseek", "kimi", "xai", "groq", "openrouter", "mistral", "ollama")
 
 @Composable
 fun ProvidersScreen(
     providerRepository: ProviderRepository,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    startWithAdd: Boolean = false,
+    startEditId: String? = null,
+    onFinished: (() -> Unit)? = null
 ) {
     val providers by providerRepository.allProviders.collectAsState(initial = emptyList())
     val scope = rememberCoroutineScope()
-    var editingId by remember { mutableStateOf<String?>(null) }
-    var showAdd by remember { mutableStateOf(false) }
+    var editingId by remember { mutableStateOf(startEditId) }
+    var showAdd by remember { mutableStateOf(startWithAdd) }
 
     val editing = providers.firstOrNull { it.id == editingId }
 
@@ -151,11 +156,20 @@ fun ProvidersScreen(
         ProviderEditor(
             provider = editing,
             repo = providerRepository,
-            onDismiss = { editingId = null }
+            onDismiss = {
+                editingId = null
+                onFinished?.invoke()
+            }
         )
     }
     if (showAdd) {
-        AddProviderDialog(repo = providerRepository, onDismiss = { showAdd = false })
+        AddProviderDialog(
+            repo = providerRepository,
+            onDismiss = {
+                showAdd = false
+                onFinished?.invoke()
+            }
+        )
     }
 }
 
@@ -169,7 +183,7 @@ private fun ProviderRow(
     onMoveUp: () -> Unit,
     onMoveDown: () -> Unit
 ) {
-    val hasKey = provider.encryptedApiKey.isNotEmpty() || provider.id == "ollama"
+    val hasKey = provider.encryptedApiKey.isNotEmpty() || isProviderReady(provider)
     val now = System.currentTimeMillis()
     val cooling = provider.cooldownUntilTimestamp > now
     val (statusText, statusColor) = when {
@@ -192,19 +206,16 @@ private fun ProviderRow(
             modifier = Modifier.padding(start = 12.dp, top = 10.dp, bottom = 10.dp, end = 4.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Box(
-                modifier = Modifier
-                    .size(28.dp)
-                    .clip(CircleShape)
-                    .background(AppColors.surfaceAlt),
-                contentAlignment = Alignment.Center
-            ) {
-                Text("$index", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = AppColors.textSecondary)
-            }
+            ProviderIcon(
+                providerId = provider.id,
+                model = provider.selectedModel,
+                size = 32.dp,
+                providerName = provider.name
+            )
             Spacer(modifier = Modifier.width(12.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = provider.name,
+                    text = "$index.  ${provider.name}",
                     fontSize = 15.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = AppColors.textPrimary,
@@ -382,6 +393,13 @@ private fun ProviderEditor(
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
+                    ProviderIcon(
+                        providerId = provider.id,
+                        model = modelText,
+                        size = 36.dp,
+                        providerName = provider.name
+                    )
+                    Spacer(modifier = Modifier.width(12.dp))
                     Column(modifier = Modifier.weight(1f)) {
                         Text(provider.name, fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = AppColors.textPrimary)
                         Text(

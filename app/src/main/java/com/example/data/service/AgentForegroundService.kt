@@ -28,19 +28,23 @@ class AgentForegroundService : Service() {
         @Volatile
         private var running = false
 
+        @Volatile
+        private var stopRequested = false
+
+        /**
+         * Plain startService (the app is in the foreground when a run starts). Using startForegroundService
+         * here caused "did not then call startForeground" crashes when the run ended before the service started.
+         */
         fun startService(context: Context, status: String = "Agent is working…") {
+            stopRequested = false
             try {
                 val intent = Intent(context, AgentForegroundService::class.java).apply {
                     action = ACTION_START
                     putExtra(EXTRA_STATUS, status)
                 }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    context.startForegroundService(intent)
-                } else {
-                    context.startService(intent)
-                }
+                context.startService(intent)
             } catch (e: Exception) {
-                // Starting a foreground service can be refused in some background states; the agent still runs.
+                // Not allowed right now (e.g. app in background). The agent still runs, only the notification is missing.
             }
         }
 
@@ -56,10 +60,15 @@ class AgentForegroundService : Service() {
         }
 
         fun stopService(context: Context) {
-            try {
-                context.stopService(Intent(context, AgentForegroundService::class.java))
-            } catch (e: Exception) {
-                // ignore
+            if (running) {
+                try {
+                    context.stopService(Intent(context, AgentForegroundService::class.java))
+                } catch (e: Exception) {
+                    // ignore
+                }
+            } else {
+                // The service has not reached startForeground yet: it will stop itself right after.
+                stopRequested = true
             }
         }
 
@@ -101,6 +110,13 @@ class AgentForegroundService : Service() {
             }
             running = true
         } catch (e: Exception) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        if (stopRequested) {
+            stopRequested = false
+            running = false
+            stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         }
         return START_NOT_STICKY

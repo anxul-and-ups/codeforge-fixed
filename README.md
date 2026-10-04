@@ -12,6 +12,9 @@ Chat-based coding agent for Android (Kotlin + Jetpack Compose). Import a project
 - Attachments are sent together with your message: images, PDF (read natively by Claude/Gemini/OpenAI), text/code files, .docx, and project .zip (imported when you press send; the chat stays).
 - Builds tab: every GitHub build result and its error log, with Copy / Share / Send to AI. When a build fails, the AI asks your permission before fixing it (Settings → GitHub).
 
+- Provider/model logos (Claude, OpenAI, Gemini, DeepSeek, Kimi, Grok, Perplexity) are shown next to model names; custom providers use the app icon.
+- Files tab: green tick on every edited file and its folders, syntax-highlighted scrollable viewer, Download/Share ZIP. Changes tab: Undo / Redo of AI runs.
+
 ## How it works
 1. Add an API key in the **Providers** tab (Anthropic, OpenAI, Gemini, DeepSeek, Groq, OpenRouter, Mistral, Ollama, or any custom endpoint).
 2. Import a ZIP in the **Files** tab.

@@ -181,7 +181,7 @@ class AgentEngine(
             status("Pushing changes to GitHub…")
             val push = try {
                 val files = projectRepository.listFilesForPush(req.projectId)
-                val deleted = projectRepository.computeDiffsFromLastCheckpoint(req.projectId)
+                val deleted = projectRepository.computeRunDiffs(req.projectId)
                     .filter { it.isDeletedFile }.map { it.filePath.replace('\\', '/') }.toSet()
                 gitHubRepository.pushProject(
                     pat, repo, branch, files, deleted,
@@ -440,7 +440,8 @@ RULES
         )
 
         try {
-            projectRepository.createCheckpoint(req.projectId, "Before: ${prompt.lineSequence().firstOrNull().orEmpty().take(50)}")
+            val cp = projectRepository.createCheckpoint(req.projectId, "Before: ${prompt.lineSequence().firstOrNull().orEmpty().take(50)}")
+            projectRepository.recordRunCheckpoint(req.projectId, cp.id)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {

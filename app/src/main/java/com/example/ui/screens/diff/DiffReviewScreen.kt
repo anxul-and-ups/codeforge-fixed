@@ -92,7 +92,7 @@ fun DiffReviewScreen(
         if (activeProject == null) return
         scope.launch {
             isLoading = true
-            diffs = projectRepository.computeDiffsFromLastCheckpoint(activeProject.id)
+            diffs = projectRepository.computeRunDiffs(activeProject.id)
             isLoading = false
         }
     }
@@ -104,6 +104,11 @@ fun DiffReviewScreen(
                 checkpoints = list
             }
         }
+    }
+
+    val undoTick by projectRepository.undoTick.collectAsState()
+    val undoCounts = remember(undoTick, activeProject?.id) {
+        if (activeProject != null) projectRepository.undoRedoCounts(activeProject.id) else Pair(0, 0)
     }
 
     fun shareFile(file: File, mimeType: String, chooserTitle: String) {
@@ -180,6 +185,63 @@ fun DiffReviewScreen(
                         Text("Export ZIP", fontSize = 12.sp, color = AppColors.onAccent)
                     }
                 }
+            }
+        }
+
+        // Undo / redo of AI changes + download
+        Surface(color = AppColors.surface, modifier = Modifier.fillMaxWidth()) {
+            Column(modifier = Modifier.padding(start = 12.dp, end = 12.dp, bottom = 10.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                    OutlinedButton(
+                        enabled = undoCounts.first > 0 && activeProject != null,
+                        onClick = {
+                            if (activeProject != null) {
+                                scope.launch {
+                                    val msg = projectRepository.undoLastRun(activeProject.id)
+                                    Toast.makeText(context, msg ?: "Nothing to undo", Toast.LENGTH_SHORT).show()
+                                    refreshDiffs()
+                                }
+                            }
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) { Text("Undo (${undoCounts.first})", fontSize = 13.sp, color = AppColors.textPrimary) }
+                    OutlinedButton(
+                        enabled = undoCounts.second > 0 && activeProject != null,
+                        onClick = {
+                            if (activeProject != null) {
+                                scope.launch {
+                                    val msg = projectRepository.redoLastUndo(activeProject.id)
+                                    Toast.makeText(context, msg ?: "Nothing to redo", Toast.LENGTH_SHORT).show()
+                                    refreshDiffs()
+                                }
+                            }
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) { Text("Redo (${undoCounts.second})", fontSize = 13.sp, color = AppColors.textPrimary) }
+                }
+                Spacer(modifier = Modifier.height(6.dp))
+                OutlinedButton(
+                    enabled = activeProject != null,
+                    onClick = {
+                        if (activeProject != null) {
+                            scope.launch {
+                                try {
+                                    val where = projectRepository.saveZipToDownloads(activeProject.id)
+                                    Toast.makeText(context, "Saved to $where", Toast.LENGTH_LONG).show()
+                                } catch (e: Exception) {
+                                    Toast.makeText(context, "Could not save: ${e.message}", Toast.LENGTH_LONG).show()
+                                }
+                            }
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Download ZIP to Downloads folder", fontSize = 13.sp, color = AppColors.textPrimary) }
+                Text(
+                    text = if (diffs.isEmpty()) "No file changed in the last AI run." else "${diffs.size} file(s) changed in the last AI run (listed below).",
+                    fontSize = 12.sp,
+                    color = AppColors.textSecondary,
+                    modifier = Modifier.padding(top = 6.dp)
+                )
             }
         }
 

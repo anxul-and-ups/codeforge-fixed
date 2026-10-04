@@ -47,7 +47,7 @@ class SettingsStore(context: Context) {
 
     var githubRepo: String
         get() = prefs.getString("github_repo", "") ?: ""
-        set(value) { prefs.edit().putString("github_repo", value.trim()).apply() }
+        set(value) { prefs.edit().putString("github_repo", normalizeRepo(value)).apply() }
 
     var githubBranch: String
         get() = prefs.getString("github_branch", "main") ?: "main"
@@ -74,6 +74,10 @@ class SettingsStore(context: Context) {
         get() = prefs.getBoolean("ask_before_build_fix", true)
         set(value) { prefs.edit().putBoolean("ask_before_build_fix", value).apply() }
 
+    var ollamaMigrated: Boolean
+        get() = prefs.getBoolean("ollama_migrated", false)
+        set(value) { prefs.edit().putBoolean("ollama_migrated", value).apply() }
+
     var activeProjectId: String?
         get() = prefs.getString("active_project_id", null)
         set(value) { prefs.edit().putString("active_project_id", value).apply() }
@@ -99,6 +103,15 @@ class SettingsStore(context: Context) {
         get() = githubRepo.contains("/") && githubToken.isNotBlank()
 
     companion object {
+        fun normalizeRepo(input: String): String {
+            var s = input.trim()
+            s = s.removePrefix("https://").removePrefix("http://").removePrefix("www.")
+            s = s.removePrefix("github.com/").removePrefix("github.com:")
+            s = s.removeSuffix("/").removeSuffix(".git").trim('/')
+            val parts = s.split('/').filter { it.isNotBlank() }
+            return if (parts.size >= 2) parts[0] + "/" + parts[1] else s
+        }
+
         const val DEFAULT_GLOBAL_PROMPT =
             "Be concise, write production-grade Kotlin, follow modern Android patterns, and double-check imports."
         val LANGUAGES = listOf("English", "Hinglish", "Hindi", "Spanish", "French", "German")

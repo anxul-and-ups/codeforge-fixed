@@ -42,6 +42,13 @@ object AppColors {
     val error: Color get() = if (isDark) Color(0xFFEA7C78) else Color(0xFFC8423D)
     val reasoning: Color get() = if (isDark) Color(0xFFB7A3DD) else Color(0xFF6F52AE)
 
+    val synKeyword: Color get() = if (isDark) Color(0xFFC49BF0) else Color(0xFF7A3E9D)
+    val synString: Color get() = if (isDark) Color(0xFF9CCB7E) else Color(0xFF2E7D32)
+    val synComment: Color get() = if (isDark) Color(0xFF7C8089) else Color(0xFF7A7F87)
+    val synNumber: Color get() = if (isDark) Color(0xFFE5A559) else Color(0xFFB45F06)
+    val synType: Color get() = if (isDark) Color(0xFF7FB8E8) else Color(0xFF1F5FA8)
+    val synAnnotation: Color get() = if (isDark) Color(0xFFD9BE7E) else Color(0xFF8A6D0B)
+
     val diffAddBg: Color get() = if (isDark) Color(0xFF173225) else Color(0xFFE2F4E9)
     val diffAddText: Color get() = if (isDark) Color(0xFF86D7A8) else Color(0xFF1C7343)
     val diffRemoveBg: Color get() = if (isDark) Color(0xFF3A1D1F) else Color(0xFFFBE6E5)

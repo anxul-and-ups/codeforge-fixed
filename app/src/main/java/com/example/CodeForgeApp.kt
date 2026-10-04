@@ -61,7 +61,7 @@ class CodeForgeApp : Application() {
         com.example.util.CrashReporter.install(this)
         agentScope.launch(Dispatchers.IO) {
             try {
-                providerRepository.initializeDefaultPresets()
+                providerRepository.initializeDefaultPresets(settingsStore)
             } catch (e: Exception) {
                 android.util.Log.e("CodeForge", "Could not initialise provider presets", e)
             }

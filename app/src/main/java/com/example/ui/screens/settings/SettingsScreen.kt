@@ -115,6 +115,7 @@ fun SettingsScreen(
 
     var isCheckingGitHub by remember { mutableStateOf(false) }
     var githubConnected by remember { mutableStateOf<Boolean?>(null) }
+    var githubMessage by remember { mutableStateOf<String?>(null) }
     var workflowRuns by remember { mutableStateOf<List<WorkflowRunInfo>>(emptyList()) }
     var isLoadingRuns by remember { mutableStateOf(false) }
 
@@ -508,16 +509,21 @@ fun SettingsScreen(
                                 if (githubRepo.isNotBlank() && githubPat.isNotBlank()) {
                                     scope.launch {
                                         isCheckingGitHub = true
-                                        val ok = gitHubRepository.testToken(githubPat.trim(), githubRepo.trim())
+                                        githubRepo = SettingsStore.normalizeRepo(githubRepo)
+                                        val error = gitHubRepository.checkConnection(githubPat.trim(), githubRepo, githubBranch)
+                                        val ok = error == null
                                         githubConnected = ok
+                                        githubMessage = error ?: "Connected. The token can read and write ${githubRepo}."
                                         if (ok) {
                                             isLoadingRuns = true
                                             workflowRuns = gitHubRepository.getRecentWorkflowRuns(githubPat.trim(), githubRepo.trim())
                                             isLoadingRuns = false
                                         }
                                         isCheckingGitHub = false
-                                        Toast.makeText(context, if (ok) "GitHub Connected!" else "Connection failed.", Toast.LENGTH_SHORT).show()
                                     }
+                                } else {
+                                    githubConnected = false
+                                    githubMessage = "Enter the repository (owner/repo) and your token first."
                                 }
                             }
                         ) {
@@ -543,6 +549,15 @@ fun SettingsScreen(
                             Spacer(modifier = Modifier.width(4.dp))
                             Text("Trigger Build", fontSize = 11.sp, color = AppColors.onAccent)
                         }
+                    }
+
+                    if (githubMessage != null) {
+                        Text(
+                            text = githubMessage ?: "",
+                            fontSize = 12.sp,
+                            lineHeight = 17.sp,
+                            color = if (githubConnected == true) EmeraldSuccess else RoseError
+                        )
                     }
 
                     // Recent Workflow Runs

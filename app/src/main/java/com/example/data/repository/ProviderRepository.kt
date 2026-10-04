@@ -62,6 +62,20 @@ class ProviderRepository(
             supportsVision = false, supportsTools = true
         ),
         ProviderConfigEntity(
+            id = "kimi", name = "Kimi (Moonshot)",
+            baseUrl = "https://api.moonshot.ai/v1", apiFormat = "OPENAI", encryptedApiKey = "",
+            modelsJson = models("kimi-k2-0905-preview", "kimi-k2-turbo-preview"),
+            selectedModel = "kimi-k2-0905-preview", priority = 5,
+            supportsVision = false, supportsTools = true
+        ),
+        ProviderConfigEntity(
+            id = "xai", name = "xAI (Grok)",
+            baseUrl = "https://api.x.ai/v1", apiFormat = "OPENAI", encryptedApiKey = "",
+            modelsJson = models("grok-4", "grok-code-fast-1"),
+            selectedModel = "grok-4", priority = 6,
+            supportsVision = true, supportsTools = true
+        ),
+        ProviderConfigEntity(
             id = "groq", name = "Groq",
             baseUrl = "https://api.groq.com/openai/v1", apiFormat = "OPENAI", encryptedApiKey = "",
             modelsJson = models("llama-3.3-70b-versatile"),
@@ -86,7 +100,8 @@ class ProviderRepository(
             id = "ollama", name = "Ollama / Local LM",
             baseUrl = "http://localhost:11434/v1", apiFormat = "OPENAI", encryptedApiKey = "",
             modelsJson = models("qwen2.5-coder:7b", "llama3.2:latest"),
-            selectedModel = "qwen2.5-coder:7b", priority = 8,
+            selectedModel = "qwen2.5-coder:7b", priority = 10,
+            isEnabled = false,
             supportsVision = false, supportsTools = true
         )
     )
@@ -97,12 +112,26 @@ class ProviderRepository(
         "gemini-1.5-pro", "gemini-1.5-flash", "anthropic/claude-3.5-sonnet", "mixtral-8x7b-32768"
     )
 
-    suspend fun initializeDefaultPresets() {
+    suspend fun initializeDefaultPresets(settings: com.example.data.settings.SettingsStore? = null) {
         val existing = providerDao.getAllProvidersOnce()
         val presets = defaultPresets()
         if (existing.isEmpty()) {
             providerDao.insertProviders(presets)
+            settings?.ollamaMigrated = true
             return
+        }
+        // Add presets that older versions did not have (Kimi, xAI) without touching existing ones
+        val known = existing.map { it.id }.toSet()
+        var nextPriority = (existing.maxOfOrNull { it.priority } ?: 0) + 1
+        val missing = presets.filter { it.id !in known }.map { it.copy(priority = nextPriority++) }
+        if (missing.isNotEmpty()) providerDao.insertProviders(missing)
+
+        // Local Ollama must not appear as a ready model before the user turns it on (one-time)
+        if (settings != null && !settings.ollamaMigrated) {
+            existing.firstOrNull { it.id == "ollama" }?.let { o ->
+                if (o.encryptedApiKey.isEmpty() && o.isEnabled) providerDao.updateProvider(o.copy(isEnabled = false))
+            }
+            settings.ollamaMigrated = true
         }
         // Existing install: never overwrite keys/settings. Only fix stale model names / local URL.
         for (p in existing) {

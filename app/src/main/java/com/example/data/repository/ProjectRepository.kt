@@ -7,6 +7,11 @@ import com.example.data.local.dao.ProjectDao
 import com.example.data.local.entity.CheckpointEntity
 import com.example.data.local.entity.ProjectEntity
 import com.example.data.security.KeyStoreManager
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import org.json.JSONArray
+import org.json.JSONObject
 import com.example.domain.model.DiffLine
 import com.example.domain.model.DiffLineType
 import com.example.domain.model.FileDiff
@@ -241,6 +246,20 @@ class ProjectRepository(
         out
     }
 
+    /** Plain file text for the viewer/editor (no line-number prefixes, unlike [readFile] used by the AI). */
+    suspend fun readFileRaw(projectId: String, relativePath: String): String = withContext(Dispatchers.IO) {
+        val project = projectDao.getProjectById(projectId) ?: throw IllegalArgumentException("Project not found")
+        val targetFile = resolveSafePath(File(project.rootPath), relativePath)
+        if (!targetFile.exists() || targetFile.isDirectory) throw NoSuchFileException(targetFile, reason = "File does not exist: $relativePath")
+        if (isBinaryFile(targetFile)) {
+            return@withContext "[Binary file: $relativePath (${targetFile.length() / 1024} KB) - cannot be shown as text]"
+        }
+        if (targetFile.length() > 2_000_000L) {
+            return@withContext "[File is too large to show (${targetFile.length() / 1024} KB)]"
+        }
+        targetFile.readText()
+    }
+
     suspend fun readFile(projectId: String, relativePath: String, startLine: Int? = null, endLine: Int? = null): String = withContext(Dispatchers.IO) {
         val project = projectDao.getProjectById(projectId) ?: throw IllegalArgumentException("Project not found")
         val targetFile = resolveSafePath(File(project.rootPath), relativePath)
@@ -422,7 +441,7 @@ class ProjectRepository(
         )
         checkpointDao.insertCheckpoint(entity)
         // keep only the newest 15 snapshots per project to save storage
-        val all = checkpointDao.getCheckpointsForProjectOnce(projectId)
+        val all = checkpointDao.getCheckpointsForProjectOnce(projectId).filter { !isBaselineTitle(it.title) }
         if (all.size > 15) {
             for (old in all.drop(15)) {
                 try { File(old.snapshotDirPath).deleteRecursively() } catch (e: Exception) { }
@@ -468,6 +487,11 @@ class ProjectRepository(
         val snapshotDir = File(lastCheckpoint.snapshotDirPath)
         if (!snapshotDir.exists()) return@withContext emptyList()
 
+        diffAgainstSnapshot(currentDir, snapshotDir)
+    }
+
+    /** Diff of the current project against any snapshot directory. */
+    private fun diffAgainstSnapshot(currentDir: File, snapshotDir: File): List<FileDiff> {
         val currentFiles = walkFiltered(currentDir).filter { it.isFile && !isBinaryFile(it) }.toList()
         val snapshotFiles = walkFiltered(snapshotDir).filter { it.isFile && !isBinaryFile(it) }.toList()
 
@@ -502,14 +526,187 @@ class ProjectRepository(
                 )
             }
         }
-        diffs
+        return diffs
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Baseline (since import), undo / redo
+    // ---------------------------------------------------------------------------------------
+
+    private fun isBaselineTitle(title: String) = title == "Initial State" || title.startsWith("Imported")
+
+    private suspend fun baselineCheckpoint(projectId: String): CheckpointEntity? {
+        val all = checkpointDao.getCheckpointsForProjectOnce(projectId) // newest first
+        return all.lastOrNull { isBaselineTitle(it.title) } ?: all.lastOrNull()
+    }
+
+    /** All files that differ from the state at import/creation (used for the green ticks in Files). */
+    suspend fun getChangedPaths(projectId: String): Set<String> = withContext(Dispatchers.IO) {
+        val project = projectDao.getProjectById(projectId) ?: return@withContext emptySet()
+        val base = baselineCheckpoint(projectId) ?: return@withContext emptySet()
+        val currentDir = File(project.rootPath)
+        val snapDir = File(base.snapshotDirPath)
+        if (!currentDir.exists() || !snapDir.exists()) return@withContext emptySet()
+
+        val cur = walkFiltered(currentDir).filter { it.isFile }.associateBy { it.relativeTo(currentDir).path }
+        val snap = walkFiltered(snapDir).filter { it.isFile }.associateBy { it.relativeTo(snapDir).path }
+        val changed = HashSet<String>()
+        for ((path, f) in cur) {
+            val sf = snap[path]
+            val differs = sf == null || sf.length() != f.length() ||
+                (f.length() < 3_000_000L && !f.readBytes().contentEquals(sf.readBytes()))
+            if (differs) changed.add(path.replace(File.separatorChar, '/'))
+        }
+        changed
+    }
+
+    private val _undoTick = MutableStateFlow(0)
+    val undoTick: StateFlow<Int> = _undoTick.asStateFlow()
+
+    private fun stackFile(projectId: String) = File(context.filesDir, "undo_$projectId.json")
+
+    private fun readStacks(projectId: String): Pair<MutableList<String>, MutableList<String>> {
+        val undo = mutableListOf<String>()
+        val redo = mutableListOf<String>()
+        try {
+            val f = stackFile(projectId)
+            if (f.exists()) {
+                val o = JSONObject(f.readText())
+                val u = o.optJSONArray("undo") ?: JSONArray()
+                val r = o.optJSONArray("redo") ?: JSONArray()
+                for (i in 0 until u.length()) undo.add(u.getString(i))
+                for (i in 0 until r.length()) redo.add(r.getString(i))
+            }
+        } catch (e: Exception) {
+            // start with empty stacks
+        }
+        return Pair(undo, redo)
+    }
+
+    private fun writeStacks(projectId: String, undo: List<String>, redo: List<String>) {
+        try {
+            stackFile(projectId).writeText(
+                JSONObject().put("undo", JSONArray(undo)).put("redo", JSONArray(redo)).toString()
+            )
+        } catch (e: Exception) {
+            // ignore
+        }
+        _undoTick.value = _undoTick.value + 1
+    }
+
+    /** (number of undo steps, number of redo steps) */
+    fun undoRedoCounts(projectId: String): Pair<Int, Int> {
+        val (u, r) = readStacks(projectId)
+        return Pair(u.size, r.size)
+    }
+
+    /** Called when an AI run starts: [checkpointId] is the snapshot of the state before that run. */
+    fun recordRunCheckpoint(projectId: String, checkpointId: String) {
+        val (u, _) = readStacks(projectId)
+        u.add(checkpointId)
+        writeStacks(projectId, u.takeLast(30), emptyList())
+    }
+
+    private suspend fun applySnapshot(checkpoint: CheckpointEntity, project: ProjectEntity): Boolean {
+        val snapshotDir = File(checkpoint.snapshotDirPath)
+        if (!snapshotDir.exists()) return false
+        val root = File(project.rootPath)
+        root.mkdirs()
+        root.listFiles()?.forEach { child ->
+            if (!isIgnored(child.name)) child.deleteRecursively()
+        }
+        copyDirectoryFiltered(snapshotDir, root)
+        updateProjectStats(project)
+        return true
+    }
+
+    /** Undo the last AI run (go back one step). Returns a message, or null if nothing to undo. */
+    suspend fun undoLastRun(projectId: String): String? = withContext(Dispatchers.IO) {
+        val project = projectDao.getProjectById(projectId) ?: return@withContext null
+        val (undo, redo) = readStacks(projectId)
+        while (undo.isNotEmpty()) {
+            val id = undo.removeAt(undo.size - 1)
+            val cp = checkpointDao.getCheckpointById(id) ?: continue
+            if (!File(cp.snapshotDirPath).exists()) continue
+            val redoPoint = createCheckpoint(projectId, "Redo point")
+            redo.add(redoPoint.id)
+            if (applySnapshot(cp, project)) {
+                writeStacks(projectId, undo, redo)
+                return@withContext "Went back one step: restored \"${cp.title.removePrefix("Before: ")}\""
+            }
+        }
+        writeStacks(projectId, undo, redo)
+        null
+    }
+
+    /** Redo what was undone. Returns a message, or null if nothing to redo. */
+    suspend fun redoLastUndo(projectId: String): String? = withContext(Dispatchers.IO) {
+        val project = projectDao.getProjectById(projectId) ?: return@withContext null
+        val (undo, redo) = readStacks(projectId)
+        while (redo.isNotEmpty()) {
+            val id = redo.removeAt(redo.size - 1)
+            val cp = checkpointDao.getCheckpointById(id) ?: continue
+            if (!File(cp.snapshotDirPath).exists()) continue
+            val undoPoint = createCheckpoint(projectId, "Undo point")
+            undo.add(undoPoint.id)
+            if (applySnapshot(cp, project)) {
+                writeStacks(projectId, undo, redo)
+                return@withContext "Redid the change"
+            }
+        }
+        writeStacks(projectId, undo, redo)
+        null
+    }
+
+    /** Snapshot that represents "before the current AI run": top of the undo stack, else the newest checkpoint. */
+    private suspend fun runBaseline(projectId: String): CheckpointEntity? {
+        val (undo, _) = readStacks(projectId)
+        for (id in undo.asReversed()) {
+            val cp = checkpointDao.getCheckpointById(id)
+            if (cp != null && File(cp.snapshotDirPath).exists()) return cp
+        }
+        return checkpointDao.getCheckpointsForProjectOnce(projectId).firstOrNull()
+    }
+
+    /** Files changed by the latest (not undone) AI run. */
+    suspend fun computeRunDiffs(projectId: String): List<FileDiff> = withContext(Dispatchers.IO) {
+        val project = projectDao.getProjectById(projectId) ?: return@withContext emptyList()
+        val currentDir = File(project.rootPath)
+        val base = runBaseline(projectId) ?: return@withContext emptyList()
+        val snapshotDir = File(base.snapshotDirPath)
+        if (!currentDir.exists() || !snapshotDir.exists()) return@withContext emptyList()
+        diffAgainstSnapshot(currentDir, snapshotDir)
+    }
+
+    /** Copies the project ZIP into the public Downloads folder. Returns a readable location. */
+    suspend fun saveZipToDownloads(projectId: String): String = withContext(Dispatchers.IO) {
+        val zip = exportProjectZip(projectId)
+        val name = zip.name
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            val values = android.content.ContentValues().apply {
+                put(android.provider.MediaStore.Downloads.DISPLAY_NAME, name)
+                put(android.provider.MediaStore.Downloads.MIME_TYPE, "application/zip")
+                put(android.provider.MediaStore.Downloads.RELATIVE_PATH, android.os.Environment.DIRECTORY_DOWNLOADS)
+            }
+            val uri = context.contentResolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                ?: throw IllegalStateException("Could not create the file in Downloads")
+            context.contentResolver.openOutputStream(uri)?.use { out ->
+                zip.inputStream().use { it.copyTo(out) }
+            } ?: throw IllegalStateException("Could not write to Downloads")
+            "Downloads/$name"
+        } else {
+            val dir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS)
+            dir.mkdirs()
+            val target = File(dir, name)
+            zip.copyTo(target, overwrite = true)
+            "Downloads/$name"
+        }
     }
 
     suspend fun revertFileToLastCheckpoint(projectId: String, relativePath: String) = withContext(Dispatchers.IO) {
         val project = projectDao.getProjectById(projectId) ?: return@withContext
         val currentFile = File(project.rootPath, relativePath)
-        val checkpoints = checkpointDao.getCheckpointsForProjectOnce(projectId)
-        val lastCheckpoint = checkpoints.firstOrNull() ?: return@withContext
+        val lastCheckpoint = runBaseline(projectId) ?: return@withContext
         val snapFile = File(lastCheckpoint.snapshotDirPath, relativePath)
 
         if (snapFile.exists()) {

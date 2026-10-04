@@ -75,6 +75,7 @@ import com.example.data.local.entity.MessageEntity
 import com.example.data.local.entity.ToolStepEntity
 import com.example.ui.components.AgentSummaryBar
 import com.example.ui.components.MarkdownContentView
+import com.example.ui.components.ProviderIcon
 import com.example.ui.components.ThinkingBlockView
 import com.example.ui.theme.AppColors
 import kotlinx.coroutines.launch
@@ -83,7 +84,8 @@ import kotlinx.coroutines.launch
 fun ChatScreen(
     viewModel: ChatViewModel,
     modifier: Modifier = Modifier,
-    onOpenProviders: (() -> Unit)? = null
+    onAddProvider: () -> Unit = {},
+    onSetupProvider: (String) -> Unit = {}
 ) {
     val uiState by viewModel.uiState.collectAsState()
     val messages by viewModel.messages.collectAsState()
@@ -103,10 +105,10 @@ fun ChatScreen(
     }
     val streamingMessageId = visibleMessages.lastOrNull { it.status == "STREAMING" }?.id
 
-    val activeProvider = providers.firstOrNull { it.id == preferredId && it.isEnabled }
-        ?: providers.firstOrNull { it.isEnabled && (it.encryptedApiKey.isNotEmpty() || it.id == "ollama") }
-    val modelLabel = activeProvider?.selectedModel ?: "Choose model"
-    val modelReady = activeProvider != null && (activeProvider.encryptedApiKey.isNotEmpty() || activeProvider.id == "ollama")
+    val activeProvider = providers.firstOrNull { it.id == preferredId && isProviderReady(it) }
+        ?: providers.firstOrNull { isProviderReady(it) }
+    val modelLabel = activeProvider?.selectedModel ?: "Add a provider"
+    val modelReady = activeProvider != null
 
     val photoPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
@@ -156,7 +158,14 @@ fun ChatScreen(
                 viewModel.selectModel(pid, model)
                 showModelPicker = false
             },
-            onOpenProviders = onOpenProviders,
+            onSetupProvider = { id ->
+                showModelPicker = false
+                onSetupProvider(id)
+            },
+            onAddProvider = {
+                showModelPicker = false
+                onAddProvider()
+            },
             onDismiss = { showModelPicker = false }
         )
     }
@@ -363,18 +372,18 @@ fun ChatScreen(
                                 .testTag("model_chip"),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(7.dp)
-                                    .clip(CircleShape)
-                                    .background(if (modelReady) AppColors.ok else AppColors.warn)
+                            ProviderIcon(
+                                providerId = activeProvider?.id,
+                                model = activeProvider?.selectedModel,
+                                size = 16.dp,
+                                providerName = activeProvider?.name
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(
                                 text = modelLabel,
                                 fontSize = 12.sp,
                                 fontFamily = FontFamily.Monospace,
-                                color = AppColors.textSecondary,
+                                color = if (modelReady) AppColors.textSecondary else AppColors.warn,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                                 modifier = Modifier.widthIn(max = 170.dp)
@@ -551,8 +560,10 @@ private fun ChatMessage(
                     )
                 }
                 if (!model.isNullOrBlank()) {
+                    Spacer(modifier = Modifier.width(10.dp))
+                    ProviderIcon(providerId = null, model = model, size = 14.dp)
                     Text(
-                        text = "   $model",
+                        text = "  $model",
                         fontSize = 11.sp,
                         fontFamily = FontFamily.Monospace,
                         color = AppColors.textMuted,

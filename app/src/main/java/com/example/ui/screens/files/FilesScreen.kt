@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -74,6 +75,10 @@ import com.example.data.local.entity.ProjectEntity
 import com.example.data.repository.ProjectRepository
 import com.example.domain.model.FileNode
 import com.example.ui.theme.CyberCyan
+import com.example.ui.components.CodeViewer
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Share
 import com.example.ui.theme.EmeraldSuccess
 import com.example.ui.theme.ForgeAmber
 import com.example.ui.theme.RoseError
@@ -106,16 +111,32 @@ fun FilesScreen(
 
     val expandedFolders = remember { mutableStateMapOf<String, Boolean>() }
 
+    // Files edited since the project was imported/created (green tick), plus all their parent folders
+    var changedFiles by remember { mutableStateOf<Set<String>>(emptySet()) }
+    val changedMarks = remember(changedFiles) {
+        val marks = HashSet<String>(changedFiles)
+        for (f in changedFiles) {
+            var p = f.substringBeforeLast('/', "")
+            while (p.isNotEmpty()) {
+                marks.add(p)
+                p = p.substringBeforeLast('/', "")
+            }
+        }
+        marks
+    }
+    val undoTick by projectRepository.undoTick.collectAsState()
+
     fun loadTree() {
         if (activeProject == null) return
         scope.launch {
             isLoading = true
             fileTree = projectRepository.getFileTree(activeProject.id)
+            changedFiles = try { projectRepository.getChangedPaths(activeProject.id) } catch (e: Exception) { emptySet() }
             isLoading = false
         }
     }
 
-    LaunchedEffect(activeProject?.id) {
+    LaunchedEffect(activeProject?.id, undoTick) {
         loadTree()
     }
 
@@ -200,8 +221,58 @@ fun FilesScreen(
                     }
                 }
 
-                // Actions: Import ZIP & Starter
+                // Actions: Download, Share, Import ZIP & Starter
                 Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(
+                        onClick = {
+                            if (activeProject != null) {
+                                scope.launch {
+                                    try {
+                                        val where = projectRepository.saveZipToDownloads(activeProject.id)
+                                        Toast.makeText(context, "Saved to $where", Toast.LENGTH_LONG).show()
+                                    } catch (e: Exception) {
+                                        Toast.makeText(context, "Could not save: ${e.message}", Toast.LENGTH_LONG).show()
+                                    }
+                                }
+                            }
+                        },
+                        modifier = Modifier.size(36.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Download,
+                            contentDescription = "Download project ZIP",
+                            tint = EmeraldSuccess
+                        )
+                    }
+                    IconButton(
+                        onClick = {
+                            if (activeProject != null) {
+                                scope.launch {
+                                    try {
+                                        val zip = projectRepository.exportProjectZip(activeProject.id)
+                                        val uri = androidx.core.content.FileProvider.getUriForFile(
+                                            context, "${context.packageName}.fileprovider", zip
+                                        )
+                                        val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                                            type = "application/zip"
+                                            putExtra(android.content.Intent.EXTRA_STREAM, uri)
+                                            addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                        }
+                                        context.startActivity(android.content.Intent.createChooser(send, "Share project ZIP"))
+                                    } catch (e: Exception) {
+                                        Toast.makeText(context, "Could not share: ${e.message}", Toast.LENGTH_LONG).show()
+                                    }
+                                }
+                            }
+                        },
+                        modifier = Modifier.size(36.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Share,
+                            contentDescription = "Share project ZIP",
+                            tint = AppColors.textSecondary
+                        )
+                    }
                     IconButton(
                         onClick = { zipPickerLauncher.launch(arrayOf("*/*")) },
                         modifier = Modifier.size(36.dp)
@@ -224,6 +295,24 @@ fun FilesScreen(
                         )
                     }
                 }
+            }
+        }
+
+        if (viewingFilePath == null && changedFiles.isNotEmpty()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(AppColors.accentSoft)
+                    .padding(horizontal = 14.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(Icons.Default.Check, contentDescription = null, tint = AppColors.ok, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "${changedFiles.size} file(s) edited. They are marked with a green tick, and so are their folders.",
+                    fontSize = 12.sp,
+                    color = AppColors.textPrimary
+                )
             }
         }
 
@@ -259,8 +348,15 @@ fun FilesScreen(
                             text = viewingFilePath ?: "",
                             fontSize = 13.sp,
                             fontWeight = FontWeight.SemiBold,
-                            color = AppColors.textPrimary
+                            color = AppColors.textPrimary,
+                            maxLines = 1,
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                            modifier = Modifier.widthIn(max = 220.dp)
                         )
+                        if (viewingFilePath in changedFiles) {
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Icon(Icons.Default.Check, contentDescription = "Edited", tint = AppColors.ok, modifier = Modifier.size(16.dp))
+                        }
                     }
 
                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -316,21 +412,11 @@ fun FilesScreen(
                             .padding(8.dp)
                     )
                 } else {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(AppColors.codeBg)
-                            .horizontalScroll(rememberScrollState())
-                            .padding(12.dp)
-                    ) {
-                        Text(
-                            text = viewingFileContent,
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 12.sp,
-                            lineHeight = 18.sp,
-                            color = AppColors.textPrimary
-                        )
-                    }
+                    CodeViewer(
+                        path = viewingFilePath ?: "",
+                        content = viewingFileContent,
+                        modifier = Modifier.fillMaxSize()
+                    )
                 }
             }
         } else {
@@ -403,13 +489,14 @@ fun FilesScreen(
                             node = node,
                             depth = 0,
                             expandedFolders = expandedFolders,
+                            changedMarks = changedMarks,
                             onToggleFolder = { path ->
                                 expandedFolders[path] = !(expandedFolders[path] ?: false)
                             },
                             onOpenFile = { path ->
                                 scope.launch {
                                     try {
-                                        val content = projectRepository.readFile(activeProject!!.id, path)
+                                        val content = projectRepository.readFileRaw(activeProject!!.id, path)
                                         viewingFilePath = path
                                         viewingFileContent = content
                                         isEditing = false
@@ -455,7 +542,7 @@ fun FilesScreen(
                                 text = if (selectedType == t) "🔘 " else "⚪ ",
                                 fontSize = 14.sp
                             )
-                            Text(t, fontSize = 13.sp, color = if (selectedType == t) CyberCyan else Color.White)
+                            Text(t, fontSize = 13.sp, color = if (selectedType == t) CyberCyan else AppColors.textPrimary)
                         }
                     }
                 }
@@ -523,10 +610,12 @@ fun FileNodeItem(
     node: FileNode,
     depth: Int,
     expandedFolders: Map<String, Boolean>,
+    changedMarks: Set<String>,
     onToggleFolder: (String) -> Unit,
     onOpenFile: (String) -> Unit
 ) {
     val isExpanded = expandedFolders[node.path] ?: false
+    val isChanged = node.path.replace('\\', '/') in changedMarks
 
     Column {
         Row(
@@ -580,6 +669,15 @@ fun FileNodeItem(
                     color = AppColors.textMuted
                 )
             }
+            if (isChanged) {
+                Spacer(modifier = Modifier.width(6.dp))
+                Icon(
+                    imageVector = Icons.Default.Check,
+                    contentDescription = "Edited",
+                    tint = AppColors.ok,
+                    modifier = Modifier.size(16.dp)
+                )
+            }
         }
 
         if (node.isDirectory && isExpanded) {
@@ -588,6 +686,7 @@ fun FileNodeItem(
                     node = child,
                     depth = depth + 1,
                     expandedFolders = expandedFolders,
+                    changedMarks = changedMarks,
                     onToggleFolder = onToggleFolder,
                     onOpenFile = onOpenFile
                 )

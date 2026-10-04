@@ -58,6 +58,11 @@ fun MainScreen(
         currentScreen = if (currentScreen == Screen.Analytics) Screen.Settings else Screen.Chat
     }
 
+    // "Add provider" / "Set up key" from the chat model picker: go to Models, then come back to the chat
+    var providersStartAdd by remember { mutableStateOf(false) }
+    var providersStartEditId by remember { mutableStateOf<String?>(null) }
+    var returnToChat by remember { mutableStateOf(false) }
+
     // Hide the bottom bar while typing: it caused a big empty gap between keyboard and input box
     val imeOpen = WindowInsets.ime.getBottom(LocalDensity.current) > 0
 
@@ -96,7 +101,12 @@ fun MainScreen(
                         (screen == Screen.Settings && currentScreen == Screen.Analytics)
                     NavigationBarItem(
                         selected = isSelected,
-                        onClick = { currentScreen = screen },
+                        onClick = {
+                            providersStartAdd = false
+                            providersStartEditId = null
+                            returnToChat = false
+                            currentScreen = screen
+                        },
                         alwaysShowLabel = false,
                         icon = {
                             Icon(
@@ -134,7 +144,18 @@ fun MainScreen(
                     ChatScreen(
                         viewModel = chatViewModel,
                         modifier = Modifier.fillMaxSize(),
-                        onOpenProviders = { currentScreen = Screen.Providers }
+                        onAddProvider = {
+                            providersStartAdd = true
+                            providersStartEditId = null
+                            returnToChat = true
+                            currentScreen = Screen.Providers
+                        },
+                        onSetupProvider = { id ->
+                            providersStartAdd = false
+                            providersStartEditId = id
+                            returnToChat = true
+                            currentScreen = Screen.Providers
+                        }
                     )
                 }
                 Screen.Files -> {
@@ -167,6 +188,16 @@ fun MainScreen(
                 Screen.Providers -> {
                     ProvidersScreen(
                         providerRepository = app.providerRepository,
+                        startWithAdd = providersStartAdd,
+                        startEditId = providersStartEditId,
+                        onFinished = {
+                            providersStartAdd = false
+                            providersStartEditId = null
+                            if (returnToChat) {
+                                returnToChat = false
+                                currentScreen = Screen.Chat
+                            }
+                        },
                         modifier = Modifier.fillMaxSize()
                     )
                 }

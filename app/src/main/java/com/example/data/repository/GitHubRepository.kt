@@ -67,6 +67,59 @@ class GitHubRepository(
         }
     }
 
+    /** Accepts "owner/repo", full URLs, ".git" suffixes etc. and returns "owner/repo". */
+    fun normalizeRepo(input: String): String {
+        var s = input.trim()
+        s = s.removePrefix("https://").removePrefix("http://").removePrefix("www.")
+        s = s.removePrefix("github.com/").removePrefix("github.com:")
+        s = s.removeSuffix("/").removeSuffix(".git").trim('/')
+        val parts = s.split('/').filter { it.isNotBlank() }
+        return if (parts.size >= 2) parts[0] + "/" + parts[1] else s
+    }
+
+    /**
+     * Checks token, repository access and branch. Returns null when everything works,
+     * otherwise a readable explanation of what is wrong.
+     */
+    suspend fun checkConnection(pat: String, repoInput: String, branch: String): String? = withContext(Dispatchers.IO) {
+        val repo = normalizeRepo(repoInput)
+        if (pat.isBlank()) return@withContext "Enter your GitHub token."
+        if (!repo.contains("/")) return@withContext "Repository must look like owner/repo (for example anshul/my-app)."
+        try {
+            client.newCall(builder(pat.trim(), "$api/repos/$repo").build()).execute().use { res ->
+                val body = res.body?.string().orEmpty()
+                if (!res.isSuccessful) {
+                    val msg = try { JSONObject(body).optString("message", "") } catch (e: Exception) { "" }
+                    return@withContext when (res.code) {
+                        401 -> "Token rejected (401). It is wrong, expired or revoked. Create a new token."
+                        403 -> "Access denied (403): $msg"
+                        404 -> "Repository $repo not found (404). Check the name. For a fine-grained token, open the token settings and select this repository under 'Repository access'."
+                        else -> "GitHub error ${res.code}: $msg"
+                    }
+                }
+                val perms = try { JSONObject(body).optJSONObject("permissions") } catch (e: Exception) { null }
+                if (perms != null && !perms.optBoolean("push", false)) {
+                    return@withContext "Connected, but this token cannot write to $repo. Give it 'Contents: Read and write'."
+                }
+            }
+            val b = branch.trim().ifEmpty { "main" }
+            client.newCall(builder(pat.trim(), "$api/repos/$repo/branches/$b").build()).execute().use { res ->
+                if (!res.isSuccessful) {
+                    return@withContext if (res.code == 404) {
+                        "Branch '$b' not found. The repository may be empty or use another branch name (for example master). Upload at least one file first."
+                    } else {
+                        "Could not read branch '$b' (HTTP ${res.code})."
+                    }
+                }
+            }
+            null
+        } catch (e: java.net.UnknownHostException) {
+            "No internet connection."
+        } catch (e: Exception) {
+            "Connection problem: ${e.message ?: e.javaClass.simpleName}"
+        }
+    }
+
     suspend fun testToken(pat: String, ownerRepo: String): Boolean = withContext(Dispatchers.IO) {
         try {
             client.newCall(builder(pat, "$api/repos/$ownerRepo").build()).execute().use { it.isSuccessful }
