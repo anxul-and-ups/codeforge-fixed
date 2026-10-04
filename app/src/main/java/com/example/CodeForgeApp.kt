@@ -41,6 +41,18 @@ class CodeForgeApp : Application() {
     }
     val gitHubRepository by lazy { GitHubRepository() }
     val buildLogStore by lazy { com.example.data.logs.BuildLogStore(this) }
+    val gitLogStore by lazy { com.example.data.logs.GitLogStore(this) }
+    val githubManager by lazy {
+        com.example.data.github.GitHubManager(
+            context = this,
+            settings = settingsStore,
+            github = gitHubRepository,
+            projects = projectRepository,
+            log = gitLogStore,
+            buildLogs = buildLogStore,
+            scope = agentScope
+        )
+    }
     val agentEngine by lazy {
         AgentEngine(
             appContext = this,
@@ -52,7 +64,8 @@ class CodeForgeApp : Application() {
             conversationDao = database.conversationDao(),
             usageDao = database.usageDao(),
             settings = settingsStore,
-            buildLogStore = buildLogStore
+            buildLogStore = buildLogStore,
+            githubManager = githubManager
         )
     }
 

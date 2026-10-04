@@ -10,6 +10,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.TextButton
 import androidx.compose.ui.platform.LocalDensity
 import com.example.ui.screens.builds.BuildLogScreen
+import com.example.ui.screens.github.GitHubScreen
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
@@ -49,13 +50,13 @@ fun MainScreen(
     modifier: Modifier = Modifier
 ) {
     val chatViewModel: ChatViewModel = viewModel()
-    val chatUiState by chatViewModel.uiState.collectAsState()
+    val activeProject by chatViewModel.activeProject.collectAsState()
 
     var currentScreen by remember { mutableStateOf<Screen>(Screen.Chat) }
 
     // Handle back button on sub-screens
     BackHandler(enabled = currentScreen != Screen.Chat) {
-        currentScreen = if (currentScreen == Screen.Analytics) Screen.Settings else Screen.Chat
+        currentScreen = if (currentScreen == Screen.Analytics || currentScreen == Screen.GitHub) Screen.Settings else Screen.Chat
     }
 
     // "Add provider" / "Set up key" from the chat model picker: go to Models, then come back to the chat
@@ -67,7 +68,8 @@ fun MainScreen(
     val imeOpen = WindowInsets.ime.getBottom(LocalDensity.current) > 0
 
     // Permission requests from the agent (safe mode, "fix this build error?") on ANY screen
-    val approval = chatUiState.approval
+    val approvalState by chatViewModel.approval.collectAsState()
+    val approval = approvalState
     if (approval != null) {
         AlertDialog(
             onDismissRequest = { chatViewModel.resolveApproval(false) },
@@ -98,7 +100,7 @@ fun MainScreen(
             ) {
                 for (screen in Screen.bottomNavItems) {
                     val isSelected = currentScreen == screen ||
-                        (screen == Screen.Settings && currentScreen == Screen.Analytics)
+                        (screen == Screen.Settings && (currentScreen == Screen.Analytics || currentScreen == Screen.GitHub))
                     NavigationBarItem(
                         selected = isSelected,
                         onClick = {
@@ -150,6 +152,9 @@ fun MainScreen(
                             returnToChat = true
                             currentScreen = Screen.Providers
                         },
+                        onOpenGitHub = { currentScreen = Screen.GitHub },
+                        githubManager = app.githubManager,
+                        githubConnected = app.settingsStore.githubConnected,
                         onSetupProvider = { id ->
                             providersStartAdd = false
                             providersStartEditId = id
@@ -161,7 +166,7 @@ fun MainScreen(
                 Screen.Files -> {
                     FilesScreen(
                         projectRepository = app.projectRepository,
-                        activeProject = chatUiState.activeProject,
+                        activeProject = activeProject,
                         onSelectProject = { proj ->
                             chatViewModel.selectProject(proj)
                         },
@@ -171,13 +176,23 @@ fun MainScreen(
                 Screen.Changes -> {
                     DiffReviewScreen(
                         projectRepository = app.projectRepository,
-                        activeProject = chatUiState.activeProject,
+                        activeProject = activeProject,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
+                Screen.GitHub -> {
+                    GitHubScreen(
+                        manager = app.githubManager,
+                        settings = app.settingsStore,
+                        chatViewModel = chatViewModel,
+                        onOpenBuilds = { currentScreen = Screen.Builds },
                         modifier = Modifier.fillMaxSize()
                     )
                 }
                 Screen.Builds -> {
                     BuildLogScreen(
                         store = app.buildLogStore,
+                        manager = app.githubManager,
                         onSendToAi = { prompt ->
                             currentScreen = Screen.Chat
                             chatViewModel.sendMessage(prompt)
@@ -217,6 +232,7 @@ fun MainScreen(
                             chatViewModel.sendMessage(buildPrompt)
                         },
                         onOpenUsage = { currentScreen = Screen.Analytics },
+                        onOpenGitHub = { currentScreen = Screen.GitHub },
                         onPushAndBuild = {
                             currentScreen = Screen.Chat
                             chatViewModel.pushAndBuild()

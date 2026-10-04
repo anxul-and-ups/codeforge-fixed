@@ -17,6 +17,7 @@ sealed class Screen(val route: String, val title: String, val icon: ImageVector)
     object Builds : Screen("builds", "Builds", Icons.Default.BugReport)
     object Providers : Screen("providers", "Models", Icons.Default.Dns)
     object Analytics : Screen("analytics", "Analytics", Icons.Default.Analytics)
+    object GitHub : Screen("github", "GitHub", Icons.Default.Settings)
     object Settings : Screen("settings", "Settings", Icons.Default.Settings)
 
     companion object {

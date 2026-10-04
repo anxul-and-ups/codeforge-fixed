@@ -63,7 +63,6 @@ class ChatRepository(
 
     fun observeConversation(id: String) = conversationDao.observeConversation(id)
 
-
     suspend fun moveConversationToProject(id: String, projectId: String) {
         val c = conversationDao.getConversationById(id) ?: return
         conversationDao.updateConversation(c.copy(projectId = projectId, updatedAt = System.currentTimeMillis()))

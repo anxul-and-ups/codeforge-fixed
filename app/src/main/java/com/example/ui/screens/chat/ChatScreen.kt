@@ -85,7 +85,10 @@ fun ChatScreen(
     viewModel: ChatViewModel,
     modifier: Modifier = Modifier,
     onAddProvider: () -> Unit = {},
-    onSetupProvider: (String) -> Unit = {}
+    onSetupProvider: (String) -> Unit = {},
+    onOpenGitHub: () -> Unit = {},
+    githubManager: com.example.data.github.GitHubManager? = null,
+    githubConnected: Boolean = false
 ) {
     val uiState by viewModel.uiState.collectAsState()
     val messages by viewModel.messages.collectAsState()
@@ -99,6 +102,7 @@ fun ChatScreen(
     var inputText by remember { mutableStateOf("") }
     var showModelPicker by remember { mutableStateOf(false) }
     var showAttachMenu by remember { mutableStateOf(false) }
+    var showRepoPicker by remember { mutableStateOf(false) }
 
     val visibleMessages = messages.filter { m ->
         !(m.status == "STREAMING" && m.content.isBlank() && toolStepsMap[m.id].isNullOrEmpty())
@@ -125,7 +129,7 @@ fun ChatScreen(
     val stepCount = toolStepsMap.values.sumOf { it.size }
     LaunchedEffect(messages.size, stepCount, uiState.streamingContent.length / 40, uiState.isAgentRunning) {
         val total = listState.layoutInfo.totalItemsCount
-        if (total > 0) listState.animateScrollToItem(total - 1)
+        if (total > 0) listState.scrollToItem(total - 1)
     }
 
     if (uiState.warningSecretFile != null) {
@@ -150,6 +154,17 @@ fun ChatScreen(
         )
     }
 
+    if (showRepoPicker && githubManager != null) {
+        com.example.ui.screens.github.RepoPickerDialog(
+            manager = githubManager,
+            title = "Clone a repository",
+            onDismiss = { showRepoPicker = false },
+            onPick = { repo ->
+                showRepoPicker = false
+                viewModel.cloneRepo(repo)
+            }
+        )
+    }
     if (showModelPicker) {
         ModelPickerDialog(
             providers = providers,
@@ -359,6 +374,21 @@ fun ChatScreen(
                                     }
                                 )
                             }
+                        }
+
+                        // GitHub: clone one of your repositories (or connect first)
+                        IconButton(
+                            onClick = {
+                                if (githubConnected) showRepoPicker = true else onOpenGitHub()
+                            },
+                            modifier = Modifier.size(40.dp).testTag("github_button")
+                        ) {
+                            androidx.compose.foundation.Image(
+                                painter = androidx.compose.ui.res.painterResource(com.example.R.drawable.ic_github),
+                                contentDescription = "GitHub repositories",
+                                colorFilter = androidx.compose.ui.graphics.ColorFilter.tint(AppColors.textSecondary),
+                                modifier = Modifier.size(20.dp)
+                            )
                         }
 
                         Spacer(modifier = Modifier.weight(1f))

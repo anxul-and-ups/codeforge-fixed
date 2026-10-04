@@ -15,6 +15,12 @@ Chat-based coding agent for Android (Kotlin + Jetpack Compose). Import a project
 - Provider/model logos (Claude, OpenAI, Gemini, DeepSeek, Kimi, Grok, Perplexity) are shown next to model names; custom providers use the app icon.
 - Files tab: green tick on every edited file and its folders, syntax-highlighted scrollable viewer, Download/Share ZIP. Changes tab: Undo / Redo of AI runs.
 
+## GitHub
+- Settings → GitHub: enter your username and token, press Save. The profile (name, bio, repos) is shown and everything is written to the terminal-style GitHub log.
+- Several accounts: "Add account", switch or remove them. No branch setting: the repository's default branch is used.
+- Create a repository from the app, or choose any existing one. "Push to GitHub" first shows how many files are new / modified / deleted, then uploads everything as one commit. Empty repositories get the whole project folder by folder.
+- Chat box: small GitHub icon lists all your repositories (with search) and clones the chosen one as a project.
+
 ## How it works
 1. Add an API key in the **Providers** tab (Anthropic, OpenAI, Gemini, DeepSeek, Groq, OpenRouter, Mistral, Ollama, or any custom endpoint).
 2. Import a ZIP in the **Files** tab.

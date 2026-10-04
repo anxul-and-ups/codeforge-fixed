@@ -45,20 +45,83 @@ class SettingsStore(context: Context) {
         get() = prefs.getBoolean("budget_hard_stop", true)
         set(value) { prefs.edit().putBoolean("budget_hard_stop", value).apply() }
 
+    /** Legacy single repository (kept for old installs). New code uses [repoFor]. */
     var githubRepo: String
         get() = prefs.getString("github_repo", "") ?: ""
         set(value) { prefs.edit().putString("github_repo", normalizeRepo(value)).apply() }
 
-    var githubBranch: String
-        get() = prefs.getString("github_branch", "main") ?: "main"
-        set(value) { prefs.edit().putString("github_branch", value.trim().ifEmpty { "main" }).apply() }
+    // ---- GitHub accounts (several accounts, one active) ----
+    data class GhAccount(val login: String, val token: String)
 
-    var githubToken: String
-        get() = KeyStoreManager.decrypt(prefs.getString("github_token", "") ?: "")
-        set(value) {
-            val enc = try { KeyStoreManager.encrypt(value.trim()) } catch (e: Exception) { "" }
-            prefs.edit().putString("github_token", enc).apply()
+    private fun readAccounts(): MutableList<Pair<String, String>> {
+        val out = mutableListOf<Pair<String, String>>() // login to encrypted token
+        try {
+            val arr = org.json.JSONArray(prefs.getString("gh_accounts", "[]") ?: "[]")
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                out.add(Pair(o.getString("login"), o.getString("token")))
+            }
+        } catch (e: Exception) {
+            // ignore
         }
+        return out
+    }
+
+    private fun writeAccounts(list: List<Pair<String, String>>) {
+        val arr = org.json.JSONArray()
+        for ((login, tok) in list) arr.put(org.json.JSONObject().put("login", login).put("token", tok))
+        prefs.edit().putString("gh_accounts", arr.toString()).apply()
+    }
+
+    fun githubAccounts(): List<GhAccount> =
+        readAccounts().map { GhAccount(it.first, KeyStoreManager.decrypt(it.second)) }.filter { it.token.isNotBlank() }
+
+    var githubActiveLogin: String?
+        get() = prefs.getString("gh_active", null)
+        set(value) { prefs.edit().putString("gh_active", value).apply() }
+
+    fun addGithubAccount(login: String, token: String) {
+        val list = readAccounts().filter { !it.first.equals(login, ignoreCase = true) }.toMutableList()
+        list.add(Pair(login, KeyStoreManager.encrypt(token.trim())))
+        writeAccounts(list)
+        githubActiveLogin = login
+    }
+
+    fun removeGithubAccount(login: String) {
+        val list = readAccounts().filter { !it.first.equals(login, ignoreCase = true) }
+        writeAccounts(list)
+        if (githubActiveLogin.equals(login, ignoreCase = true)) githubActiveLogin = list.firstOrNull()?.first
+    }
+
+    /** Token of the active account (empty when not connected). */
+    val githubToken: String
+        get() {
+            val accounts = githubAccounts()
+            val active = accounts.firstOrNull { it.login.equals(githubActiveLogin, ignoreCase = true) } ?: accounts.firstOrNull()
+            if (active != null) return active.token
+            // old installs stored a single token
+            return KeyStoreManager.decrypt(prefs.getString("github_token", "") ?: "")
+        }
+
+    /** Login of the active account. Cheap: does not touch the Keystore. */
+    val githubLogin: String
+        get() {
+            val logins = readAccounts().map { it.first }
+            return logins.firstOrNull { it.equals(githubActiveLogin, ignoreCase = true) } ?: logins.firstOrNull() ?: ""
+        }
+
+    /** True when at least one account is saved. Cheap: does not touch the Keystore. */
+    val githubConnected: Boolean
+        get() = readAccounts().isNotEmpty() || !prefs.getString("github_token", "").isNullOrEmpty()
+
+    /** Repository (owner/repo) this project pushes to. */
+    fun repoFor(projectId: String): String? =
+        prefs.getString("repo_$projectId", null)?.takeIf { it.contains("/") }
+            ?: githubRepo.takeIf { it.contains("/") }
+
+    fun linkRepo(projectId: String, repo: String) {
+        prefs.edit().putString("repo_$projectId", normalizeRepo(repo)).apply()
+    }
 
     /** After every agent run: push changes to GitHub, wait for the build and auto-fix compile errors. */
     var autoPushBuild: Boolean
@@ -100,7 +163,7 @@ class SettingsStore(context: Context) {
         set(value) { prefs.edit().putString("active_conversation_id", value).apply() }
 
     val githubConfigured: Boolean
-        get() = githubRepo.contains("/") && githubToken.isNotBlank()
+        get() = githubToken.isNotBlank()
 
     companion object {
         fun normalizeRepo(input: String): String {

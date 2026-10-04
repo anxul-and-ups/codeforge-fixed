@@ -81,6 +81,7 @@ fun SettingsScreen(
     onFeedBuildErrorToChat: ((String) -> Unit)? = null,
     onPushAndBuild: (() -> Unit)? = null,
     onOpenUsage: (() -> Unit)? = null,
+    onOpenGitHub: (() -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -91,14 +92,6 @@ fun SettingsScreen(
     var selectedReasoningLevel by remember { mutableStateOf(settingsStore.reasoningLevel) }
     var selectedLanguage by remember { mutableStateOf(settingsStore.language) }
     var maxSteps by remember { mutableIntStateOf(settingsStore.maxSteps) }
-    var autoPushBuild by remember { mutableStateOf(settingsStore.autoPushBuild) }
-    var maxFixAttempts by remember { mutableIntStateOf(settingsStore.maxBuildFixAttempts) }
-    var askBeforeFix by remember { mutableStateOf(settingsStore.askBeforeBuildFix) }
-
-    // GitHub Settings
-    var githubPat by remember { mutableStateOf(settingsStore.githubToken) }
-    var githubRepo by remember { mutableStateOf(settingsStore.githubRepo) }
-    var githubBranch by remember { mutableStateOf(settingsStore.githubBranch) }
 
     // Persist every change
     LaunchedEffect(globalSystemPrompt) { settingsStore.globalSystemPrompt = globalSystemPrompt }
@@ -106,18 +99,6 @@ fun SettingsScreen(
     LaunchedEffect(selectedReasoningLevel) { settingsStore.reasoningLevel = selectedReasoningLevel }
     LaunchedEffect(selectedLanguage) { settingsStore.language = selectedLanguage }
     LaunchedEffect(maxSteps) { settingsStore.maxSteps = maxSteps }
-    LaunchedEffect(autoPushBuild) { settingsStore.autoPushBuild = autoPushBuild }
-    LaunchedEffect(maxFixAttempts) { settingsStore.maxBuildFixAttempts = maxFixAttempts }
-    LaunchedEffect(askBeforeFix) { settingsStore.askBeforeBuildFix = askBeforeFix }
-    LaunchedEffect(githubPat) { settingsStore.githubToken = githubPat }
-    LaunchedEffect(githubRepo) { settingsStore.githubRepo = githubRepo }
-    LaunchedEffect(githubBranch) { settingsStore.githubBranch = githubBranch }
-
-    var isCheckingGitHub by remember { mutableStateOf(false) }
-    var githubConnected by remember { mutableStateOf<Boolean?>(null) }
-    var githubMessage by remember { mutableStateOf<String?>(null) }
-    var workflowRuns by remember { mutableStateOf<List<WorkflowRunInfo>>(emptyList()) }
-    var isLoadingRuns by remember { mutableStateOf(false) }
 
     LazyColumn(
         modifier = modifier
@@ -387,218 +368,43 @@ fun SettingsScreen(
             }
         }
 
-        // GitHub Actions CI Integration
+        // GitHub
         item {
+            val ghLogin = remember { settingsStore.githubLogin }
             Card(
                 colors = CardDefaults.cardColors(containerColor = AppColors.surface),
                 shape = RoundedCornerShape(12.dp),
                 border = androidx.compose.foundation.BorderStroke(1.dp, AppColors.border),
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .clickable { onOpenGitHub?.invoke() }
             ) {
-                Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.Code, contentDescription = null, tint = CyberCyan, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("GitHub Actions CI & Push", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = AppColors.textPrimary)
-                    }
-                    Text(
-                        "Push your project to GitHub as one commit, run the Actions build, and let the AI read failure logs and fix them. Token is stored encrypted on this device.",
-                        fontSize = 11.sp,
-                        color = AppColors.textSecondary
+                Row(
+                    modifier = Modifier.padding(14.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    androidx.compose.foundation.Image(
+                        painter = androidx.compose.ui.res.painterResource(com.example.R.drawable.ic_github),
+                        contentDescription = "GitHub",
+                        colorFilter = androidx.compose.ui.graphics.ColorFilter.tint(AppColors.textPrimary),
+                        modifier = Modifier.size(26.dp)
                     )
-
-                    OutlinedTextField(
-                        value = githubRepo,
-                        onValueChange = { githubRepo = it },
-                        label = { Text("Repository (e.g. username/my-app)") },
-                        modifier = Modifier.fillMaxWidth()
-                    )
-
-                    OutlinedTextField(
-                        value = githubBranch,
-                        onValueChange = { githubBranch = it },
-                        label = { Text("Branch") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-
-                    OutlinedTextField(
-                        value = githubPat,
-                        onValueChange = { githubPat = it },
-                        label = { Text("GitHub token (Contents: write, Actions: read)") },
-                        singleLine = true,
-                        visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("Auto push, build & fix", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = AppColors.textPrimary)
-                            Text(
-                                "After every AI change: push one commit, wait for the GitHub build, and let the AI fix compile errors automatically.",
-                                fontSize = 11.sp,
-                                color = AppColors.textSecondary
-                            )
-                        }
-                        Switch(
-                            checked = autoPushBuild,
-                            onCheckedChange = { autoPushBuild = it },
-                            colors = SwitchDefaults.colors(checkedThumbColor = CyberCyan)
-                        )
-                    }
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("Ask before fixing build errors", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = AppColors.textPrimary)
-                            Text(
-                                "When a build fails, the AI waits for your OK before changing code.",
-                                fontSize = 11.sp,
-                                color = AppColors.textSecondary
-                            )
-                        }
-                        Switch(
-                            checked = askBeforeFix,
-                            onCheckedChange = { askBeforeFix = it },
-                            colors = SwitchDefaults.colors(checkedThumbColor = CyberCyan)
-                        )
-                    }
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text("Max auto-fix attempts", fontSize = 12.sp, color = AppColors.textPrimary)
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            TextButton(onClick = { maxFixAttempts = (maxFixAttempts - 1).coerceAtLeast(1) }) { Text("−", fontSize = 14.sp) }
-                            Text("$maxFixAttempts", fontSize = 12.sp, color = ForgeAmber, fontWeight = FontWeight.SemiBold)
-                            TextButton(onClick = { maxFixAttempts = (maxFixAttempts + 1).coerceAtMost(8) }) { Text("+", fontSize = 14.sp) }
-                        }
-                    }
-                    Button(
-                        onClick = {
-                            if (githubRepo.isNotBlank() && githubPat.isNotBlank()) {
-                                settingsStore.githubToken = githubPat
-                                settingsStore.githubRepo = githubRepo
-                                settingsStore.githubBranch = githubBranch
-                                onPushAndBuild?.invoke()
-                                Toast.makeText(context, "Pushing current project and watching the build (see Chat tab)…", Toast.LENGTH_LONG).show()
-                            } else {
-                                Toast.makeText(context, "Enter repository and token first.", Toast.LENGTH_SHORT).show()
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonDefaults.buttonColors(containerColor = EmeraldSuccess)
-                    ) {
-                        Text("Push project & build now", fontSize = 12.sp, color = AppColors.onAccent)
-                    }
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        OutlinedButton(
-                            onClick = {
-                                if (githubRepo.isNotBlank() && githubPat.isNotBlank()) {
-                                    scope.launch {
-                                        isCheckingGitHub = true
-                                        githubRepo = SettingsStore.normalizeRepo(githubRepo)
-                                        val error = gitHubRepository.checkConnection(githubPat.trim(), githubRepo, githubBranch)
-                                        val ok = error == null
-                                        githubConnected = ok
-                                        githubMessage = error ?: "Connected. The token can read and write ${githubRepo}."
-                                        if (ok) {
-                                            isLoadingRuns = true
-                                            workflowRuns = gitHubRepository.getRecentWorkflowRuns(githubPat.trim(), githubRepo.trim())
-                                            isLoadingRuns = false
-                                        }
-                                        isCheckingGitHub = false
-                                    }
-                                } else {
-                                    githubConnected = false
-                                    githubMessage = "Enter the repository (owner/repo) and your token first."
-                                }
-                            }
-                        ) {
-                            if (isCheckingGitHub) {
-                                CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp, color = CyberCyan)
-                            } else {
-                                Text("Test Connection", fontSize = 11.sp)
-                            }
-                        }
-
-                        Button(
-                            onClick = {
-                                if (githubRepo.isNotBlank() && githubPat.isNotBlank()) {
-                                    scope.launch {
-                                        val ok = gitHubRepository.triggerWorkflowDispatch(githubPat.trim(), githubRepo.trim(), githubBranch.trim())
-                                        Toast.makeText(context, if (ok) "Triggered build.yml run on GitHub!" else "Trigger failed.", Toast.LENGTH_SHORT).show()
-                                    }
-                                }
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = CyberCyan)
-                        ) {
-                            Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(14.dp), tint = AppColors.onAccent)
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Trigger Build", fontSize = 11.sp, color = AppColors.onAccent)
-                        }
-                    }
-
-                    if (githubMessage != null) {
+                    Spacer(modifier = Modifier.width(14.dp))
+                    Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = githubMessage ?: "",
+                            text = if (ghLogin.isBlank()) "Connect GitHub" else "GitHub · @$ghLogin",
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = AppColors.textPrimary
+                        )
+                        Text(
+                            text = if (ghLogin.isBlank()) "Enter your username and token to push code and build APKs" else "Push, create repos, accounts and build log",
                             fontSize = 12.sp,
-                            lineHeight = 17.sp,
-                            color = if (githubConnected == true) EmeraldSuccess else RoseError
+                            color = AppColors.textSecondary
                         )
                     }
-
-                    // Recent Workflow Runs
-                    if (workflowRuns.isNotEmpty()) {
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text("Recent Workflow Runs:", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = AppColors.textPrimary)
-                        for (run in workflowRuns.take(3)) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .background(AppColors.codeBg, RoundedCornerShape(6.dp))
-                                    .padding(8.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text("${run.name} (#${run.id})", fontSize = 11.sp, color = AppColors.textPrimary)
-                                    Text(
-                                        "${run.status} • conclusion: ${run.conclusion ?: "in progress"}",
-                                        fontSize = 10.sp,
-                                        color = if (run.conclusion == "failure") RoseError else EmeraldSuccess
-                                    )
-                                }
-                                if (run.conclusion == "failure") {
-                                    Button(
-                                        onClick = {
-                                            scope.launch {
-                                                val log = gitHubRepository.fetchFailureLog(githubPat.trim(), githubRepo.trim(), run.id)
-                                                onFeedBuildErrorToChat?.invoke("GitHub Actions build failed for run #${run.id}:\n\n```\n$log\n```\nPlease fix this build error.")
-                                                Toast.makeText(context, "Fed build error into chat!", Toast.LENGTH_SHORT).show()
-                                            }
-                                        },
-                                        colors = ButtonDefaults.buttonColors(containerColor = RoseError),
-                                        modifier = Modifier.height(28.dp)
-                                    ) {
-                                        Text("Fix Build", fontSize = 10.sp)
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    Text("›", fontSize = 20.sp, color = AppColors.textMuted)
                 }
             }
         }

@@ -3,6 +3,7 @@ package com.example.data.agent
 import android.content.Context
 import com.example.data.api.LlmDocument
 import com.example.data.api.LlmMessage
+import com.example.data.github.GitHubManager
 import com.example.data.logs.BuildLogEntry
 import com.example.data.logs.BuildLogStore
 import kotlinx.coroutines.withTimeoutOrNull
@@ -85,7 +86,8 @@ class AgentEngine(
     private val conversationDao: ConversationDao,
     private val usageDao: UsageDao,
     private val settings: SettingsStore,
-    private val buildLogStore: BuildLogStore
+    private val buildLogStore: BuildLogStore,
+    private val githubManager: GitHubManager
 ) {
     private val _agentEvents = MutableSharedFlow<AgentEvent>(extraBufferCapacity = 8192)
     val agentEvents = _agentEvents.asSharedFlow()
@@ -172,20 +174,30 @@ class AgentEngine(
 
     private suspend fun buildAndFix(req: RunRequest, summaryHint: String) {
         val pat = settings.githubToken
-        val repo = settings.githubRepo
-        val branch = settings.githubBranch
+        val repo = settings.repoFor(req.projectId)
+        if (repo == null) {
+            postNote(
+                req.conversationId,
+                "⚠️ No GitHub repository is selected for this project. Open Settings → GitHub and choose or create one."
+            )
+            _agentEvents.tryEmit(AgentEvent.Finished("No repository selected", 0))
+            return
+        }
         val maxAttempts = settings.maxBuildFixAttempts
         var attempt = 0
 
         while (true) {
             status("Pushing changes to GitHub…")
             val push = try {
-                val files = projectRepository.listFilesForPush(req.projectId)
                 val deleted = projectRepository.computeRunDiffs(req.projectId)
                     .filter { it.isDeletedFile }.map { it.filePath.replace('\\', '/') }.toSet()
-                gitHubRepository.pushProject(
-                    pat, repo, branch, files, deleted,
-                    "CodeForge: ${summaryHint.lineSequence().firstOrNull().orEmpty().take(60).ifBlank { "update" }}"
+                githubManager.push(
+                    projectId = req.projectId,
+                    repo = repo,
+                    deleteExtra = false,
+                    message = "CodeForge: ${summaryHint.lineSequence().firstOrNull().orEmpty().take(60).ifBlank { "update" }}",
+                    explicitDeletes = deleted,
+                    requireOverlap = !req.pushOnly
                 )
             } catch (e: CancellationException) {
                 throw e
@@ -195,11 +207,12 @@ class AgentEngine(
                 return
             }
             if (push.noChanges) {
-                postNote(req.conversationId, "ℹ️ Nothing to push: the GitHub repo already matches this project.")
+                postNote(req.conversationId, "ℹ️ Nothing to push: $repo already matches this project.")
                 _agentEvents.tryEmit(AgentEvent.Finished("No changes to push", 0))
                 return
             }
-            status("Pushed ${push.changedFiles} file(s). Waiting for the build…")
+            postNote(req.conversationId, "⬆️ " + githubManager.describe(push, repo))
+            status("Pushed ${push.changedFiles + push.deletedFiles} file(s). Waiting for the build…")
             val run = gitHubRepository.waitForRun(pat, repo, push.commitSha) { status(it) }
             val short = push.commitSha.take(7)
             if (run == null) {

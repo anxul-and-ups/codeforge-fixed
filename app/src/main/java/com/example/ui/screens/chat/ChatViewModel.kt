@@ -16,6 +16,10 @@ import com.example.data.api.LlmDocument
 import com.example.data.local.entity.ConversationEntity
 import com.example.data.local.entity.MessageEntity
 import com.example.data.local.entity.ProviderConfigEntity
+import com.example.data.repository.GhRepo
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import java.util.UUID
 import java.util.zip.ZipInputStream
@@ -71,8 +75,21 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val settings = app.settingsStore
     private val agentEngine = app.agentEngine
 
+    /** Permission requests (separate flow so screens do not recompose for every streamed token). */
+    val approval: StateFlow<ApprovalRequest?> = agentEngine.approvalRequest
+
+    private val streamBuf = StringBuilder()
+    private val reasoningBuf = StringBuilder()
+    private var flushJob: Job? = null
+
     private val _uiState = MutableStateFlow(ChatUiState())
     val uiState: StateFlow<ChatUiState> = _uiState.asStateFlow()
+
+    /** Only changes when the project changes (not for every streamed token). */
+    val activeProject: StateFlow<ProjectEntity?> = _uiState
+        .map { it.activeProject }
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
     private val activeProjectId = MutableStateFlow<String?>(null)
     private val activeConversationId = MutableStateFlow<String?>(null)
@@ -97,12 +114,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         .flatMapLatest { id -> if (id == null) flowOf(emptyList()) else chatRepo.getMessages(id) }
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
+    private val stepsCache = HashMap<String, Pair<String, List<ToolStepEntity>>>() // messageId -> (status, steps)
+
     val toolStepsMap: StateFlow<Map<String, List<ToolStepEntity>>> = combine(messages, refreshTick) { msgs, _ -> msgs }
         .mapLatest { msgs ->
             val map = mutableMapOf<String, List<ToolStepEntity>>()
             for (m in msgs) {
                 if (m.sender != "ASSISTANT") continue
-                val steps = chatRepo.getToolStepsOnce(m.id)
+                val cached = stepsCache[m.id]
+                // finished messages never change again, so their steps are loaded only once
+                val steps = if (cached != null && cached.first == m.status && m.status != "STREAMING") {
+                    cached.second
+                } else {
+                    chatRepo.getToolStepsOnce(m.id).also { stepsCache[m.id] = Pair(m.status, it) }
+                }
                 if (steps.isNotEmpty()) map[m.id] = steps
             }
             map.toMap()
@@ -115,19 +140,49 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             agentEngine.agentEvents.collect { event ->
                 when (event) {
                     is AgentEvent.StatusUpdate -> _uiState.update { it.copy(currentAgentStatus = event.statusText) }
-                    is AgentEvent.StreamingChunk -> _uiState.update { it.copy(streamingContent = it.streamingContent + event.text) }
+                    is AgentEvent.StreamingChunk -> {
+                        streamBuf.append(event.text)
+                        if (flushJob == null) {
+                            flushJob = viewModelScope.launch {
+                                delay(120)
+                                flushJob = null
+                                val text = streamBuf.toString()
+                                val reasoning = reasoningBuf.toString()
+                                _uiState.update { it.copy(streamingContent = text, streamingReasoning = reasoning) }
+                            }
+                        }
+                    }
                     is AgentEvent.NoteAdded -> refreshTick.update { it + 1 }
-                    is AgentEvent.StreamingReset -> _uiState.update { it.copy(streamingContent = "", streamingReasoning = "") }
-                    is AgentEvent.ReasoningChunk -> _uiState.update { it.copy(streamingReasoning = it.streamingReasoning + event.text) }
+                    is AgentEvent.StreamingReset -> {
+                        streamBuf.setLength(0)
+                        reasoningBuf.setLength(0)
+                        _uiState.update { it.copy(streamingContent = "", streamingReasoning = "") }
+                    }
+                    is AgentEvent.ReasoningChunk -> {
+                        reasoningBuf.append(event.text)
+                        if (flushJob == null) {
+                            flushJob = viewModelScope.launch {
+                                delay(120)
+                                flushJob = null
+                                val text = streamBuf.toString()
+                                val reasoning = reasoningBuf.toString()
+                                _uiState.update { it.copy(streamingContent = text, streamingReasoning = reasoning) }
+                            }
+                        }
+                    }
                     is AgentEvent.FailoverNotice -> _uiState.update {
                         it.copy(failoverNotice = "Switched to ${event.toProvider} (${event.reason.take(100)})")
                     }
                     is AgentEvent.ToolStarted, is AgentEvent.ToolFinished -> refreshTick.update { it + 1 }
                     is AgentEvent.Finished -> {
+                        streamBuf.setLength(0)
+                        reasoningBuf.setLength(0)
                         _uiState.update { it.copy(streamingContent = "", streamingReasoning = "") }
                         refreshTick.update { it + 1 }
                     }
                     is AgentEvent.Error -> {
+                        streamBuf.setLength(0)
+                        reasoningBuf.setLength(0)
                         _uiState.update {
                             it.copy(streamingContent = "", streamingReasoning = "", failoverNotice = "⚠️ ${event.error.take(200)}")
                         }
@@ -147,9 +202,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     else it.copy(isAgentRunning = false, currentAgentStatus = "", streamingContent = "", streamingReasoning = "")
                 }
             }
-        }
-        viewModelScope.launch {
-            agentEngine.approvalRequest.collect { req -> _uiState.update { it.copy(approval = req) } }
         }
 
         // Keep the active conversation entity (title etc.) in sync
@@ -182,6 +234,73 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     if (fresh == null) selectProject(projects.first())
                     else if (fresh != current) _uiState.update { it.copy(activeProject = fresh) }
                 }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // GitHub: repository list and clone
+    // ---------------------------------------------------------------------------------------
+
+    data class RepoListState(
+        val loading: Boolean = false,
+        val error: String? = null,
+        val repos: List<GhRepo> = emptyList(),
+        val connected: Boolean = true
+    )
+
+    private val _repoList = MutableStateFlow(RepoListState())
+    val repoList: StateFlow<RepoListState> = _repoList.asStateFlow()
+
+    fun loadGithubRepos() {
+        if (settings.githubToken.isBlank()) {
+            _repoList.value = RepoListState(connected = false)
+            return
+        }
+        _repoList.update { it.copy(loading = true, error = null, connected = true) }
+        viewModelScope.launch {
+            try {
+                val list = app.githubManager.listRepos()
+                _repoList.value = RepoListState(repos = list)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _repoList.value = RepoListState(error = e.message ?: "Could not load repositories")
+            }
+        }
+    }
+
+    /** Downloads a repository as a project; the current chat stays open and moves into it. */
+    fun cloneRepo(repo: GhRepo) {
+        if (agentEngine.isRunning.value) {
+            _uiState.update { it.copy(failoverNotice = "The agent is working. Press Stop first.") }
+            return
+        }
+        _uiState.update { it.copy(failoverNotice = "Cloning ${repo.fullName}…") }
+        viewModelScope.launch {
+            try {
+                val project = app.githubManager.cloneRepo(repo)
+                val conv = _uiState.value.activeConversation
+                if (conv != null) {
+                    chatRepo.moveConversationToProject(conv.id, project.id)
+                    app.database.messageDao().insertMessage(
+                        MessageEntity(
+                            id = UUID.randomUUID().toString(),
+                            conversationId = conv.id,
+                            sender = "ASSISTANT",
+                            content = "📥 Cloned **${repo.fullName}** (${project.fileCount} files). Pushes from this project go to this repository.",
+                            status = "SUCCESS"
+                        )
+                    )
+                    switchProject(project, conv.id)
+                } else {
+                    switchProject(project, null)
+                }
+                _uiState.update { it.copy(failoverNotice = null) }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _uiState.update { it.copy(failoverNotice = "⚠️ ${e.message ?: "Clone failed"}".take(240)) }
             }
         }
     }

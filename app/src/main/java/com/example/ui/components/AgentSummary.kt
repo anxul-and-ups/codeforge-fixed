@@ -219,11 +219,10 @@ fun AgentSummaryBar(
     if (steps.isEmpty()) return
     var open by remember { mutableStateOf(false) }
 
-    val sorted = steps.sortedBy { it.stepIndex }
-    val notes = sorted.filter { it.toolName == "note" }
-    val tools = sorted.filter { it.toolName != "note" && it.toolName != "finish" }
-    val phases = buildPhases(sorted)
-    val title = overallTitle(sorted, phases)
+    val sorted = remember(steps) { steps.sortedBy { it.stepIndex } }
+    val notes = remember(sorted) { sorted.filter { it.toolName == "note" } }
+    val tools = remember(sorted) { sorted.filter { it.toolName != "note" && it.toolName != "finish" } }
+    val title = remember(sorted) { overallTitle(sorted, buildPhases(sorted)) }
     val latest: String = when {
         running -> {
             val lastTool = tools.lastOrNull()

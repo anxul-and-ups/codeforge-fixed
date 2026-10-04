@@ -10,6 +10,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -63,10 +64,12 @@ import java.util.Locale
 @Composable
 fun BuildLogScreen(
     store: BuildLogStore,
+    manager: com.example.data.github.GitHubManager,
     onSendToAi: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val entries by store.entries.collectAsState()
+    val terminalLines by manager.log.lines.collectAsState()
     var selected by remember { mutableStateOf<BuildLogEntry?>(null) }
     var confirmClear by remember { mutableStateOf(false) }
     val dateFormat = remember { SimpleDateFormat("dd MMM, HH:mm", Locale.getDefault()) }
@@ -93,6 +96,10 @@ fun BuildLogScreen(
             if (entries.isNotEmpty()) {
                 TextButton(onClick = { confirmClear = true }) { Text("Clear", color = AppColors.error) }
             }
+        }
+
+        Box(modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
+            com.example.ui.screens.github.TerminalCard(manager = manager, lines = terminalLines)
         }
 
         if (entries.isEmpty()) {

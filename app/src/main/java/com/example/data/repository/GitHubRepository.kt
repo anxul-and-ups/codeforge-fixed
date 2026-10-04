@@ -27,10 +27,52 @@ data class WorkflowRunInfo(
 
 data class PushResult(
     val commitSha: String,
-    val changedFiles: Int,
+    val newFiles: Int,
+    val modifiedFiles: Int,
     val deletedFiles: Int,
-    val noChanges: Boolean
+    val noChanges: Boolean,
+    val branch: String = "main",
+    val skipped: List<String> = emptyList()
+) {
+    val changedFiles: Int get() = newFiles + modifiedFiles
+}
+
+data class GhUser(
+    val login: String,
+    val name: String,
+    val bio: String,
+    val avatarUrl: String,
+    val publicRepos: Int,
+    val followers: Int,
+    val following: Int,
+    val company: String,
+    val location: String,
+    val htmlUrl: String
 )
+
+data class GhRepo(
+    val fullName: String,
+    val name: String,
+    val isPrivate: Boolean,
+    val description: String,
+    val defaultBranch: String,
+    val updatedAt: String,
+    val isFork: Boolean,
+    val sizeKb: Int
+)
+
+/** What a push would do, shown to the user before anything is uploaded. */
+data class PushPlan(
+    val repo: String,
+    val branch: String,
+    val repoIsEmpty: Boolean,
+    val newFiles: List<String>,
+    val modifiedFiles: List<String>,
+    val deletedFiles: List<String>,
+    val protectedKept: List<String>
+) {
+    val isEmpty: Boolean get() = newFiles.isEmpty() && modifiedFiles.isEmpty() && deletedFiles.isEmpty()
+}
 
 class GitHubRepository(
     private val client: OkHttpClient = OkHttpClient.Builder()
@@ -64,6 +106,136 @@ class GitHubRepository(
                 throw IllegalStateException("GitHub: $what failed [${res.code}] ${msg.take(300)}$hint")
             }
             return try { JSONObject(body) } catch (e: Exception) { JSONObject() }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Account, repositories
+    // ---------------------------------------------------------------------------------------
+
+    private fun parseUser(o: JSONObject) = GhUser(
+        login = o.optString("login"),
+        name = if (o.isNull("name")) "" else o.optString("name"),
+        bio = if (o.isNull("bio")) "" else o.optString("bio"),
+        avatarUrl = o.optString("avatar_url"),
+        publicRepos = o.optInt("public_repos"),
+        followers = o.optInt("followers"),
+        following = o.optInt("following"),
+        company = if (o.isNull("company")) "" else o.optString("company"),
+        location = if (o.isNull("location")) "" else o.optString("location"),
+        htmlUrl = o.optString("html_url")
+    )
+
+    private fun parseRepo(o: JSONObject) = GhRepo(
+        fullName = o.optString("full_name"),
+        name = o.optString("name"),
+        isPrivate = o.optBoolean("private"),
+        description = if (o.isNull("description")) "" else o.optString("description"),
+        defaultBranch = o.optString("default_branch", "main").ifBlank { "main" },
+        updatedAt = o.optString("updated_at"),
+        isFork = o.optBoolean("fork"),
+        sizeKb = o.optInt("size")
+    )
+
+    private fun friendlyHttpError(code: Int, message: String, what: String): String = when (code) {
+        401 -> "$what failed: the token is wrong, expired or revoked (401)."
+        403 -> "$what failed: access denied (403) $message"
+        404 -> "$what failed: not found (404). For a fine-grained token, make sure the repository is selected in the token settings."
+        409 -> "$what failed: $message (409)"
+        422 -> "$what failed: $message (422)"
+        else -> "$what failed [$code] $message"
+    }
+
+    /** Reads the account that belongs to [pat]. Throws IllegalStateException with a readable message. */
+    suspend fun getUser(pat: String): GhUser = withContext(Dispatchers.IO) {
+        try {
+            client.newCall(builder(pat.trim(), "$api/user").build()).execute().use { res ->
+                val body = res.body?.string().orEmpty()
+                if (!res.isSuccessful) {
+                    val msg = try { JSONObject(body).optString("message", "") } catch (e: Exception) { "" }
+                    throw IllegalStateException(friendlyHttpError(res.code, msg, "Connecting to GitHub"))
+                }
+                parseUser(JSONObject(body))
+            }
+        } catch (e: java.net.UnknownHostException) {
+            throw IllegalStateException("No internet connection.")
+        }
+    }
+
+    /** All repositories of the account (own, collaborator, organisation), newest first. */
+    suspend fun listRepos(pat: String): List<GhRepo> = withContext(Dispatchers.IO) {
+        val out = ArrayList<GhRepo>()
+        for (page in 1..6) {
+            val url = "$api/user/repos?per_page=100&page=$page&sort=updated&affiliation=owner,collaborator,organization_member"
+            client.newCall(builder(pat.trim(), url).build()).execute().use { res ->
+                val body = res.body?.string().orEmpty()
+                if (!res.isSuccessful) {
+                    val msg = try { JSONObject(body).optString("message", "") } catch (e: Exception) { "" }
+                    throw IllegalStateException(friendlyHttpError(res.code, msg, "Loading repositories"))
+                }
+                val arr = JSONArray(body)
+                for (i in 0 until arr.length()) out.add(parseRepo(arr.getJSONObject(i)))
+                if (arr.length() < 100) return@withContext out
+            }
+        }
+        out
+    }
+
+    suspend fun getRepo(pat: String, fullName: String): GhRepo = withContext(Dispatchers.IO) {
+        client.newCall(builder(pat.trim(), "$api/repos/$fullName").build()).execute().use { res ->
+            val body = res.body?.string().orEmpty()
+            if (!res.isSuccessful) {
+                val msg = try { JSONObject(body).optString("message", "") } catch (e: Exception) { "" }
+                throw IllegalStateException(friendlyHttpError(res.code, msg, "Reading $fullName"))
+            }
+            parseRepo(JSONObject(body))
+        }
+    }
+
+    suspend fun createRepo(pat: String, name: String, description: String, isPrivate: Boolean): GhRepo = withContext(Dispatchers.IO) {
+        val payload = JSONObject()
+            .put("name", name.trim())
+            .put("description", description.trim())
+            .put("private", isPrivate)
+            .put("auto_init", false)
+        client.newCall(
+            builder(pat.trim(), "$api/user/repos").post(payload.toString().toRequestBody(jsonMediaType)).build()
+        ).execute().use { res ->
+            val body = res.body?.string().orEmpty()
+            if (!res.isSuccessful) {
+                var msg = try { JSONObject(body).optString("message", "") } catch (e: Exception) { "" }
+                if (res.code == 422) {
+                    msg = "A repository with this name already exists, or the name is not allowed. $msg"
+                }
+                throw IllegalStateException(friendlyHttpError(res.code, msg, "Creating the repository"))
+            }
+            parseRepo(JSONObject(body))
+        }
+    }
+
+    /** Downloads the default branch of a repository as a ZIP file. */
+    suspend fun downloadRepoZip(pat: String, fullName: String, dest: File) = withContext(Dispatchers.IO) {
+        client.newCall(builder(pat.trim(), "$api/repos/$fullName/zipball").build()).execute().use { res ->
+            if (!res.isSuccessful) {
+                val body = res.body?.string().orEmpty()
+                val msg = try { JSONObject(body).optString("message", "") } catch (e: Exception) { "" }
+                throw IllegalStateException(friendlyHttpError(res.code, msg, "Downloading $fullName"))
+            }
+            res.body?.byteStream()?.use { input ->
+                dest.outputStream().use { out -> input.copyTo(out) }
+            } ?: throw IllegalStateException("GitHub returned an empty download.")
+        }
+    }
+
+    suspend fun fetchAvatar(url: String): android.graphics.Bitmap? = withContext(Dispatchers.IO) {
+        try {
+            client.newCall(Request.Builder().url(url).build()).execute().use { res ->
+                if (!res.isSuccessful) return@withContext null
+                val bytes = res.body?.bytes() ?: return@withContext null
+                android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            }
+        } catch (e: Exception) {
+            null
         }
     }
 
@@ -167,25 +339,41 @@ class GitHubRepository(
         return md.digest().joinToString("") { "%02x".format(it) }
     }
 
-    /**
-     * Commits the differences between [files] (local project) and the branch head as ONE commit,
-     * so only one workflow run is triggered. [deletedPaths] are removed from the repo if present.
-     */
-    suspend fun pushProject(
-        pat: String,
-        ownerRepo: String,
-        branch: String,
-        files: Map<String, File>,
-        deletedPaths: Set<String>,
-        commitMessage: String
-    ): PushResult = withContext(Dispatchers.IO) {
-        val ref = jsonOrThrow(builder(pat, "$api/repos/$ownerRepo/git/ref/heads/$branch").build(), "read branch '$branch'")
-        val baseCommitSha = ref.getJSONObject("object").getString("sha")
+    private val protectedPrefixes = listOf(".github/")
 
-        val baseCommit = jsonOrThrow(builder(pat, "$api/repos/$ownerRepo/git/commits/$baseCommitSha").build(), "read commit")
+    private class RemoteState(
+        val defaultBranch: String,
+        val isEmpty: Boolean,
+        val baseCommitSha: String?,
+        val baseTreeSha: String?,
+        val remoteSha: Map<String, String>,
+        val remoteMode: Map<String, String>
+    )
+
+    private fun readRemote(pat: String, repo: String): RemoteState {
+        val info = client.newCall(builder(pat, "$api/repos/$repo").build()).execute().use { res ->
+            val body = res.body?.string().orEmpty()
+            if (!res.isSuccessful) {
+                val msg = try { JSONObject(body).optString("message", "") } catch (e: Exception) { "" }
+                throw IllegalStateException(friendlyHttpError(res.code, msg, "Reading $repo"))
+            }
+            JSONObject(body)
+        }
+        val branch = info.optString("default_branch", "main").ifBlank { "main" }
+
+        val refRes = client.newCall(builder(pat, "$api/repos/$repo/git/ref/heads/$branch").build()).execute()
+        val refBody = refRes.use { r -> Pair(r.code, r.body?.string().orEmpty()) }
+        if (refBody.first == 404 || refBody.first == 409) {
+            return RemoteState(branch, true, null, null, emptyMap(), emptyMap())
+        }
+        if (refBody.first !in 200..299) {
+            val msg = try { JSONObject(refBody.second).optString("message", "") } catch (e: Exception) { "" }
+            throw IllegalStateException(friendlyHttpError(refBody.first, msg, "Reading branch '$branch'"))
+        }
+        val baseCommitSha = JSONObject(refBody.second).getJSONObject("object").getString("sha")
+        val baseCommit = jsonOrThrow(builder(pat, "$api/repos/$repo/git/commits/$baseCommitSha").build(), "read commit")
         val baseTreeSha = baseCommit.getJSONObject("tree").getString("sha")
-
-        val tree = jsonOrThrow(builder(pat, "$api/repos/$ownerRepo/git/trees/$baseTreeSha?recursive=1").build(), "read tree")
+        val tree = jsonOrThrow(builder(pat, "$api/repos/$repo/git/trees/$baseTreeSha?recursive=1").build(), "read file list")
         val remoteSha = HashMap<String, String>()
         val remoteMode = HashMap<String, String>()
         val arr = tree.optJSONArray("tree") ?: JSONArray()
@@ -196,58 +384,150 @@ class GitHubRepository(
                 remoteMode[t.getString("path")] = t.optString("mode", "100644")
             }
         }
+        return RemoteState(branch, false, baseCommitSha, baseTreeSha, remoteSha, remoteMode)
+    }
 
-        if (remoteSha.isNotEmpty() && files.keys.none { it in remoteSha }) {
+    private fun isProtected(path: String, localHasWorkflows: Boolean): Boolean =
+        !localHasWorkflows && protectedPrefixes.any { path.startsWith(it) }
+
+    /** Compares the project with the repository (nothing is uploaded). */
+    suspend fun planPush(
+        pat: String,
+        repo: String,
+        files: Map<String, File>,
+        deleteExtra: Boolean
+    ): PushPlan = withContext(Dispatchers.IO) {
+        val remote = readRemote(pat.trim(), repo)
+        val newF = ArrayList<String>()
+        val modF = ArrayList<String>()
+        for ((path, file) in files) {
+            if (file.length() > 20L * 1024 * 1024) continue
+            val rs = remote.remoteSha[path]
+            if (rs == null) newF.add(path) else if (rs != gitBlobSha(file)) modF.add(path)
+        }
+        val localHasWorkflows = files.keys.any { it.startsWith(".github/") }
+        val delF = ArrayList<String>()
+        val kept = ArrayList<String>()
+        if (deleteExtra) {
+            for (path in remote.remoteSha.keys) {
+                if (path in files) continue
+                if (isProtected(path, localHasWorkflows)) kept.add(path) else delF.add(path)
+            }
+        }
+        PushPlan(repo, remote.defaultBranch, remote.isEmpty, newF.sorted(), modF.sorted(), delF.sorted(), kept.sorted())
+    }
+
+    /**
+     * Makes the repository's default branch contain [files] as ONE commit (one build is triggered).
+     * Works for empty repositories too (the first file is created through the Contents API).
+     * Files only in the repo are removed when [deleteExtra] is true (workflow files are kept if the project has none).
+     */
+    suspend fun pushProject(
+        pat: String,
+        repo: String,
+        files: Map<String, File>,
+        deleteExtra: Boolean,
+        explicitDeletes: Set<String>,
+        commitMessage: String,
+        requireOverlap: Boolean,
+        onProgress: (String) -> Unit = {}
+    ): PushResult = withContext(Dispatchers.IO) {
+        val token = pat.trim()
+        var remote = readRemote(token, repo)
+        val branch = remote.defaultBranch
+
+        val usable = files.filter { it.value.length() <= 20L * 1024 * 1024 }
+        val skipped = files.filter { it.value.length() > 20L * 1024 * 1024 }.keys.toList()
+
+        if (requireOverlap && !remote.isEmpty && remote.remoteSha.isNotEmpty() && usable.keys.none { it in remote.remoteSha }) {
             throw IllegalStateException(
-                "Project files do not match the GitHub repo (no common file paths). " +
-                    "Check the repository name/branch, or whether the ZIP has an extra top-level folder."
+                "Project files do not match the repo (no common file paths). Use 'Push project' in the GitHub screen to replace the repo content."
             )
         }
-
-        val changed = files.filter { (path, file) ->
-            file.length() <= 20L * 1024 * 1024 && remoteSha[path] != gitBlobSha(file)
+        if (usable.isEmpty()) {
+            throw IllegalStateException("The project has no files to push.")
         }
-        val removed = deletedPaths.filter { it in remoteSha && it !in files }
 
-        if (changed.isEmpty() && removed.isEmpty()) {
-            return@withContext PushResult(baseCommitSha, 0, 0, true)
+        if (remote.isEmpty) {
+            onProgress("Repository is empty. Creating the first commit…")
+            // The Git Data API refuses empty repositories, so seed it with the smallest file via the Contents API.
+            val seedPath = usable.minByOrNull { it.value.length() }!!.key
+            val seedFile = usable.getValue(seedPath)
+            val seedBody = JSONObject()
+                .put("message", "Initial commit")
+                .put("content", Base64.encodeToString(seedFile.readBytes(), Base64.NO_WRAP))
+                .put("branch", branch)
+            jsonOrThrow(
+                builder(token, "$api/repos/$repo/contents/" + seedPath.split("/").joinToString("/") { java.net.URLEncoder.encode(it, "UTF-8").replace("+", "%20") })
+                    .put(seedBody.toString().toRequestBody(jsonMediaType)).build(),
+                "create the first file"
+            )
+            remote = readRemote(token, repo)
+        }
+
+        val baseCommitSha = remote.baseCommitSha ?: throw IllegalStateException("Could not read the repository after creating it.")
+        val baseTreeSha = remote.baseTreeSha ?: throw IllegalStateException("Could not read the repository tree.")
+        val remoteSha = remote.remoteSha
+
+        val newPaths = ArrayList<String>()
+        val modPaths = ArrayList<String>()
+        for ((path, file) in usable) {
+            val rs = remoteSha[path]
+            if (rs == null) newPaths.add(path) else if (rs != gitBlobSha(file)) modPaths.add(path)
+        }
+        val localHasWorkflows = files.keys.any { it.startsWith(".github/") }
+        val removed = ArrayList<String>()
+        for (path in remoteSha.keys) {
+            if (path in files) continue
+            if (deleteExtra && !isProtected(path, localHasWorkflows)) removed.add(path)
+            else if (path in explicitDeletes) removed.add(path)
+        }
+
+        val total = newPaths.size + modPaths.size
+        if (total == 0 && removed.isEmpty()) {
+            return@withContext PushResult(baseCommitSha, 0, 0, 0, true, branch, skipped)
         }
 
         val entries = JSONArray()
-        for ((path, file) in changed) {
-            val content = Base64.encodeToString(file.readBytes(), Base64.NO_WRAP)
-            val blobBody = JSONObject().put("content", content).put("encoding", "base64")
+        var done = 0
+        for (path in newPaths + modPaths) {
+            val file = usable.getValue(path)
+            val blobBody = JSONObject()
+                .put("content", Base64.encodeToString(file.readBytes(), Base64.NO_WRAP))
+                .put("encoding", "base64")
             val blob = jsonOrThrow(
-                builder(pat, "$api/repos/$ownerRepo/git/blobs")
+                builder(token, "$api/repos/$repo/git/blobs")
                     .post(blobBody.toString().toRequestBody(jsonMediaType)).build(),
                 "upload $path"
             )
             entries.put(
                 JSONObject()
                     .put("path", path)
-                    .put("mode", remoteMode[path] ?: if (path.endsWith("gradlew") || path.endsWith(".sh")) "100755" else "100644")
+                    .put("mode", remote.remoteMode[path] ?: if (path.endsWith("gradlew") || path.endsWith(".sh")) "100755" else "100644")
                     .put("type", "blob")
                     .put("sha", blob.getString("sha"))
             )
+            done++
+            if (done % 20 == 0 || done == total) onProgress("Uploaded $done of $total files…")
         }
         for (path in removed) {
             entries.put(
                 JSONObject()
                     .put("path", path)
-                    .put("mode", remoteMode[path] ?: "100644")
+                    .put("mode", remote.remoteMode[path] ?: "100644")
                     .put("type", "blob")
                     .put("sha", JSONObject.NULL)
             )
         }
 
         val newTree = jsonOrThrow(
-            builder(pat, "$api/repos/$ownerRepo/git/trees")
+            builder(token, "$api/repos/$repo/git/trees")
                 .post(JSONObject().put("base_tree", baseTreeSha).put("tree", entries).toString().toRequestBody(jsonMediaType))
                 .build(),
             "create tree"
         )
         val commit = jsonOrThrow(
-            builder(pat, "$api/repos/$ownerRepo/git/commits")
+            builder(token, "$api/repos/$repo/git/commits")
                 .post(
                     JSONObject()
                         .put("message", commitMessage)
@@ -259,11 +539,11 @@ class GitHubRepository(
         )
         val newCommitSha = commit.getString("sha")
         jsonOrThrow(
-            builder(pat, "$api/repos/$ownerRepo/git/refs/heads/$branch")
+            builder(token, "$api/repos/$repo/git/refs/heads/$branch")
                 .patch(JSONObject().put("sha", newCommitSha).toString().toRequestBody(jsonMediaType)).build(),
             "update branch"
         )
-        PushResult(newCommitSha, changed.size, removed.size, false)
+        PushResult(newCommitSha, newPaths.size, modPaths.size, removed.size, false, branch, skipped)
     }
 
     // ---------------------------------------------------------------------------------------
