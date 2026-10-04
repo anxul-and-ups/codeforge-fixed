@@ -2,7 +2,13 @@ package com.example.data.repository
 
 import android.util.Base64
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -489,27 +495,54 @@ class GitHubRepository(
         }
 
         val entries = JSONArray()
-        var done = 0
-        for (path in newPaths + modPaths) {
-            val file = usable.getValue(path)
-            val blobBody = JSONObject()
-                .put("content", Base64.encodeToString(file.readBytes(), Base64.NO_WRAP))
-                .put("encoding", "base64")
-            val blob = jsonOrThrow(
-                builder(token, "$api/repos/$repo/git/blobs")
-                    .post(blobBody.toString().toRequestBody(jsonMediaType)).build(),
-                "upload $path"
-            )
-            entries.put(
-                JSONObject()
-                    .put("path", path)
-                    .put("mode", remote.remoteMode[path] ?: if (path.endsWith("gradlew") || path.endsWith(".sh")) "100755" else "100644")
-                    .put("type", "blob")
-                    .put("sha", blob.getString("sha"))
-            )
-            done++
-            if (done % 20 == 0 || done == total) onProgress("Uploaded $done of $total files…")
+        // Upload the file contents in parallel (HTTP/2 multiplexes them over one connection).
+        // One-by-one uploading was the reason for slow pushes on a phone connection.
+        val done = AtomicInteger(0)
+        val gate = Semaphore(8)
+        val allPaths = newPaths + modPaths
+        val uploaded: List<JSONObject> = coroutineScope {
+            allPaths.map { path ->
+                async(Dispatchers.IO) {
+                    gate.withPermit {
+                        val file = usable.getValue(path)
+                        val blobBody = JSONObject()
+                            .put("content", Base64.encodeToString(file.readBytes(), Base64.NO_WRAP))
+                            .put("encoding", "base64")
+                            .toString()
+                        var attempt = 0
+                        var blob: JSONObject? = null
+                        while (blob == null) {
+                            attempt++
+                            try {
+                                blob = jsonOrThrow(
+                                    builder(token, "$api/repos/$repo/git/blobs")
+                                        .post(blobBody.toRequestBody(jsonMediaType)).build(),
+                                    "upload $path"
+                                )
+                            } catch (e: java.io.IOException) {
+                                if (attempt >= 3) throw IllegalStateException("Upload of $path failed: ${e.message}")
+                                delay(800L * attempt)
+                            } catch (e: IllegalStateException) {
+                                // secondary rate limit / temporary server error: wait and retry
+                                val m = e.message.orEmpty()
+                                val transient = m.contains("[403]") || m.contains("[429]") || m.contains("[500]") ||
+                                    m.contains("[502]") || m.contains("[503]")
+                                if (!transient || attempt >= 3) throw e
+                                delay(1500L * attempt)
+                            }
+                        }
+                        val n = done.incrementAndGet()
+                        if (n % 15 == 0 || n == allPaths.size) onProgress("Uploaded $n of ${allPaths.size} files…")
+                        JSONObject()
+                            .put("path", path)
+                            .put("mode", remote.remoteMode[path] ?: if (path.endsWith("gradlew") || path.endsWith(".sh")) "100755" else "100644")
+                            .put("type", "blob")
+                            .put("sha", blob.getString("sha"))
+                    }
+                }
+            }.awaitAll()
         }
+        for (o in uploaded) entries.put(o)
         for (path in removed) {
             entries.put(
                 JSONObject()

@@ -218,7 +218,7 @@ class AgentEngine(
             if (run == null) {
                 postNote(
                     req.conversationId,
-                    "⚠️ Pushed commit $short, but no GitHub Actions run was found. Make sure `.github/workflows/build.yml` triggers `on: push` for branch `main`."
+                    "⚠️ Pushed commit $short, but no GitHub Actions run was found. Make sure `.github/workflows/build.yml` triggers `on: push` for branch `${push.branch}`."
                 )
                 _agentEvents.tryEmit(AgentEvent.Finished("No build run found", 0))
                 return
