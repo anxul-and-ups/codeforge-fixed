@@ -185,6 +185,7 @@ fun MainScreen(
                         manager = app.githubManager,
                         settings = app.settingsStore,
                         chatViewModel = chatViewModel,
+                        projectRepository = app.projectRepository,
                         onOpenBuilds = { currentScreen = Screen.Builds },
                         modifier = Modifier.fillMaxSize()
                     )

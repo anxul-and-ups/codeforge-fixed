@@ -38,7 +38,8 @@ data class PushResult(
     val deletedFiles: Int,
     val noChanges: Boolean,
     val branch: String = "main",
-    val skipped: List<String> = emptyList()
+    val skipped: List<String> = emptyList(),
+    val paths: List<String> = emptyList()
 ) {
     val changedFiles: Int get() = newFiles + modifiedFiles
 }
@@ -103,7 +104,9 @@ class GitHubRepository(
             val body = res.body?.string().orEmpty()
             if (!res.isSuccessful) {
                 val msg = try { JSONObject(body).optString("message", body) } catch (e: Exception) { body }
-                val hint = when (res.code) {
+                val hint = if (msg.contains("workflow", ignoreCase = true)) {
+                    " (your token needs the 'workflow' scope for classic tokens, or 'Workflows: Read and write' for fine-grained tokens, to change .github/workflows files)"
+                } else when (res.code) {
                     401 -> " (token invalid or expired)"
                     403 -> " (token lacks permission: needs Contents read/write, Actions read, and Workflows if you change workflow files)"
                     404 -> " (repo/branch not found or token has no access)"
@@ -436,21 +439,26 @@ class GitHubRepository(
         explicitDeletes: Set<String>,
         commitMessage: String,
         requireOverlap: Boolean,
+        onlyPaths: Set<String>? = null,
         onProgress: (String) -> Unit = {}
     ): PushResult = withContext(Dispatchers.IO) {
         val token = pat.trim()
         var remote = readRemote(token, repo)
         val branch = remote.defaultBranch
 
-        val usable = files.filter { it.value.length() <= 20L * 1024 * 1024 }
-        val skipped = files.filter { it.value.length() > 20L * 1024 * 1024 }.keys.toList()
+        // When only specific files should be pushed (e.g. the files the AI just fixed), everything else is left alone.
+        // An empty repository always gets the whole project.
+        val restrict = onlyPaths != null && !remote.isEmpty
+        val candidates = if (restrict) files.filterKeys { k -> onlyPaths!!.any { k == it || k.startsWith("$it/") } } else files
+        val usable = candidates.filter { it.value.length() <= 20L * 1024 * 1024 }
+        val skipped = candidates.filter { it.value.length() > 20L * 1024 * 1024 }.keys.toList()
 
         if (requireOverlap && !remote.isEmpty && remote.remoteSha.isNotEmpty() && usable.keys.none { it in remote.remoteSha }) {
             throw IllegalStateException(
                 "Project files do not match the repo (no common file paths). Use 'Push project' in the GitHub screen to replace the repo content."
             )
         }
-        if (usable.isEmpty()) {
+        if (usable.isEmpty() && !restrict) {
             throw IllegalStateException("The project has no files to push.")
         }
 
@@ -485,14 +493,15 @@ class GitHubRepository(
         val removed = ArrayList<String>()
         for (path in remoteSha.keys) {
             if (path in files) continue
-            if (deleteExtra && !isProtected(path, localHasWorkflows)) removed.add(path)
-            else if (path in explicitDeletes) removed.add(path)
+            if (!restrict && deleteExtra && !isProtected(path, localHasWorkflows)) removed.add(path)
+            else if (explicitDeletes.any { path == it || path.startsWith("$it/") }) removed.add(path)
         }
 
         val total = newPaths.size + modPaths.size
         if (total == 0 && removed.isEmpty()) {
             return@withContext PushResult(baseCommitSha, 0, 0, 0, true, branch, skipped)
         }
+        val touchedPaths = (newPaths + modPaths + removed).toList()
 
         val entries = JSONArray()
         // Upload the file contents in parallel (HTTP/2 multiplexes them over one connection).
@@ -576,7 +585,7 @@ class GitHubRepository(
                 .patch(JSONObject().put("sha", newCommitSha).toString().toRequestBody(jsonMediaType)).build(),
             "update branch"
         )
-        PushResult(newCommitSha, newPaths.size, modPaths.size, removed.size, false, branch, skipped)
+        PushResult(newCommitSha, newPaths.size, modPaths.size, removed.size, false, branch, skipped, touchedPaths)
     }
 
     // ---------------------------------------------------------------------------------------

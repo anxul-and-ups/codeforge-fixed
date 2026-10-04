@@ -4,6 +4,7 @@ import android.content.Context
 import com.example.data.api.LlmDocument
 import com.example.data.api.LlmMessage
 import com.example.data.github.GitHubManager
+import com.example.data.repository.PushResult
 import com.example.data.logs.BuildLogEntry
 import com.example.data.logs.BuildLogStore
 import kotlinx.coroutines.withTimeoutOrNull
@@ -60,7 +61,9 @@ data class RunRequest(
     val imagesBase64: List<String> = emptyList(),
     val docs: List<LlmDocument> = emptyList(),
     /** If true: skip the AI step and only push the project to GitHub, wait for the build and auto-fix. */
-    val pushOnly: Boolean = false
+    val pushOnly: Boolean = false,
+    /** A push that was already done (manually); only watch its build and fix errors if it fails. */
+    val watchPush: PushResult? = null
 )
 
 data class ApprovalRequest(
@@ -72,9 +75,21 @@ data class ApprovalRequest(
     val denyLabel: String = "Deny"
 )
 
-private data class ToolResult(val text: String, val isError: Boolean = false, val changed: Boolean = false)
+private data class ToolResult(
+    val text: String,
+    val isError: Boolean = false,
+    val changed: Boolean = false,
+    val touched: List<String> = emptyList(),
+    val removed: List<String> = emptyList()
+)
 
-private data class LoopResult(val ok: Boolean, val changed: Boolean, val summary: String)
+private data class LoopResult(
+    val ok: Boolean,
+    val changed: Boolean,
+    val summary: String,
+    val touched: Set<String> = emptySet(),
+    val removed: Set<String> = emptySet()
+)
 
 class AgentEngine(
     private val appContext: Context,
@@ -148,10 +163,20 @@ class AgentEngine(
     private suspend fun runFull(req: RunRequest) {
         var changed = false
         var summary = ""
+        var touched: Set<String>? = null
+        var removed: Set<String> = emptySet()
+        if (req.watchPush != null) {
+            // The user pushed manually from the GitHub screen: just follow that build.
+            if (!settings.githubConfigured) return
+            buildAndFix(req, "build check", null, emptySet(), req.watchPush)
+            return
+        }
         if (!req.pushOnly) {
             val result = runAgentLoop(req, req.userPrompt, req.imagesBase64, req.docs)
             changed = result.changed
             summary = result.summary
+            touched = result.touched
+            removed = result.removed
             if (!result.ok) return
         } else {
             changed = true
@@ -159,12 +184,12 @@ class AgentEngine(
         }
         val githubReady = settings.githubConfigured
         if (req.pushOnly && !githubReady) {
-            postNote(req.conversationId, "⚠️ GitHub is not configured. Add repository and token in Settings.")
-            _agentEvents.tryEmit(AgentEvent.Finished("GitHub not configured", 0))
+            postNote(req.conversationId, "⚠️ GitHub is not connected. Open Settings → GitHub and connect your account.")
+            _agentEvents.tryEmit(AgentEvent.Finished("GitHub not connected", 0))
             return
         }
         if (githubReady && (req.pushOnly || (settings.autoPushBuild && changed))) {
-            buildAndFix(req, summary)
+            buildAndFix(req, summary, touched, removed, null)
         }
     }
 
@@ -172,7 +197,13 @@ class AgentEngine(
     // GitHub: push -> wait for build -> auto-fix loop
     // ---------------------------------------------------------------------------------------
 
-    private suspend fun buildAndFix(req: RunRequest, summaryHint: String) {
+    private suspend fun buildAndFix(
+        req: RunRequest,
+        summaryHint: String,
+        firstTouched: Set<String>?,
+        firstRemoved: Set<String>,
+        initialPush: PushResult?
+    ) {
         val pat = settings.githubToken
         val repo = settings.repoFor(req.projectId)
         if (repo == null) {
@@ -185,46 +216,59 @@ class AgentEngine(
         }
         val maxAttempts = settings.maxBuildFixAttempts
         var attempt = 0
+        // Only the files the AI changed are pushed (not the whole project).
+        var touched: Set<String>? = firstTouched
+        var removed: Set<String> = firstRemoved
+        var preDone: PushResult? = initialPush
 
         while (true) {
-            status("Pushing changes to GitHub…")
-            val push = try {
-                val deleted = projectRepository.computeRunDiffs(req.projectId)
-                    .filter { it.isDeletedFile }.map { it.filePath.replace('\\', '/') }.toSet()
-                githubManager.push(
-                    projectId = req.projectId,
-                    repo = repo,
-                    deleteExtra = false,
-                    message = "CodeForge: ${summaryHint.lineSequence().firstOrNull().orEmpty().take(60).ifBlank { "update" }}",
-                    explicitDeletes = deleted,
-                    requireOverlap = !req.pushOnly
-                )
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                postNote(req.conversationId, "⚠️ GitHub push failed: ${e.message}")
-                _agentEvents.tryEmit(AgentEvent.Finished("Push failed", 0))
-                return
+            val push: PushResult
+            if (preDone != null) {
+                push = preDone
+                preDone = null
+            } else {
+                status("Pushing changes to GitHub…")
+                push = try {
+                    githubManager.push(
+                        projectId = req.projectId,
+                        repo = repo,
+                        deleteExtra = false,
+                        message = "CodeForge: ${summaryHint.lineSequence().firstOrNull().orEmpty().take(60).ifBlank { "update" }}",
+                        explicitDeletes = removed,
+                        requireOverlap = false,
+                        onlyPaths = touched
+                    )
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    postNote(req.conversationId, "⚠️ GitHub push failed: ${e.message}")
+                    _agentEvents.tryEmit(AgentEvent.Finished("Push failed", 0))
+                    return
+                }
+                if (push.noChanges) {
+                    postNote(req.conversationId, "ℹ️ Nothing to push: $repo already has these changes.")
+                    _agentEvents.tryEmit(AgentEvent.Finished("No changes to push", 0))
+                    return
+                }
+                postNote(req.conversationId, "⬆️ " + githubManager.describe(push, repo))
             }
-            if (push.noChanges) {
-                postNote(req.conversationId, "ℹ️ Nothing to push: $repo already matches this project.")
-                _agentEvents.tryEmit(AgentEvent.Finished("No changes to push", 0))
-                return
-            }
-            postNote(req.conversationId, "⬆️ " + githubManager.describe(push, repo))
             status("Pushed ${push.changedFiles + push.deletedFiles} file(s). Waiting for the build…")
+            githubManager.log.info("Waiting for the GitHub Actions build…")
             val run = gitHubRepository.waitForRun(pat, repo, push.commitSha) { status(it) }
             val short = push.commitSha.take(7)
             if (run == null) {
+                githubManager.log.error("No build started for commit $short. Add .github/workflows/build.yml (Settings → GitHub → Add build workflow).")
                 postNote(
                     req.conversationId,
-                    "⚠️ Pushed commit $short, but no GitHub Actions run was found. Make sure `.github/workflows/build.yml` triggers `on: push` for branch `${push.branch}`."
+                    "⚠️ Pushed commit $short, but GitHub did not start a build. The repository needs a workflow file `.github/workflows/build.yml` with `on: push`. " +
+                        "Open Settings → GitHub and tap \"Add build workflow\", then push again."
                 )
                 _agentEvents.tryEmit(AgentEvent.Finished("No build run found", 0))
                 return
             }
             val projectName = projectRepository.getProject(req.projectId)?.name ?: "Project"
             if (run.conclusion == "success") {
+                githubManager.log.ok("Build succeeded for $short. APK: ${run.htmlUrl}")
                 buildLogStore.add(
                     BuildLogEntry(
                         id = System.currentTimeMillis(), time = System.currentTimeMillis(), projectName = projectName,
@@ -246,6 +290,7 @@ class AgentEngine(
             }
 
             attempt++
+            githubManager.log.error("Build FAILED for $short (attempt $attempt). Reading the error log…")
             status("Build failed. Reading the error log…")
             val log = gitHubRepository.fetchFailureLog(pat, repo, run.id)
             // Always keep the error in the Builds tab so the user can read and copy it.
@@ -256,6 +301,7 @@ class AgentEngine(
                     runUrl = run.htmlUrl, log = log
                 )
             )
+            githubManager.log.error("Error log saved in the Builds tab.")
             val firstError = log.lineSequence()
                 .firstOrNull { it.contains("error", ignoreCase = true) || it.startsWith("e: ") || it.contains("FAILED") }
                 ?.trim()?.take(160) ?: "See the Builds tab for the full log."
@@ -299,6 +345,8 @@ class AgentEngine(
                 "Read the affected files first, fix the root cause with minimal edits, and call finish when done."
             val result = runAgentLoop(req, prompt, emptyList())
             if (!result.ok) return
+            touched = result.touched
+            removed = result.removed
             if (!result.changed) {
                 postNote(req.conversationId, "⚠️ The AI made no file changes for this build error, so I stopped. Last run: ${run.htmlUrl}")
                 return
@@ -479,6 +527,8 @@ RULES
         var lastToolError = false
         var errorText: String? = null
         var hitStepLimit = false
+        val touchedAll = LinkedHashSet<String>()
+        val removedAll = LinkedHashSet<String>()
 
         try {
             var step = 0
@@ -617,6 +667,8 @@ RULES
                         executeTool(req.projectId, call)
                     }
                     if (result.changed) anyChange = true
+                    touchedAll.addAll(result.touched)
+                    removedAll.addAll(result.removed)
                     if (result.isError) lastToolError = true
                     messageDao.insertToolStep(
                         ToolStepEntity(
@@ -657,7 +709,7 @@ RULES
                 reasoningAll.toString(), "ERROR", providerName, modelName, totalPrompt, totalCompletion, totalCached
             )
             _agentEvents.tryEmit(AgentEvent.Error(msg))
-            return LoopResult(false, anyChange, "")
+            return LoopResult(false, anyChange, "", touchedAll, removedAll)
         }
 
         val body = StringBuilder(fullText.toString())
@@ -677,7 +729,9 @@ RULES
             providerName, modelName, totalPrompt, totalCompletion, totalCached
         )
         _agentEvents.tryEmit(AgentEvent.Finished(fs ?: fullText.toString().take(200), toolIndex))
-        return LoopResult(errorText == null, anyChange, fs ?: fullText.toString())
+        // a file edited and later deleted/moved in the same run is not "touched" any more
+        touchedAll.removeAll(removedAll)
+        return LoopResult(errorText == null, anyChange, fs ?: fullText.toString(), touchedAll, removedAll)
     }
 
     private suspend fun finalizeMessage(
@@ -737,6 +791,8 @@ RULES
             pendingDecision = null
         }
     }
+
+    private fun cleanPath(p: String): String = p.trim().removePrefix("./").trim('/').replace('\\', '/')
 
     private fun findNode(root: FileNode, path: String): FileNode? {
         val clean = path.trim().removePrefix("./").trim('/').ifEmpty { "." }
@@ -807,24 +863,34 @@ RULES
                     if (!awaitApproval("edit_file", "Edit $path")) return ToolResult("The user denied this edit.", true)
                     ToolResult(
                         projectRepository.editFile(projectId, path, args.getString("old_str"), args.getString("new_str")),
-                        changed = true
+                        changed = true,
+                        touched = listOf(cleanPath(path))
                     )
                 }
                 "write_file" -> {
                     val path = args.getString("path")
                     if (!awaitApproval("write_file", "Write file $path")) return ToolResult("The user denied this write.", true)
-                    ToolResult(projectRepository.writeFile(projectId, path, args.getString("content")), changed = true)
+                    ToolResult(
+                        projectRepository.writeFile(projectId, path, args.getString("content")),
+                        changed = true,
+                        touched = listOf(cleanPath(path))
+                    )
                 }
                 "delete_file" -> {
                     val path = args.getString("path")
                     if (!awaitApproval("delete_file", "Delete $path")) return ToolResult("The user denied this deletion.", true)
-                    ToolResult(projectRepository.deleteFile(projectId, path), changed = true)
+                    ToolResult(projectRepository.deleteFile(projectId, path), changed = true, removed = listOf(cleanPath(path)))
                 }
                 "move_file" -> {
                     val from = args.getString("from_path")
                     val to = args.getString("to_path")
                     if (!awaitApproval("move_file", "Move $from → $to")) return ToolResult("The user denied this move.", true)
-                    ToolResult(projectRepository.moveFile(projectId, from, to), changed = true)
+                    ToolResult(
+                        projectRepository.moveFile(projectId, from, to),
+                        changed = true,
+                        touched = listOf(cleanPath(to)),
+                        removed = listOf(cleanPath(from))
+                    )
                 }
                 else -> ToolResult("Error: unknown tool '${call.name}'", true)
             }

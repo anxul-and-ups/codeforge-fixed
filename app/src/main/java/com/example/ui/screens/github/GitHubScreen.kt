@@ -80,6 +80,7 @@ fun GitHubScreen(
     manager: GitHubManager,
     settings: SettingsStore,
     chatViewModel: ChatViewModel,
+    projectRepository: com.example.data.repository.ProjectRepository,
     onOpenBuilds: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -112,6 +113,18 @@ fun GitHubScreen(
     var planning by remember { mutableStateOf(false) }
     var pushing by remember { mutableStateOf(false) }
     var plan by remember { mutableStateOf<PushPlan?>(null) }
+
+    // does the project have a build workflow? (without it GitHub never starts a build)
+    var workflowTick by remember { mutableIntStateOf(0) }
+    val hasWorkflow by produceState<Boolean?>(initialValue = null, project?.id, workflowTick) {
+        value = project?.let { p ->
+            try {
+                projectRepository.listFilesForPush(p.id).keys.any { it.startsWith(".github/workflows/") }
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
 
     // build options
     var autoPush by remember { mutableStateOf(settings.autoPushBuild) }
@@ -281,6 +294,28 @@ fun GitHubScreen(
                             colors = SwitchDefaults.colors(checkedThumbColor = AppColors.onAccent, checkedTrackColor = AppColors.accent)
                         )
                     }
+                    if (project != null && hasWorkflow == false) {
+                        Text(
+                            "This project has no build workflow, so GitHub will not build it. Add it, then push.",
+                            fontSize = 12.sp,
+                            lineHeight = 17.sp,
+                            color = AppColors.warn
+                        )
+                        OutlinedButton(
+                            onClick = {
+                                scope.launch {
+                                    try {
+                                        projectRepository.writeFile(project.id, com.example.data.github.BuildWorkflow.PATH, com.example.data.github.BuildWorkflow.YAML)
+                                        manager.log.ok("Added ${com.example.data.github.BuildWorkflow.PATH} to the project")
+                                        workflowTick++
+                                    } catch (e: Exception) {
+                                        Toast.makeText(context, "Could not add the workflow: ${e.message}", Toast.LENGTH_LONG).show()
+                                    }
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) { Text("Add build workflow", color = AppColors.textPrimary) }
+                    }
                     Button(
                         enabled = project != null && linkedRepo != null && !planning && !pushing,
                         onClick = { linkedRepo?.let { startPush(it) } },
@@ -443,7 +478,10 @@ fun GitHubScreen(
                                         message = "CodeForge: push $total file(s) from ${p.name}"
                                     )
                                     Toast.makeText(context, manager.describe(result, repo), Toast.LENGTH_LONG).show()
-                                    if (!result.noChanges) manager.watchBuild(p.name, repo, result.commitSha)
+                                    if (!result.noChanges) {
+                                        // follow the build; if it fails the AI asks for permission and fixes ONLY the broken files
+                                        if (!chatViewModel.watchBuildAfterPush(result)) manager.watchBuild(p.name, repo, result.commitSha)
+                                    }
                                 } catch (e: kotlinx.coroutines.CancellationException) {
                                     throw e
                                 } catch (e: Exception) {

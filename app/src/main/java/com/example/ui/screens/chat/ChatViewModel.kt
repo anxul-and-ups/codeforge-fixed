@@ -680,6 +680,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         agentEngine.start(RunRequest(proj.id, conv.id, "", pushOnly = true))
     }
 
+    /** Follows the GitHub build of a push that was started manually; on failure the AI can fix it (with permission). */
+    fun watchBuildAfterPush(result: com.example.data.repository.PushResult): Boolean {
+        val proj = _uiState.value.activeProject ?: return false
+        val conv = _uiState.value.activeConversation ?: return false
+        if (agentEngine.isRunning.value) return false
+        agentEngine.start(RunRequest(proj.id, conv.id, "", watchPush = result))
+        return true
+    }
+
     fun stopAgent() {
         agentEngine.stop()
     }

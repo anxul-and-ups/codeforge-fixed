@@ -149,7 +149,8 @@ class GitHubManager(
         if (r.modifiedFiles > 0) parts.add("${r.modifiedFiles} modified")
         if (r.deletedFiles > 0) parts.add("${r.deletedFiles} deleted")
         val total = r.newFiles + r.modifiedFiles + r.deletedFiles
-        return "Pushed $total file${if (total == 1) "" else "s"} to $repo (${parts.joinToString(", ")}) → commit ${r.commitSha.take(7)} on ${r.branch}"
+        val names = if (r.paths.isNotEmpty() && r.paths.size <= 8) "\n" + r.paths.joinToString("\n") { "  • $it" } else ""
+        return "Pushed $total file${if (total == 1) "" else "s"} to $repo (${parts.joinToString(", ")}) → commit ${r.commitSha.take(7)} on ${r.branch}$names"
     }
 
     /**
@@ -162,7 +163,8 @@ class GitHubManager(
         deleteExtra: Boolean,
         message: String,
         explicitDeletes: Set<String> = emptySet(),
-        requireOverlap: Boolean = false
+        requireOverlap: Boolean = false,
+        onlyPaths: Set<String>? = null
     ): PushResult {
         val tok = settings.githubToken
         if (tok.isBlank()) throw IllegalStateException("Connect GitHub first (Settings → GitHub).")
@@ -178,6 +180,7 @@ class GitHubManager(
                 explicitDeletes = explicitDeletes,
                 commitMessage = message,
                 requireOverlap = requireOverlap,
+                onlyPaths = onlyPaths,
                 onProgress = { log.info(it) }
             )
             if (result.noChanges) {
