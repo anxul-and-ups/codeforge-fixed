@@ -18,11 +18,32 @@ android {
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
 
+  // Stable signing key (decoded from codeforge_keystore.b64 by the GitHub workflow), so every build
+  // has the same signature and can be installed OVER the old app without losing chats.
+  val releaseKeystore = rootProject.file("codeforge.keystore")
+  signingConfigs {
+    if (releaseKeystore.exists()) {
+      create("codeforgeRelease") {
+        storeFile = releaseKeystore
+        storePassword = "codeforge"
+        keyAlias = "codeforge"
+        keyPassword = "codeforge"
+      }
+    }
+  }
+
   buildTypes {
     release {
       isCrunchPngs = false
-      isMinifyEnabled = false
+      // R8 optimisation + resource shrinking makes the app much faster than a debug build.
+      isMinifyEnabled = true
+      isShrinkResources = true
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+      signingConfig = if (releaseKeystore.exists()) {
+        signingConfigs.getByName("codeforgeRelease")
+      } else {
+        signingConfigs.getByName("debug")
+      }
     }
   }
   compileOptions {
@@ -65,6 +86,8 @@ dependencies {
   implementation(libs.androidx.room.ktx)
   implementation(libs.androidx.room.runtime)
   implementation(libs.coil.compose)
+  // Installs the Compose baseline profile on first start (faster startup and scrolling)
+  implementation("androidx.profileinstaller:profileinstaller:1.4.1")
   // Uncomment to use Firestore:
   // implementation(libs.firebase.firestore)
 

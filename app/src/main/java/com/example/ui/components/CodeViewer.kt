@@ -10,7 +10,11 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.layout.Box
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.produceState
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
@@ -322,10 +326,14 @@ fun CodeViewer(
 ) {
     val lang = remember(path) { SyntaxHighlighter.languageOf(path) }
     val dark = AppColors.isDark
-    val lines = remember(content, lang, dark) { SyntaxHighlighter.highlight(content, lang) }
     val textColor = AppColors.textPrimary
+    // Show plain text immediately; colours are computed in the background so big files never freeze the screen.
+    val plain = remember(content) { content.split("\n").map { AnnotatedString(it.trimEnd('\r')) } }
+    val lines by produceState(initialValue = plain, content, lang, dark) {
+        value = withContext(Dispatchers.Default) { SyntaxHighlighter.highlight(content, lang) }
+    }
 
-    SelectionContainer(modifier = modifier.fillMaxSize().background(AppColors.codeBg)) {
+    Box(modifier = modifier.fillMaxSize().background(AppColors.codeBg)) {
         LazyColumn(modifier = Modifier.fillMaxSize()) {
             itemsIndexed(lines) { index, line ->
                 Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp)) {

@@ -9,7 +9,7 @@ on:
 
 jobs:
   build:
-    name: Build Debug APK
+    name: Build APK (release)
     runs-on: ubuntu-latest
 
     steps:
@@ -26,20 +26,26 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew || true
 
+      - name: Restore signing key (same signature every build)
+        run: |
+          if [ -f codeforge_keystore.b64 ]; then
+            base64 -d codeforge_keystore.b64 > codeforge.keystore
+          fi
+
       - name: Create local.properties
         run: echo "sdk.dir=$ANDROID_HOME" > local.properties
 
       - name: Build with Gradle
         run: |
           if [ -f "./gradlew" ]; then
-            ./gradlew assembleDebug --stacktrace
+            ./gradlew assembleRelease --stacktrace
           else
-            gradle assembleDebug --stacktrace
+            gradle assembleRelease --stacktrace
           fi
 
       - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: codeforge-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
+          name: codeforge-apk
+          path: app/build/outputs/apk/release/*.apk
           retention-days: 14

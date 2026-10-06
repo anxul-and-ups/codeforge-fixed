@@ -554,7 +554,7 @@ class ProjectRepository(
         for ((path, f) in cur) {
             val sf = snap[path]
             val differs = sf == null || sf.length() != f.length() ||
-                (f.length() < 3_000_000L && !f.readBytes().contentEquals(sf.readBytes()))
+                (f.length() < 400_000L && !f.readBytes().contentEquals(sf.readBytes()))
             if (differs) changed.add(path.replace(File.separatorChar, '/'))
         }
         changed

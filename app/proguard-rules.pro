@@ -19,3 +19,18 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+
+# ---- CodeForge ----
+# Keep names readable so crash reports can be understood (R8 still shrinks and optimises).
+-dontobfuscate
+-keepattributes SourceFile,LineNumberTable,*Annotation*,Signature,InnerClasses,EnclosingMethod
+
+# OkHttp / optional TLS providers
+-dontwarn org.conscrypt.**
+-dontwarn org.bouncycastle.**
+-dontwarn org.openjsse.**
+-dontwarn okhttp3.internal.platform.**
+
+# Room entities / enums are used by generated code and valueOf()
+-keep class com.example.data.local.entity.** { *; }
+-keepclassmembers enum * { public static **[] values(); public static ** valueOf(java.lang.String); }
