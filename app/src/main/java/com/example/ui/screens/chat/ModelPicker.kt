@@ -1,7 +1,6 @@
 package com.example.ui.screens.chat
 
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -16,10 +15,16 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Icon
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
@@ -48,17 +53,8 @@ private fun isLocalUrl(url: String): Boolean {
     return u.contains("localhost") || u.contains("127.0.0.1") || u.contains("10.0.2.2")
 }
 
-/** A provider is usable when it is switched on and has an API key (or points to a local server). */
 fun isProviderReady(p: ProviderConfigEntity): Boolean =
     p.isEnabled && (p.encryptedApiKey.isNotEmpty() || isLocalUrl(p.baseUrl))
-
-private sealed class PickerRow {
-    data class Header(val provider: ProviderConfigEntity) : PickerRow()
-    data class Model(val provider: ProviderConfigEntity, val model: String, val selected: Boolean) : PickerRow()
-    object SetupTitle : PickerRow()
-    data class Setup(val provider: ProviderConfigEntity) : PickerRow()
-    object AddCustom : PickerRow()
-}
 
 @Composable
 fun ModelPickerDialog(
@@ -69,21 +65,12 @@ fun ModelPickerDialog(
     onAddProvider: () -> Unit,
     onDismiss: () -> Unit
 ) {
-    val ready = providers.filter { isProviderReady(it) }
-    val notReady = providers.filter { !isProviderReady(it) }
-
-    val rows = ArrayList<PickerRow>()
-    for (p in ready) {
-        rows.add(PickerRow.Header(p))
-        for (m in providerModels(p)) {
-            rows.add(PickerRow.Model(p, m, p.id == activeProviderId && m == p.selectedModel))
-        }
+    var query by remember { mutableStateOf("") }
+    val activeProvider = providers.firstOrNull { it.id == activeProviderId }
+    val models = activeProvider?.let { providerModels(it) } ?: emptyList()
+    val filteredModels = models.filter { model ->
+        query.isBlank() || model.contains(query.trim(), ignoreCase = true)
     }
-    if (notReady.isNotEmpty()) {
-        rows.add(PickerRow.SetupTitle)
-        for (p in notReady) rows.add(PickerRow.Setup(p))
-    }
-    rows.add(PickerRow.AddCustom)
 
     Dialog(onDismissRequest = onDismiss) {
         Surface(
@@ -100,47 +87,90 @@ fun ModelPickerDialog(
                     modifier = Modifier.padding(horizontal = 20.dp)
                 )
                 Text(
-                    text = if (ready.isEmpty()) "Add an API key to start chatting." else "Other providers stay as backup if this one hits a limit.",
+                    text = activeProvider?.name ?: "No provider selected",
                     fontSize = 12.sp,
                     color = AppColors.textSecondary,
                     modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 2.dp, bottom = 8.dp)
                 )
+                if (activeProvider != null) {
+                    OutlinedTextField(
+                        value = query,
+                        onValueChange = { query = it },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 20.dp, vertical = 4.dp),
+                        singleLine = true,
+                        placeholder = { Text("Search models") },
+                        leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) }
+                    )
+                }
                 LazyColumn(modifier = Modifier.heightIn(max = 460.dp)) {
-                    items(rows) { row ->
-                        when (row) {
-                            is PickerRow.Header -> Row(
+                    if (activeProvider == null) {
+                        item {
+                            Text(
+                                text = "Select a provider first.",
+                                fontSize = 13.sp,
+                                color = AppColors.textSecondary,
+                                modifier = Modifier.padding(horizontal = 20.dp, vertical = 16.dp)
+                            )
+                        }
+                    } else if (!isProviderReady(activeProvider)) {
+                        item {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { onSetupProvider(activeProvider.id) }
+                                    .padding(horizontal = 20.dp, vertical = 12.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                ProviderIcon(activeProvider.id, null, size = 18.dp, providerName = activeProvider.name)
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Text(
+                                    text = "Set up ${activeProvider.name}",
+                                    fontSize = 14.sp,
+                                    color = AppColors.textPrimary,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                Text("Set up", fontSize = 12.sp, color = AppColors.accent)
+                            }
+                        }
+                    } else {
+                        item {
+                            Row(
                                 modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 12.dp, bottom = 4.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                ProviderIcon(row.provider.id, null, size = 16.dp, providerName = row.provider.name)
+                                ProviderIcon(activeProvider.id, null, size = 16.dp, providerName = activeProvider.name)
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Text(
-                                    text = row.provider.name,
+                                    text = activeProvider.name,
                                     fontSize = 12.sp,
                                     fontWeight = FontWeight.SemiBold,
                                     color = AppColors.textMuted
                                 )
                             }
-                            is PickerRow.Model -> Row(
+                        }
+                        items(filteredModels) { model ->
+                            Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .clickable { onSelect(row.provider.id, row.model) }
+                                    .clickable { onSelect(activeProvider.id, model) }
                                     .padding(horizontal = 20.dp, vertical = 11.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                ProviderIcon(row.provider.id, row.model, size = 18.dp, providerName = row.provider.name)
+                                ProviderIcon(activeProvider.id, model, size = 18.dp, providerName = activeProvider.name)
                                 Spacer(modifier = Modifier.width(10.dp))
                                 Text(
-                                    text = row.model,
+                                    text = model,
                                     fontSize = 13.sp,
                                     fontFamily = FontFamily.Monospace,
-                                    color = if (row.selected) AppColors.accent else AppColors.textPrimary,
-                                    fontWeight = if (row.selected) FontWeight.SemiBold else FontWeight.Normal,
+                                    color = if (model == activeProvider.selectedModel) AppColors.accent else AppColors.textPrimary,
+                                    fontWeight = if (model == activeProvider.selectedModel) FontWeight.SemiBold else FontWeight.Normal,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis,
                                     modifier = Modifier.weight(1f)
                                 )
-                                if (row.selected) {
+                                if (model == activeProvider.selectedModel) {
                                     Icon(
                                         Icons.Default.Check,
                                         contentDescription = "Selected",
@@ -149,41 +179,19 @@ fun ModelPickerDialog(
                                     )
                                 }
                             }
-                            is PickerRow.SetupTitle -> Text(
-                                text = "ADD AN API KEY",
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = AppColors.textMuted,
-                                modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 16.dp, bottom = 4.dp)
-                            )
-                            is PickerRow.Setup -> Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable { onSetupProvider(row.provider.id) }
-                                    .padding(horizontal = 20.dp, vertical = 11.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                ProviderIcon(row.provider.id, null, size = 18.dp, providerName = row.provider.name)
-                                Spacer(modifier = Modifier.width(10.dp))
-                                Text(
-                                    text = row.provider.name,
-                                    fontSize = 14.sp,
-                                    color = AppColors.textPrimary,
-                                    modifier = Modifier.weight(1f)
-                                )
-                                Text("Set up", fontSize = 12.sp, color = AppColors.accent)
-                            }
-                            is PickerRow.AddCustom -> Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable { onAddProvider() }
-                                    .padding(horizontal = 20.dp, vertical = 13.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(Icons.Default.Add, contentDescription = null, tint = AppColors.accent, modifier = Modifier.size(18.dp))
-                                Spacer(modifier = Modifier.width(10.dp))
-                                Text("Add provider", fontSize = 14.sp, color = AppColors.accent, fontWeight = FontWeight.SemiBold)
-                            }
+                        }
+                    }
+                    item {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onAddProvider() }
+                                .padding(horizontal = 20.dp, vertical = 13.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Default.Add, contentDescription = null, tint = AppColors.accent, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Text("Add provider", fontSize = 14.sp, color = AppColors.accent, fontWeight = FontWeight.SemiBold)
                         }
                     }
                 }
