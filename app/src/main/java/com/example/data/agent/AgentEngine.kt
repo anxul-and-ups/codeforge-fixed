@@ -594,9 +594,9 @@ RULES
         var hitStepLimit = false
         val touchedAll = LinkedHashSet<String>()
         val removedAll = LinkedHashSet<String>()
+        var step = 0
 
         try {
-            var step = 0
             saveResumeCheckpoint(req, prompt, resumeContextBuilder.toString(), 0)
             while (true) {
                 step++
