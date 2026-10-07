@@ -162,6 +162,18 @@ class SettingsStore(context: Context) {
         get() = prefs.getString("active_conversation_id", null)
         set(value) { prefs.edit().putString("active_conversation_id", value).apply() }
 
+    /** Small persistent checkpoint used to resume an interrupted agent run. */
+    var pendingAgentRun: String?
+        get() = prefs.getString("pending_agent_run", null)
+        set(value) {
+            prefs.edit().apply {
+                if (value == null) remove("pending_agent_run") else putString("pending_agent_run", value)
+            }.apply()
+        }
+
+    val hasPendingAgentRun: Boolean
+        get() = !pendingAgentRun.isNullOrBlank()
+
     val githubConfigured: Boolean
         get() = githubToken.isNotBlank()
 

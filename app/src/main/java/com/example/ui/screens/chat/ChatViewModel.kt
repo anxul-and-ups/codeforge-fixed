@@ -53,7 +53,8 @@ data class ChatUiState(
     val failoverNotice: String? = null,
     val pendingAttachments: List<AttachmentItem> = emptyList(),
     val warningSecretFile: String? = null,
-    val approval: ApprovalRequest? = null
+    val approval: ApprovalRequest? = null,
+    val resumeAvailable: Boolean = false
 )
 
 data class AttachmentItem(
@@ -82,7 +83,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val reasoningBuf = StringBuilder()
     private var flushJob: Job? = null
 
-    private val _uiState = MutableStateFlow(ChatUiState())
+    private val _uiState = MutableStateFlow(ChatUiState(resumeAvailable = settings.hasPendingAgentRun))
     val uiState: StateFlow<ChatUiState> = _uiState.asStateFlow()
 
     /** Only changes when the project changes (not for every streamed token). */
@@ -177,14 +178,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     is AgentEvent.Finished -> {
                         streamBuf.setLength(0)
                         reasoningBuf.setLength(0)
-                        _uiState.update { it.copy(streamingContent = "", streamingReasoning = "") }
+                        _uiState.update { it.copy(streamingContent = "", streamingReasoning = "", resumeAvailable = settings.hasPendingAgentRun) }
                         refreshTick.update { it + 1 }
                     }
                     is AgentEvent.Error -> {
                         streamBuf.setLength(0)
                         reasoningBuf.setLength(0)
                         _uiState.update {
-                            it.copy(streamingContent = "", streamingReasoning = "", failoverNotice = "⚠️ ${event.error.take(200)}")
+                            it.copy(streamingContent = "", streamingReasoning = "", failoverNotice = "⚠️ ${event.error.take(200)}", resumeAvailable = settings.hasPendingAgentRun)
                         }
                         refreshTick.update { it + 1 }
                     }
@@ -610,6 +611,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // ---------------------------------------------------------------------------------------
 
     fun sendMessage(promptText: String) {
+        val resumeWords = promptText.trim().lowercase()
+        val wantsResume = resumeWords == "continue" || resumeWords == "resume" ||
+            resumeWords == "continue karo" || resumeWords == "resume karo" ||
+            resumeWords.contains("wahi se continue") || resumeWords.contains("jahan ruka tha")
+        if (wantsResume && settings.hasPendingAgentRun) {
+            if (agentEngine.resumePending()) {
+                _uiState.update { it.copy(resumeAvailable = false, failoverNotice = null, currentAgentStatus = "Resuming…") }
+            } else {
+                _uiState.update { it.copy(resumeAvailable = false, failoverNotice = "No resumable work is available.") }
+            }
+            return
+        }
         val proj = _uiState.value.activeProject ?: return
         val conv = _uiState.value.activeConversation ?: return
         val attachments = _uiState.value.pendingAttachments
@@ -669,6 +682,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
             chatRepo.addUserMessage(conv.id, display)
             agentEngine.start(RunRequest(projectId, conv.id, prompt, images, docs))
+            _uiState.update { it.copy(resumeAvailable = false) }
         }
     }
 

@@ -63,7 +63,9 @@ data class RunRequest(
     /** If true: skip the AI step and only push the project to GitHub, wait for the build and auto-fix. */
     val pushOnly: Boolean = false,
     /** A push that was already done (manually); only watch its build and fix errors if it fails. */
-    val watchPush: PushResult? = null
+    val watchPush: PushResult? = null,
+    /** Continue a previously interrupted run from its persisted checkpoint. */
+    val resume: Boolean = false
 )
 
 data class ApprovalRequest(
@@ -118,9 +120,11 @@ class AgentEngine(
 
     private var pendingDecision: CompletableDeferred<Boolean>? = null
     private var job: Job? = null
+    private var userStopRequested = false
 
     fun start(request: RunRequest) {
         if (_isRunning.value) return
+        userStopRequested = false
         _isRunning.value = true
         _runningConversationId.value = request.conversationId
         AgentForegroundService.startService(appContext, "Agent is working…")
@@ -143,7 +147,25 @@ class AgentEngine(
         }
     }
 
+    fun resumePending(): Boolean {
+        if (_isRunning.value) return false
+        val raw = settings.pendingAgentRun ?: return false
+        return try {
+            val o = JSONObject(raw)
+            val projectId = o.optString("projectId").takeIf { it.isNotBlank() } ?: return false
+            val conversationId = o.optString("conversationId").takeIf { it.isNotBlank() } ?: return false
+            val prompt = o.optString("prompt").takeIf { it.isNotBlank() } ?: return false
+            start(RunRequest(projectId, conversationId, prompt, resume = true))
+            true
+        } catch (_: Exception) {
+            settings.pendingAgentRun = null
+            false
+        }
+    }
+
     fun stop() {
+        userStopRequested = true
+        settings.pendingAgentRun = null
         job?.cancel()
     }
 
@@ -172,7 +194,8 @@ class AgentEngine(
             return
         }
         if (!req.pushOnly) {
-            val result = runAgentLoop(req, req.userPrompt, req.imagesBase64, req.docs)
+            val resumeContext = if (req.resume) loadResumeContext() else null
+            val result = runAgentLoop(req, req.userPrompt, req.imagesBase64, req.docs, resumeContext)
             changed = result.changed
             summary = result.summary
             touched = result.touched
@@ -476,11 +499,42 @@ RULES
         return sb.toString()
     }
 
+    private fun saveResumeCheckpoint(
+        req: RunRequest,
+        prompt: String,
+        context: String,
+        step: Int,
+        partial: String = ""
+    ) {
+        val o = JSONObject()
+            .put("projectId", req.projectId)
+            .put("conversationId", req.conversationId)
+            .put("prompt", prompt.take(20_000))
+            .put("context", context.take(12_000))
+            .put("step", step)
+            .put("partial", partial.take(4_000))
+        settings.pendingAgentRun = o.toString()
+    }
+
+    private fun loadResumeContext(): String? {
+        val raw = settings.pendingAgentRun ?: return null
+        return try {
+            JSONObject(raw).optString("context").takeIf { it.isNotBlank() }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun clearResumeCheckpoint() {
+        settings.pendingAgentRun = null
+    }
+
     private suspend fun runAgentLoop(
         req: RunRequest,
         prompt: String,
         images: List<String>,
-        docs: List<LlmDocument> = emptyList()
+        docs: List<LlmDocument> = emptyList(),
+        resumeContext: String? = null
     ): LoopResult {
         val project = projectRepository.getProject(req.projectId)
         if (project == null) {
@@ -511,8 +565,19 @@ RULES
 
         val systemPrompt = buildSystemPrompt(project.name, project.systemPrompt)
         val messages = ArrayList<LlmMessage>(history)
-        messages.add(LlmMessage(role = "user", content = prompt, imagesBase64 = images, docs = docs))
+        val resumeInstruction = resumeContext?.let {
+            "Continue the interrupted task from the persisted checkpoint below. Do not restart completed work. Verify the current project state and continue from the next required action.\n\nCheckpoint:\n$it"
+        }
+        messages.add(
+            LlmMessage(
+                role = "user",
+                content = if (resumeInstruction != null) resumeInstruction else prompt,
+                imagesBase64 = if (resumeInstruction != null) emptyList() else images,
+                docs = if (resumeInstruction != null) emptyList() else docs
+            )
+        )
 
+        val resumeContextBuilder = StringBuilder(resumeContext ?: "Original task: ${prompt.take(1500)}")
         val maxSteps = settings.maxSteps
         val fullText = StringBuilder()
         val reasoningAll = StringBuilder()
@@ -532,8 +597,10 @@ RULES
 
         try {
             var step = 0
+            saveResumeCheckpoint(req, prompt, resumeContextBuilder.toString(), 0)
             while (true) {
                 step++
+                saveResumeCheckpoint(req, prompt, resumeContextBuilder.toString(), step, fullText.toString())
                 if (step > maxSteps) {
                     hitStepLimit = true
                     break
@@ -680,6 +747,10 @@ RULES
                         )
                     )
                     _agentEvents.tryEmit(AgentEvent.ToolFinished(toolIndex, call.name, result.text.take(500), result.isError))
+                    resumeContextBuilder.append("\nStep ").append(toolIndex).append(": ").append(call.name)
+                        .append("\nArguments: ").append(call.argumentsJson.take(1200))
+                        .append("\nResult: ").append(result.text.take(2500))
+                    saveResumeCheckpoint(req, prompt, resumeContextBuilder.toString(), step, fullText.toString())
                     messages.add(
                         LlmMessage(
                             role = "tool",
@@ -693,6 +764,8 @@ RULES
             }
         } catch (e: CancellationException) {
             withContext(NonCancellable) {
+                if (userStopRequested) clearResumeCheckpoint()
+                else saveResumeCheckpoint(req, prompt, resumeContextBuilder.toString(), step, fullText.toString())
                 finalizeMessage(
                     assistantId, req.conversationId,
                     (fullText.toString() + "\n\n⏹ Stopped by user.").trim(),
@@ -703,6 +776,7 @@ RULES
             throw e
         } catch (e: Exception) {
             val msg = e.message ?: e.javaClass.simpleName
+            saveResumeCheckpoint(req, prompt, resumeContextBuilder.toString(), step, fullText.toString())
             finalizeMessage(
                 assistantId, req.conversationId,
                 (fullText.toString() + "\n\n⚠️ $msg").trim(),
@@ -728,6 +802,11 @@ RULES
             reasoningAll.toString(), if (errorText != null) "ERROR" else "SUCCESS",
             providerName, modelName, totalPrompt, totalCompletion, totalCached
         )
+        if (errorText == null && !hitStepLimit) {
+            clearResumeCheckpoint()
+        } else if (errorText != null || hitStepLimit) {
+            saveResumeCheckpoint(req, prompt, resumeContextBuilder.toString(), step, fullText.toString())
+        }
         _agentEvents.tryEmit(AgentEvent.Finished(fs ?: fullText.toString().take(200), toolIndex))
         // a file edited and later deleted/moved in the same run is not "touched" any more
         touchedAll.removeAll(removedAll)
