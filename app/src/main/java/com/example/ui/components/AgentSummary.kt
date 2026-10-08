@@ -23,7 +23,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -247,11 +246,7 @@ fun AgentSummaryBar(
             .padding(vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        if (running) {
-            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = AppColors.accent)
-        } else {
-            Icon(Icons.Default.History, contentDescription = null, tint = AppColors.textMuted, modifier = Modifier.size(18.dp))
-        }
+        CodingSummaryBadge(running = running)
         Spacer(modifier = Modifier.width(10.dp))
         Text(
             text = latest,
@@ -282,6 +277,38 @@ fun AgentSummaryBar(
         ) {
             SummarySheetContent(title = title, steps = sorted, running = running, onClose = { open = false })
         }
+    }
+}
+
+private fun compactActionSummary(steps: List<ToolStepEntity>): String {
+    val reads = steps.count { it.toolName == "read_file" }
+    val searches = steps.count { it.toolName == "search_code" }
+    val lists = steps.count { it.toolName == "list_files" }
+    val edits = steps.count { it.toolName == "edit_file" || it.toolName == "write_file" || it.toolName == "delete_file" || it.toolName == "move_file" }
+    val parts = ArrayList<String>(4)
+    if (lists > 0) parts.add("${lists} file listing" + if (lists == 1) "" else "s")
+    if (reads > 0) parts.add("${reads} file read" + if (reads == 1) "" else "s")
+    if (searches > 0) parts.add("${searches} search" + if (searches == 1) "" else "es")
+    if (edits > 0) parts.add("${edits} change" + if (edits == 1) "" else "s")
+    return if (parts.isEmpty()) "${steps.size} agent action" + if (steps.size == 1) "" else "s" else parts.joinToString(" · ")
+}
+
+@Composable
+private fun CodingSummaryBadge(running: Boolean) {
+    Box(
+        modifier = Modifier
+            .size(34.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .border(1.dp, AppColors.border, RoundedCornerShape(8.dp)),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = ">_",
+            fontSize = 13.sp,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Bold,
+            color = if (running) AppColors.textPrimary else AppColors.textSecondary
+        )
     }
 }
 
@@ -379,8 +406,13 @@ private fun SummarySheetContent(
                                 color = AppColors.textSecondary
                             )
                             if (lastSentence && ph.tools.isNotEmpty()) {
-                                Spacer(modifier = Modifier.height(8.dp))
-                                ToolLines(ph.tools)
+                                Spacer(modifier = Modifier.height(5.dp))
+                                Text(
+                                    text = compactActionSummary(ph.tools),
+                                    fontSize = 12.sp,
+                                    lineHeight = 17.sp,
+                                    color = AppColors.textMuted
+                                )
                             }
                         }
                     }
