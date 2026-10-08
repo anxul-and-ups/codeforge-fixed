@@ -95,6 +95,7 @@ fun ChatScreen(
     val toolStepsMap by viewModel.toolStepsMap.collectAsState()
     val providers by viewModel.providers.collectAsState()
     val preferredId by viewModel.preferredProviderId.collectAsState()
+    LaunchedEffect(providers) { viewModel.syncPreferredProvider() }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val drawerState = rememberDrawerState(DrawerValue.Closed)
@@ -294,7 +295,14 @@ fun ChatScreen(
                 }
 
                 if (uiState.isAgentRunning && streamingMessageId == null) {
-                    item { StatusLine(uiState.currentAgentStatus.ifBlank { "Starting…" }) }
+                    item {
+                        AgentSummaryBar(
+                            steps = emptyList(),
+                            running = true,
+                            liveStatus = uiState.currentAgentStatus.ifBlank { "Starting…" },
+                            fallbackTitle = uiState.activeConversation?.title?.takeIf { it != "New Chat" } ?: "Working on your request"
+                        )
+                    }
                 }
 
                 item { Spacer(modifier = Modifier.height(4.dp)) }
@@ -556,8 +564,13 @@ private fun ChatMessage(
             .testTag("assistant_message_bubble"),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        if (toolSteps.isNotEmpty()) {
-            AgentSummaryBar(steps = toolSteps, running = live, fallbackTitle = fallbackTitle)
+        if (live || toolSteps.isNotEmpty()) {
+            AgentSummaryBar(
+                steps = toolSteps,
+                running = live,
+                liveStatus = liveStatus,
+                fallbackTitle = fallbackTitle
+            )
         }
 
         val reasoning = if (live && liveReasoning.isNotBlank()) liveReasoning else message.reasoning
@@ -571,9 +584,6 @@ private fun ChatMessage(
             MarkdownContentView(content = text, textColor = AppColors.textPrimary)
         }
 
-        if (live && toolSteps.isEmpty()) {
-            StatusLine(liveStatus.ifBlank { "Working…" })
-        }
 
         if (!live) {
             val model = message.modelUsed

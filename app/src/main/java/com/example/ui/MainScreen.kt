@@ -204,6 +204,7 @@ fun MainScreen(
                 Screen.Providers -> {
                     ProvidersScreen(
                         providerRepository = app.providerRepository,
+                        settingsStore = app.settingsStore,
                         startWithAdd = providersStartAdd,
                         startEditId = providersStartEditId,
                         onFinished = {

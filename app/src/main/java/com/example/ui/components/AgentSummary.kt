@@ -213,10 +213,11 @@ fun describeStepSentence(step: ToolStepEntity): String {
 fun AgentSummaryBar(
     steps: List<ToolStepEntity>,
     running: Boolean,
+    liveStatus: String = "",
     fallbackTitle: String,
     modifier: Modifier = Modifier
 ) {
-    if (steps.isEmpty()) return
+    if (steps.isEmpty() && !running) return
     var open by remember { mutableStateOf(false) }
 
     val sorted = remember(steps) { steps.sortedBy { it.stepIndex } }
@@ -224,6 +225,7 @@ fun AgentSummaryBar(
     val tools = remember(sorted) { sorted.filter { it.toolName != "note" && it.toolName != "finish" } }
     val title = remember(sorted) { overallTitle(sorted, buildPhases(sorted)) }
     val latest: String = when {
+        running && liveStatus.isNotBlank() -> liveStatus
         running -> {
             val lastTool = tools.lastOrNull()
             val lastNote = notes.lastOrNull { noteText(it).isNotBlank() }

@@ -488,7 +488,13 @@ RULES
 - Paths are relative to the project root. Do not touch build output folders.
 - Never read or print secrets (.env, keystores, google-services.json). Those tools will refuse.
 - Earlier chat turns only contain text summaries, not file contents; files may have changed since. Re-read before editing.
-- If a tool returns an error, read the message, adjust, and retry differently. Do not repeat the same failing call.
+- Stay tightly scoped to the user's exact request. Do not inspect unrelated screens, folders, or files unless a dependency is proven relevant.
+- Search for the exact symbol or task-specific keyword first. Then read only the relevant file/range and its direct dependencies. Avoid broad repository scans.
+- Prefer narrow read_file ranges after search results. If a file is large, use start_line/end_line around the relevant code instead of rereading the whole file.
+- After an edit, re-read the changed area and verify important references/imports before doing anything else.
+- If a tool returns an error, understand the error and change strategy. Never blindly repeat the same failing or redundant action.
+- Never perform the same exact search/read/edit action more than twice consecutively. On a third identical attempt, stop repeating it and choose a different strategy or finish with the blocker.
+- When the requested change is verified and no relevant work remains, call finish immediately. Do not keep exploring for unrelated improvements.
             """.trimIndent()
         )
         val global = settings.globalSystemPrompt.trim()
@@ -563,7 +569,9 @@ RULES
             // continue without checkpoint
         }
 
-        val systemPrompt = buildSystemPrompt(project.name, project.systemPrompt)
+        val systemPrompt = buildSystemPrompt(project.name, project.systemPrompt) +
+            "\n\nCURRENT TASK SCOPE (stay inside this scope unless a direct dependency requires otherwise):\n" +
+            prompt.take(8_000)
         val messages = ArrayList<LlmMessage>(history)
         val resumeInstruction = resumeContext?.let {
             "Continue the interrupted task from the persisted checkpoint below. Do not restart completed work. Verify the current project state and continue from the next required action.\n\nCheckpoint:\n$it"
@@ -594,6 +602,8 @@ RULES
         var hitStepLimit = false
         val touchedAll = LinkedHashSet<String>()
         val removedAll = LinkedHashSet<String>()
+        var lastActionFingerprint: String? = null
+        var consecutiveActionRepeats = 0
 
         var step = 0
         try {
@@ -725,11 +735,23 @@ RULES
                         )
                     )
                     val t0 = System.currentTimeMillis()
+                    val actionFingerprint = toolFingerprint(call)
+                    if (actionFingerprint == lastActionFingerprint) {
+                        consecutiveActionRepeats++
+                    } else {
+                        lastActionFingerprint = actionFingerprint
+                        consecutiveActionRepeats = 1
+                    }
                     val result = if (call.name == "finish") {
                         val s = try { JSONObject(call.argumentsJson).optString("summary") } catch (e: Exception) { "" }
                         finishSummary = s
                         finished = true
                         ToolResult("Done.")
+                    } else if (consecutiveActionRepeats > 2) {
+                        ToolResult(
+                            "Blocked a third identical consecutive ${call.name} action. Change strategy: use a different query/range/file or finish if the task is already verified.",
+                            isError = true
+                        )
                     } else {
                         executeTool(req.projectId, call)
                     }
@@ -831,6 +853,16 @@ RULES
             )
         )
         touchConversation(conversationId)
+    }
+
+    /** Stable fingerprint used only to stop accidental consecutive tool loops.
+     *  Exact repeats are allowed twice; a third identical action must change strategy.
+     */
+    private fun toolFingerprint(call: LlmToolCall): String {
+        val normalizedArgs = call.argumentsJson
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        return call.name + "|" + normalizedArgs
     }
 
     private fun describeCall(call: LlmToolCall): String {

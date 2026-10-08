@@ -111,6 +111,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val _preferredProviderId = MutableStateFlow(settings.preferredProviderId)
     val preferredProviderId: StateFlow<String?> = _preferredProviderId.asStateFlow()
 
+    fun syncPreferredProvider() {
+        val current = settings.preferredProviderId
+        if (_preferredProviderId.value != current) {
+            _preferredProviderId.value = current
+        }
+    }
+
     val messages: StateFlow<List<MessageEntity>> = activeConversationId
         .flatMapLatest { id -> if (id == null) flowOf(emptyList()) else chatRepo.getMessages(id) }
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())

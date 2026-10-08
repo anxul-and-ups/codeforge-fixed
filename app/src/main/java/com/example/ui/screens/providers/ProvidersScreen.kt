@@ -63,6 +63,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.example.data.local.entity.ProviderConfigEntity
 import com.example.data.repository.ProviderRepository
+import com.example.data.settings.SettingsStore
 import com.example.data.security.KeyStoreManager
 import com.example.ui.components.ProviderIcon
 import com.example.ui.screens.chat.isProviderReady
@@ -77,6 +78,7 @@ private val PRESET_IDS = setOf("anthropic", "openai", "gemini", "deepseek", "kim
 @Composable
 fun ProvidersScreen(
     providerRepository: ProviderRepository,
+    settingsStore: SettingsStore,
     modifier: Modifier = Modifier,
     startWithAdd: Boolean = false,
     startEditId: String? = null,
@@ -133,7 +135,10 @@ fun ProvidersScreen(
                     provider = provider,
                     canMoveUp = index > 0,
                     canMoveDown = index < providers.size - 1,
-                    onClick = { editingId = provider.id },
+                    onClick = {
+                    settingsStore.preferredProviderId = provider.id
+                    editingId = provider.id
+                },
                     onMoveUp = {
                         val ids = providers.map { it.id }.toMutableList()
                         val item = ids.removeAt(index)
@@ -156,6 +161,7 @@ fun ProvidersScreen(
         ProviderEditor(
             provider = editing,
             repo = providerRepository,
+            settingsStore = settingsStore,
             onDismiss = {
                 editingId = null
                 onFinished?.invoke()
@@ -351,6 +357,7 @@ private fun SectionLabel(text: String) {
 private fun ProviderEditor(
     provider: ProviderConfigEntity,
     repo: ProviderRepository,
+    settingsStore: SettingsStore,
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current

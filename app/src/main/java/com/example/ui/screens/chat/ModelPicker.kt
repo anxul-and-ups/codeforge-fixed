@@ -53,6 +53,11 @@ private fun isLocalUrl(url: String): Boolean {
     return u.contains("localhost") || u.contains("127.0.0.1") || u.contains("10.0.2.2")
 }
 
+private fun modelAccessLabel(provider: ProviderConfigEntity, model: String): String {
+    if (isLocalUrl(provider.baseUrl)) return "Free"
+    return "Paid"
+}
+
 fun isProviderReady(p: ProviderConfigEntity): Boolean =
     p.isEnabled && (p.encryptedApiKey.isNotEmpty() || isLocalUrl(p.baseUrl))
 
@@ -160,16 +165,22 @@ fun ModelPickerDialog(
                             ) {
                                 ProviderIcon(activeProvider.id, model, size = 18.dp, providerName = activeProvider.name)
                                 Spacer(modifier = Modifier.width(10.dp))
-                                Text(
-                                    text = model,
-                                    fontSize = 13.sp,
-                                    fontFamily = FontFamily.Monospace,
-                                    color = if (model == activeProvider.selectedModel) AppColors.accent else AppColors.textPrimary,
-                                    fontWeight = if (model == activeProvider.selectedModel) FontWeight.SemiBold else FontWeight.Normal,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    modifier = Modifier.weight(1f)
-                                )
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = model,
+                                        fontSize = 13.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        color = if (model == activeProvider.selectedModel) AppColors.accent else AppColors.textPrimary,
+                                        fontWeight = if (model == activeProvider.selectedModel) FontWeight.SemiBold else FontWeight.Normal,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        text = modelAccessLabel(activeProvider, model),
+                                        fontSize = 10.sp,
+                                        color = AppColors.textMuted
+                                    )
+                                }
                                 if (model == activeProvider.selectedModel) {
                                     Icon(
                                         Icons.Default.Check,
