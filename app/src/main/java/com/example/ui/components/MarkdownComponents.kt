@@ -122,8 +122,9 @@ fun FormattedRichText(
         buildAnnotatedString {
             var i = 0
             val len = text.length
+
             while (i < len) {
-                // Check inline code `...`
+                // Inline code `...`
                 if (text[i] == '`') {
                     val endIdx = text.indexOf('`', i + 1)
                     if (endIdx != -1) {
@@ -142,11 +143,19 @@ fun FormattedRichText(
                     }
                 }
 
-                // Check bold **...**
+                // Bold **...**
                 if (i + 1 < len && text[i] == '*' && text[i + 1] == '*') {
                     val endIdx = text.indexOf("**", i + 2)
                     if (endIdx != -1) {
-                        withStyle(SpanStyle(fontWeight = FontWeight.Bold, color = defaultColor)) {
+                        withStyle(
+                            SpanStyle(
+                                fontWeight = FontWeight.Bold,
+                                color = defaultColor,
+                                fontSize = 14.sp
+                            )
+                        ) {
+                            // Style the complete Unicode range at once. This is important for
+                            // Devanagari and other scripts that use combining marks.
                             append(text.substring(i + 2, endIdx))
                         }
                         i = endIdx + 2
@@ -154,11 +163,23 @@ fun FormattedRichText(
                     }
                 }
 
-                // Regular character
-                withStyle(SpanStyle(color = defaultColor, fontSize = 14.sp)) {
-                    append(text[i].toString())
+                // Append a complete plain-text run instead of styling each UTF-16 code unit.
+                // Splitting combining marks from their base character can make Android render
+                // dotted-circle placeholders (for example in Hindi vowel signs).
+                val nextCodeSpan = sequenceOf(
+                    text.indexOf('`', i),
+                    text.indexOf("**", i)
+                ).filter { it >= 0 }.minOrNull() ?: len
+                val end = if (nextCodeSpan > i) nextCodeSpan else i + 1
+                withStyle(
+                    SpanStyle(
+                        color = defaultColor,
+                        fontSize = 14.sp
+                    )
+                ) {
+                    append(text.substring(i, end))
                 }
-                i++
+                i = end
             }
         }
     }
