@@ -286,6 +286,78 @@ private fun compactActionSummary(steps: List<ToolStepEntity>): String {
 }
 
 @Composable
+private fun CleanActionList(steps: List<ToolStepEntity>) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(AppColors.codeBg)
+            .padding(vertical = 5.dp)
+    ) {
+        for (step in steps) {
+            val a = try { JSONObject(step.argumentsJson) } catch (e: Exception) { JSONObject() }
+            val (verb, target) = when (step.toolName) {
+                "list_files" -> "List" to a.optString("path", ".")
+                "read_file" -> {
+                    val range = if (a.has("start_line")) " :${a.optInt("start_line")}-${a.optInt("end_line", 0)}" else ""
+                    "Read" to (a.optString("path") + range)
+                }
+                "search_code" -> "Search" to a.optString("query").take(80)
+                "edit_file" -> "Edit" to a.optString("path")
+                "write_file" -> "Write" to a.optString("path")
+                "delete_file" -> "Delete" to a.optString("path")
+                "move_file" -> "Move" to (a.optString("from_path") + " → " + a.optString("to_path"))
+                else -> step.toolName to ""
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                when {
+                    step.status == "RUNNING" -> CircularProgressIndicator(
+                        modifier = Modifier.size(13.dp), strokeWidth = 1.6.dp, color = AppColors.accent
+                    )
+                    step.isError -> Icon(
+                        Icons.Default.Close, contentDescription = "Failed",
+                        tint = AppColors.error, modifier = Modifier.size(14.dp)
+                    )
+                    else -> Icon(
+                        Icons.Default.Check, contentDescription = "Done",
+                        tint = AppColors.ok, modifier = Modifier.size(14.dp)
+                    )
+                }
+                Spacer(modifier = Modifier.width(9.dp))
+                Text(
+                    text = verb,
+                    fontSize = 12.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.SemiBold,
+                    color = if (step.isError) AppColors.error else AppColors.accent
+                )
+                Spacer(modifier = Modifier.width(9.dp))
+                Text(
+                    text = target,
+                    fontSize = 12.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = AppColors.textPrimary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+                if (step.durationMs > 0L) {
+                    Spacer(modifier = Modifier.width(7.dp))
+                    Text(
+                        text = "${step.durationMs}ms",
+                        fontSize = 10.sp,
+                        color = AppColors.textMuted
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun CodingSummaryBadge(running: Boolean) {
     Box(
         modifier = Modifier
@@ -398,13 +470,8 @@ private fun SummarySheetContent(
                                 color = AppColors.textSecondary
                             )
                             if (lastSentence && ph.tools.isNotEmpty()) {
-                                Spacer(modifier = Modifier.height(5.dp))
-                                Text(
-                                    text = compactActionSummary(ph.tools),
-                                    fontSize = 12.sp,
-                                    lineHeight = 17.sp,
-                                    color = AppColors.textMuted
-                                )
+                                Spacer(modifier = Modifier.height(7.dp))
+                                CleanActionList(ph.tools)
                             }
                         }
                     }
