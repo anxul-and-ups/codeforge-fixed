@@ -117,7 +117,7 @@ private fun autoSentence(phase: Phase): String {
     }
 }
 
-/** Groups the raw steps into titled phases (model notes are used when present, otherwise generated). */
+/** Groups real tool actions into clean titled phases; no model-generated progress text is persisted. */
 private fun buildPhases(steps: List<ToolStepEntity>): List<Phase> {
     val phases = ArrayList<Phase>()
     var cur: Phase? = null
@@ -126,13 +126,7 @@ private fun buildPhases(steps: List<ToolStepEntity>): List<Phase> {
     var seenChange = false
     for (st in steps) {
         if (st.toolName == "finish") continue
-        if (st.toolName == "note") {
-            val t = noteText(st)
-            if (t.isNotBlank()) pending = if (pending == null) t else pending + " " + t
-            val ti = noteTitle(st)
-            if (ti != null) pendingTitle = ti
-            continue
-        }
+        if (st.toolName == "note") continue
         val isChange = st.toolName == "edit_file" || st.toolName == "write_file" ||
             st.toolName == "delete_file" || st.toolName == "move_file"
         val cat = when {
@@ -182,8 +176,6 @@ private fun buildPhases(steps: List<ToolStepEntity>): List<Phase> {
 
 /** Title for the whole task. */
 private fun overallTitle(steps: List<ToolStepEntity>, phases: List<Phase>): String {
-    val modelTitle = steps.firstNotNullOfOrNull { if (it.toolName == "note") noteTitle(it) else null }
-    if (modelTitle != null) return modelTitle
     val changed = steps.filter { it.toolName == "edit_file" || it.toolName == "write_file" }.map { shortName(stepPath(it)) }
     if (changed.isNotEmpty()) return "Update " + listNames(changed)
     return phases.firstOrNull()?.title ?: "Working on your request"

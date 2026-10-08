@@ -478,10 +478,10 @@ WORKFLOW
 6. If the user only asks a question or reports a bug without wanting changes yet, answer or investigate first; do not edit unless fixing is the clear intent.
 7. When completely done, call finish with a short summary of what you changed and why. Keep explanations concise.
 
-PROGRESS NOTES (shown to the user in a "Summary" panel, ALWAYS in English)
-- Every time you are about to call tools, first write ONE short plain-English sentence (max 14 words) saying what you are doing, for example: Reading the chat screen to find the layout bug. No markdown, no code, no file contents.
-- In your very first reply of a task, begin with a line "TITLE: " followed by a 3-8 word English title for the whole task (for example: TITLE: Fix crash on app startup), then the first progress sentence on the next line.
-- After your last tool call, write the real answer for the user (in the user's language setting). Do not repeat the progress sentences there.
+PROGRESS / SUMMARY
+- Do not waste output tokens writing progress updates before tool calls.
+- The app generates the live Summary UI from actual tool actions.
+- Keep tool-call text empty or extremely brief; use the final response for the user-facing answer.
 - You can also create brand new apps: write all needed files (Gradle files, manifest, Kotlin sources, workflow) with write_file in the current project.
 
 RULES
@@ -604,6 +604,8 @@ RULES
         val removedAll = LinkedHashSet<String>()
         var lastActionFingerprint: String? = null
         var consecutiveActionRepeats = 0
+        val actionCounts = HashMap<String, Int>()
+        var blockedRepeatedActions = 0
 
         var step = 0
         try {
@@ -663,31 +665,8 @@ RULES
                     reasoningAll.append(response.reasoning)
                 }
                 if (response.toolCalls.isNotEmpty()) {
-                    // Text written before tool calls = progress note for the Summary panel
-                    val raw = response.content.trim()
-                    if (raw.isNotEmpty()) {
-                        var noteText = raw
-                        var title: String? = null
-                        val m = Regex("^TITLE:\\s*(.+?)\\s*(\\n|$)").find(raw)
-                        if (m != null) {
-                            title = m.groupValues[1].trim()
-                            noteText = raw.substring(m.range.last + 1).trim()
-                        }
-                        toolIndex++
-                        val noteArgs = JSONObject().put("text", noteText.take(300))
-                        if (title != null) noteArgs.put("title", title.take(80))
-                        messageDao.insertToolStep(
-                            ToolStepEntity(
-                                id = UUID.randomUUID().toString(), messageId = assistantId, stepIndex = toolIndex,
-                                toolName = "note", argumentsJson = noteArgs.toString(),
-                                resultText = "", isError = false, status = "COMPLETED", durationMs = 0L
-                            )
-                        )
-                        if (title != null && history.isEmpty()) {
-                            renameConversationIfDefault(req.conversationId, title)
-                        }
-                        _agentEvents.tryEmit(AgentEvent.NoteAdded(noteText))
-                    }
+                    // Tool-call text is an internal progress note, not assistant history.
+                    // The Summary UI derives its wording from the real tool actions below.
                     _agentEvents.tryEmit(AgentEvent.StreamingReset)
                 } else if (response.content.isNotBlank()) {
                     var answer = response.content.trim()
@@ -705,7 +684,8 @@ RULES
                 messages.add(
                     LlmMessage(
                         role = "assistant",
-                        content = response.content,
+                        // Tool-call progress text is UI-only; do not feed it back into the model context.
+                        content = if (response.toolCalls.isEmpty()) response.content else "",
                         toolCalls = response.toolCalls.ifEmpty { null },
                         rawContentJson = response.rawContentJson,
                         rawFormat = response.rawFormat
@@ -742,14 +722,17 @@ RULES
                         lastActionFingerprint = actionFingerprint
                         consecutiveActionRepeats = 1
                     }
+                    val actionCount = (actionCounts[actionFingerprint] ?: 0) + 1
+                    actionCounts[actionFingerprint] = actionCount
                     val result = if (call.name == "finish") {
                         val s = try { JSONObject(call.argumentsJson).optString("summary") } catch (e: Exception) { "" }
                         finishSummary = s
                         finished = true
                         ToolResult("Done.")
-                    } else if (consecutiveActionRepeats > 2) {
+                    } else if (actionCount > 2) {
+                        blockedRepeatedActions++
                         ToolResult(
-                            "Blocked a third identical consecutive ${call.name} action. Change strategy: use a different query/range/file or finish if the task is already verified.",
+                            "Blocked repeated ${call.name} action #$actionCount. Use a different query/range/file or finish if the task is already verified.",
                             isError = true
                         )
                     } else {
@@ -783,6 +766,10 @@ RULES
                     )
                 }
                 if (finished) break
+                if (blockedRepeatedActions >= 2) {
+                    errorText = "The agent repeated the same action too often. The loop was stopped to prevent wasted work."
+                    break
+                }
             }
         } catch (e: CancellationException) {
             withContext(NonCancellable) {
