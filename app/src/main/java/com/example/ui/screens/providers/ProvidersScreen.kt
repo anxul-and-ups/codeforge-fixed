@@ -63,7 +63,6 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.example.data.local.entity.ProviderConfigEntity
 import com.example.data.repository.ProviderRepository
-import com.example.data.settings.SettingsStore
 import com.example.data.security.KeyStoreManager
 import com.example.ui.components.ProviderIcon
 import com.example.ui.screens.chat.isProviderReady
@@ -78,7 +77,6 @@ private val PRESET_IDS = setOf("anthropic", "openai", "gemini", "deepseek", "kim
 @Composable
 fun ProvidersScreen(
     providerRepository: ProviderRepository,
-    settingsStore: SettingsStore,
     modifier: Modifier = Modifier,
     startWithAdd: Boolean = false,
     startEditId: String? = null,
@@ -135,10 +133,7 @@ fun ProvidersScreen(
                     provider = provider,
                     canMoveUp = index > 0,
                     canMoveDown = index < providers.size - 1,
-                    onClick = {
-                    settingsStore.preferredProviderId = provider.id
-                    editingId = provider.id
-                },
+                    onClick = { editingId = provider.id },
                     onMoveUp = {
                         val ids = providers.map { it.id }.toMutableList()
                         val item = ids.removeAt(index)
@@ -161,7 +156,6 @@ fun ProvidersScreen(
         ProviderEditor(
             provider = editing,
             repo = providerRepository,
-            settingsStore = settingsStore,
             onDismiss = {
                 editingId = null
                 onFinished?.invoke()
@@ -357,7 +351,6 @@ private fun SectionLabel(text: String) {
 private fun ProviderEditor(
     provider: ProviderConfigEntity,
     repo: ProviderRepository,
-    settingsStore: SettingsStore,
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
@@ -369,6 +362,9 @@ private fun ProviderEditor(
     var urlText by remember(provider.id) { mutableStateOf(provider.baseUrl) }
     var enabled by remember(provider.id) { mutableStateOf(provider.isEnabled) }
     var modelList by remember(provider.id) { mutableStateOf(providerModels(provider)) }
+    val settingsStore = remember { (context.applicationContext as com.example.CodeForgeApp).settingsStore }
+    var apiStatus by remember { mutableStateOf<ApiStatus?>(null) }
+    var freeOnly by remember { mutableStateOf(settingsStore.importFreeModelsOnly) }
     var testing by remember { mutableStateOf(false) }
     var fetching by remember { mutableStateOf(false) }
     var testMessage by remember { mutableStateOf<String?>(null) }
@@ -442,24 +438,42 @@ private fun ProviderEditor(
                         }
                     }
                 }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Import only free models", fontSize = 14.sp, color = AppColors.textPrimary)
+                        Text("Paid models are not added to the list.", fontSize = 11.sp, color = AppColors.textSecondary)
+                    }
+                    Switch(
+                        checked = freeOnly,
+                        onCheckedChange = {
+                            freeOnly = it
+                            settingsStore.importFreeModelsOnly = it
+                        },
+                        colors = SwitchDefaults.colors(checkedThumbColor = AppColors.onAccent, checkedTrackColor = AppColors.accent)
+                    )
+                }
                 TextButton(
                     enabled = !fetching,
                     onClick = {
                         scope.launch {
                             fetching = true
                             try {
-                                val list = repo.fetchModels(draft())
-                                if (list.isEmpty()) {
-                                    Toast.makeText(context, "No models returned. Check the key and URL.", Toast.LENGTH_SHORT).show()
+                                val info = repo.fetchModelsDetailed(draft(), freeOnly)
+                                apiStatus = ApiStatus(true, "", info.total, info.freeCount, info.pricingKnown, info.models.size, freeOnly)
+                                if (info.models.isEmpty()) {
+                                    Toast.makeText(
+                                        context,
+                                        if (freeOnly && info.pricingKnown) "This provider has no free models." else "No models returned. Check the key and URL.",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
                                 } else {
-                                    modelList = list
-                                    if (modelText.isBlank() || modelText.trim() !in list) modelText = list.first()
-                                    Toast.makeText(context, "Loaded ${list.size} models", Toast.LENGTH_SHORT).show()
+                                    modelList = info.models
+                                    if (modelText.isBlank() || modelText.trim() !in info.models) modelText = info.models.first()
                                 }
                             } catch (e: kotlinx.coroutines.CancellationException) {
                                 throw e
                             } catch (e: Exception) {
-                                Toast.makeText(context, "Could not load models: ${e.message?.take(140)}", Toast.LENGTH_LONG).show()
+                                apiStatus = ApiStatus(false, e.message?.take(200) ?: "Could not load models")
                             } finally {
                                 fetching = false
                             }
@@ -477,10 +491,25 @@ private fun ProviderEditor(
                     onClick = {
                         scope.launch {
                             testing = true
-                            testMessage = null
+                            apiStatus = null
                             val err = repo.testConnectionError(draft())
-                            testOk = err == null
-                            testMessage = err ?: "Connection works"
+                            if (err != null) {
+                                apiStatus = ApiStatus(false, err)
+                            } else {
+                                // the key works: also count the models so the user sees what it unlocks
+                                try {
+                                    val info = repo.fetchModelsDetailed(draft(), freeOnly)
+                                    apiStatus = ApiStatus(true, "", info.total, info.freeCount, info.pricingKnown, info.models.size, freeOnly)
+                                    if (info.models.isNotEmpty()) {
+                                        modelList = info.models
+                                        if (modelText.isBlank() || modelText.trim() !in info.models) modelText = info.models.first()
+                                    }
+                                } catch (e: kotlinx.coroutines.CancellationException) {
+                                    throw e
+                                } catch (e: Exception) {
+                                    apiStatus = ApiStatus(true, "", 0, 0, false, 0, freeOnly)
+                                }
+                            }
                             testing = false
                         }
                     },
@@ -492,13 +521,8 @@ private fun ProviderEditor(
                     }
                     Text("Test connection", color = AppColors.textPrimary)
                 }
-                if (testMessage != null) {
-                    Text(
-                        text = testMessage ?: "",
-                        fontSize = 12.sp,
-                        color = if (testOk) AppColors.ok else AppColors.error
-                    )
-                }
+                val st = apiStatus
+                if (st != null) ApiStatusLine(st)
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -579,6 +603,10 @@ private fun AddProviderDialog(
     var headers by remember { mutableStateOf("") }
     var vision by remember { mutableStateOf(true) }
     var tools by remember { mutableStateOf(true) }
+    val settingsStore = remember { (context.applicationContext as com.example.CodeForgeApp).settingsStore }
+    var apiStatus by remember { mutableStateOf<ApiStatus?>(null) }
+    var freeOnly by remember { mutableStateOf(settingsStore.importFreeModelsOnly) }
+    var testing by remember { mutableStateOf(false) }
     var showAdvanced by remember { mutableStateOf(false) }
     var fetching by remember { mutableStateOf(false) }
     var saving by remember { mutableStateOf(false) }
@@ -651,9 +679,13 @@ private fun AddProviderDialog(
                                     priority = 0,
                                     customHeadersJson = headers.ifBlank { null }
                                 )
-                                models = repo.fetchModels(temp)
+                                val info = repo.fetchModelsDetailed(temp, freeOnly)
+                                models = info.models
+                                apiStatus = ApiStatus(true, "", info.total, info.freeCount, info.pricingKnown, info.models.size, freeOnly)
                                 if (models.isNotEmpty() && model.isBlank()) model = models.first()
-                                if (models.isEmpty()) error = "The provider returned no models."
+                                if (models.isEmpty()) {
+                                    error = if (freeOnly && info.pricingKnown) "This provider has no free models." else "The provider returned no models."
+                                }
                             } catch (e: kotlinx.coroutines.CancellationException) {
                                 throw e
                             } catch (e: Exception) {
@@ -666,6 +698,63 @@ private fun AddProviderDialog(
                 ) {
                     Text(if (fetching) "Loading…" else "Load model list from provider", fontSize = 13.sp, color = AppColors.accent)
                 }
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Import only free models", fontSize = 14.sp, color = AppColors.textPrimary)
+                        Text("Paid models are not added to the list.", fontSize = 11.sp, color = AppColors.textSecondary)
+                    }
+                    Switch(
+                        checked = freeOnly,
+                        onCheckedChange = {
+                            freeOnly = it
+                            settingsStore.importFreeModelsOnly = it
+                        },
+                        colors = SwitchDefaults.colors(checkedThumbColor = AppColors.onAccent, checkedTrackColor = AppColors.accent)
+                    )
+                }
+                OutlinedButton(
+                    enabled = !testing && url.trim().length > 10,
+                    onClick = {
+                        scope.launch {
+                            testing = true
+                            apiStatus = null
+                            val temp = ProviderConfigEntity(
+                                id = "temp",
+                                name = name,
+                                baseUrl = url.trim().trimEnd('/'),
+                                apiFormat = format,
+                                encryptedApiKey = KeyStoreManager.encrypt(key.trim()),
+                                modelsJson = "[]",
+                                selectedModel = model.ifBlank { "test" },
+                                priority = 0,
+                                customHeadersJson = headers.ifBlank { null }
+                            )
+                            var err: String? = null
+                            try {
+                                val info = repo.fetchModelsDetailed(temp, freeOnly)
+                                models = info.models
+                                if (models.isNotEmpty() && model.isBlank()) model = models.first()
+                                apiStatus = ApiStatus(true, "", info.total, info.freeCount, info.pricingKnown, info.models.size, freeOnly)
+                            } catch (e: kotlinx.coroutines.CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                err = e.message?.take(200) ?: "Could not reach the API"
+                            }
+                            if (err != null) apiStatus = ApiStatus(false, err)
+                            testing = false
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    if (testing) {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = AppColors.accent)
+                        Spacer(modifier = Modifier.width(8.dp))
+                    }
+                    Text("Test API", color = AppColors.textPrimary)
+                }
+                val st = apiStatus
+                if (st != null) ApiStatusLine(st)
 
                 TextButton(onClick = { showAdvanced = !showAdvanced }) {
                     Text(if (showAdvanced) "Hide advanced" else "Advanced options", fontSize = 13.sp, color = AppColors.textSecondary)
@@ -745,6 +834,67 @@ private fun AddProviderDialog(
                             contentColor = AppColors.onAccent
                         )
                     ) { Text("Add provider") }
+                }
+            }
+        }
+    }
+}
+
+
+private data class ApiStatus(
+    val active: Boolean,
+    val message: String,
+    val total: Int = 0,
+    val free: Int = 0,
+    val pricingKnown: Boolean = false,
+    val shown: Int = 0,
+    val freeOnly: Boolean = false
+)
+
+/** Green circle + "API is active" with the number of models, or a red circle with the error. */
+@Composable
+private fun ApiStatusLine(st: ApiStatus) {
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = if (st.active) AppColors.diffAddBg else AppColors.diffRemoveBg,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.Top) {
+            Box(
+                modifier = Modifier
+                    .padding(top = 4.dp)
+                    .size(10.dp)
+                    .clip(CircleShape)
+                    .background(if (st.active) AppColors.ok else AppColors.error)
+            )
+            Spacer(modifier = Modifier.width(10.dp))
+            Column {
+                Text(
+                    text = if (st.active) "API is active" else "API is not working",
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = if (st.active) AppColors.diffAddText else AppColors.diffRemoveText
+                )
+                if (st.active) {
+                    if (st.total > 0) {
+                        val line = buildString {
+                            append("${st.total} models available")
+                            if (st.pricingKnown) append("  ·  ${st.free} free")
+                            if (st.freeOnly && st.pricingKnown) append("  ·  importing ${st.shown} free")
+                        }
+                        Text(line, fontSize = 12.sp, color = AppColors.textPrimary)
+                        if (st.freeOnly && !st.pricingKnown) {
+                            Text(
+                                "This provider does not say which models are free, so all models are shown.",
+                                fontSize = 11.sp,
+                                color = AppColors.textSecondary
+                            )
+                        }
+                    } else {
+                        Text("The key works. This provider has no model list.", fontSize = 12.sp, color = AppColors.textPrimary)
+                    }
+                } else {
+                    Text(st.message, fontSize = 12.sp, color = AppColors.textPrimary)
                 }
             }
         }

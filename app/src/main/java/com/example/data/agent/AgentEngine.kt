@@ -54,6 +54,11 @@ sealed class AgentEvent {
     data class Error(val error: String) : AgentEvent()
 }
 
+/** CHAT: talk, explain, answer, look at code (read-only). BUILD: may edit files. */
+enum class AgentMode { CHAT, BUILD }
+
+private val READ_ONLY_TOOLS = setOf("list_files", "read_file", "search_code")
+
 data class RunRequest(
     val projectId: String,
     val conversationId: String,
@@ -64,8 +69,7 @@ data class RunRequest(
     val pushOnly: Boolean = false,
     /** A push that was already done (manually); only watch its build and fix errors if it fails. */
     val watchPush: PushResult? = null,
-    /** Continue a previously interrupted run from its persisted checkpoint. */
-    val resume: Boolean = false
+    val mode: AgentMode = AgentMode.BUILD
 )
 
 data class ApprovalRequest(
@@ -120,11 +124,9 @@ class AgentEngine(
 
     private var pendingDecision: CompletableDeferred<Boolean>? = null
     private var job: Job? = null
-    private var userStopRequested = false
 
     fun start(request: RunRequest) {
         if (_isRunning.value) return
-        userStopRequested = false
         _isRunning.value = true
         _runningConversationId.value = request.conversationId
         AgentForegroundService.startService(appContext, "Agent is working…")
@@ -147,25 +149,7 @@ class AgentEngine(
         }
     }
 
-    fun resumePending(): Boolean {
-        if (_isRunning.value) return false
-        val raw = settings.pendingAgentRun ?: return false
-        return try {
-            val o = JSONObject(raw)
-            val projectId = o.optString("projectId").takeIf { it.isNotBlank() } ?: return false
-            val conversationId = o.optString("conversationId").takeIf { it.isNotBlank() } ?: return false
-            val prompt = o.optString("prompt").takeIf { it.isNotBlank() } ?: return false
-            start(RunRequest(projectId, conversationId, prompt, resume = true))
-            true
-        } catch (_: Exception) {
-            settings.pendingAgentRun = null
-            false
-        }
-    }
-
     fun stop() {
-        userStopRequested = true
-        settings.pendingAgentRun = null
         job?.cancel()
     }
 
@@ -194,8 +178,7 @@ class AgentEngine(
             return
         }
         if (!req.pushOnly) {
-            val resumeContext = if (req.resume) loadResumeContext() else null
-            val result = runAgentLoop(req, req.userPrompt, req.imagesBase64, req.docs, resumeContext)
+            val result = runAgentLoop(req, req.userPrompt, req.imagesBase64, req.docs)
             changed = result.changed
             summary = result.summary
             touched = result.touched
@@ -463,84 +446,141 @@ class AgentEngine(
         }
     }
 
-    private fun buildSystemPrompt(projectName: String, projectPrompt: String?): String {
+    private fun buildSystemPrompt(projectName: String, projectPrompt: String?, mode: AgentMode, hasProject: Boolean): String {
         val sb = StringBuilder()
+        val understand = """
+HOW TO UNDERSTAND THE USER
+- The user writes informally, often in Hinglish (Hindi written in English letters) or mixed languages, with typos. Work out what they REALLY want before you do anything.
+- A message can be: (a) a question or a discussion ("what is the solution?", "why does this happen?"), (b) a bug report, (c) a request to change / add / remove / fix something, (d) a short follow-up like "done", "ok", "kar diya", "haan" which means: continue the task discussed earlier in this conversation.
+- Use the earlier messages of this conversation. Do not start from zero when the user refers to "this", "it", "that feature" or "the file you mentioned".
+- If something is unclear, ask ONE short, specific question instead of guessing or browsing files.
+        """.trimIndent()
+
+        if (mode == AgentMode.CHAT) {
+            sb.append(
+                """
+You are CodeForge in CHAT MODE: a smart, friendly assistant like Claude, ChatGPT or Gemini that also understands code. The current project is "$projectName"${if (hasProject) "" else " (no project attached: this is a clean chat)"}.
+
+$understand
+
+CHAT MODE RULES
+- Talk naturally: answer questions, explain, brainstorm, compare options, discuss bugs and solutions. Be direct, warm and concise. Greetings and general questions need NO tools.
+- If a project is attached you may look at it with the READ-ONLY tools list_files, read_file and search_code, but only when the answer depends on the code (for example "which file contains the File Editor option?" -> search, then answer with the exact file path and the function or composable that holds it). Use at most 5 tool calls. Never read files just to look busy.
+- You CANNOT modify files in chat mode. If the user asks you to change, add, remove, fix, rewrite or create something in the project, do NOT pretend you did it and do NOT call edit tools. Reply in the user's language and in your own words that they are currently in Chat mode, so please switch to Build mode with the Chat / Build switch next to the message box, and then tell you "done". If you already know what you would change, say it briefly (file and idea).
+- You have no tool for running or compiling code. Do not claim you tested anything.
+                """.trimIndent()
+            )
+        } else {
+            sb.append(
+                """
+You are CodeForge in BUILD MODE: an expert coding agent working inside an Android app on the user's phone. The current project is "$projectName"${if (hasProject) "" else " (NO PROJECT ATTACHED)"}. You work like Claude Code: understand, locate, edit, verify, report.
+
+$understand
+
+${if (hasProject) "" else "NO PROJECT: there are no files to work on. Do not call tools. Tell the user (in their language) to attach a project ZIP with the + button, or to open a project, or to clone a GitHub repo, then continue. You may still answer questions in text."}
+
+BUILD MODE WORKFLOW (for bug reports and change requests)
+1. Plan in one sentence what the user wants (see PROGRESS NOTES). If you are not sure, ask a question and make NO tool calls.
+2. Locate the code with at most 3 targeted search_code calls, then read only the files or line ranges you need. Never read the same file twice, never browse the whole tree. Do not repeat a tool call with the same arguments: its result is already in your context.
+3. As soon as you know where the change belongs, EDIT. If after about 6 exploration calls you still cannot find it, STOP and ask the user which file or screen to look at. Do not keep searching.
+4. Make the smallest correct change. Prefer edit_file (exact unique match). Use write_file only for new files or a full replacement; for big files use several small edit_file calls. If a feature must be removed, remove its UI and its now-unused code and imports completely, so the project still compiles.
+5. read_file output has line-number prefixes ("   12<tab>code"). The prefix is NOT part of the file: never put it in old_str/new_str.
+6. The project cannot be compiled on this device (builds run later on GitHub Actions), so double-check imports, nullability, signatures and brackets. After editing, re-read the edited region once to verify, then call finish.
+7. If the user only asks a question or discusses, answer in text without editing.
+
+FINAL REPORT (very important)
+After your last tool call write a short report for the user in their language, like a colleague who just finished the work:
+- What you did: 2-5 bullets with the file names that changed.
+- If it was a bug: "The problem was ..." and "I fixed it by ...".
+- What to test or check, and anything risky or left over.
+No big code dumps. Then call finish with a one-line summary.
+                """.trimIndent()
+            )
+        }
+
         sb.append(
             """
-You are CodeForge, an expert AI coding agent working inside an Android app on the user's phone. The user's project (ZIP) is "$projectName". You work like Claude Code: explore, understand, plan, edit, verify.
 
-WORKFLOW
-1. Explore first: use list_files and search_code, then read_file the relevant files. Never guess file contents or invent files.
-2. Make the smallest correct change. Prefer edit_file (exact unique match) over rewriting whole files. Use write_file only for new files or when a file must be fully replaced; for large files edit in several small edit_file calls so your output is not cut off.
-3. read_file output has line-number prefixes ("   12<tab>code"). The prefix is NOT part of the file: never include it in old_str/new_str.
-4. After editing, re-read the changed region to verify it is syntactically correct and imports/types are right.
-5. The project cannot be compiled on this device. Builds happen later on GitHub Actions, so be extremely careful about compile correctness (imports, nullability, signatures, brackets).
-6. If the user only asks a question or reports a bug without wanting changes yet, answer or investigate first; do not edit unless fixing is the clear intent.
-7. When completely done, call finish with a short summary of what you changed and why. Keep explanations concise.
 
-PROGRESS / SUMMARY
-- Do not waste output tokens writing progress updates before tool calls.
-- The app generates the live Summary UI from actual tool actions.
-- Keep tool-call text empty or extremely brief; use the final response for the user-facing answer.
-- You can also create brand new apps: write all needed files (Gradle files, manifest, Kotlin sources, workflow) with write_file in the current project.
+PROGRESS NOTES (shown in the "Summary" panel, ALWAYS in English)
+- Every time you are about to call tools, first write ONE short plain-English sentence (max 14 words) saying what you are doing and why, for example: Looking for where the folder chips handle long press. No markdown, no code.
+- In your first reply of a task, begin with a line "TITLE: " plus a 3-8 word English title (for example: TITLE: Remove reorder from folder chips), then the first progress sentence on the next line.
 
 RULES
 - Paths are relative to the project root. Do not touch build output folders.
 - Never read or print secrets (.env, keystores, google-services.json). Those tools will refuse.
 - Earlier chat turns only contain text summaries, not file contents; files may have changed since. Re-read before editing.
-- Stay tightly scoped to the user's exact request. Do not inspect unrelated screens, folders, or files unless a dependency is proven relevant.
-- Search for the exact symbol or task-specific keyword first. Then read only the relevant file/range and its direct dependencies. Avoid broad repository scans.
-- Prefer narrow read_file ranges after search results. If a file is large, use start_line/end_line around the relevant code instead of rereading the whole file.
-- After an edit, re-read the changed area and verify important references/imports before doing anything else.
-- If a tool returns an error, understand the error and change strategy. Never blindly repeat the same failing or redundant action.
-- Never perform the same exact search/read/edit action more than twice consecutively. On a third identical attempt, stop repeating it and choose a different strategy or finish with the blocker.
-- When the requested change is verified and no relevant work remains, call finish immediately. Do not keep exploring for unrelated improvements.
+- If a tool returns an error, read the message and adjust. Do not repeat the same failing call.
             """.trimIndent()
         )
         val global = settings.globalSystemPrompt.trim()
         if (global.isNotEmpty()) sb.append("\n\nUSER INSTRUCTIONS (global):\n").append(global)
         if (!projectPrompt.isNullOrBlank()) sb.append("\n\nPROJECT INSTRUCTIONS:\n").append(projectPrompt.trim())
         val lang = settings.language
-        if (lang != "English") sb.append("\n\nReply to the user in $lang (keep code, identifiers and file paths unchanged).")
+        if (lang == "Auto" || lang.isBlank()) {
+            sb.append("\n\nLANGUAGE: reply in the same language and style the user writes in (Hinglish -> Hinglish, Hindi -> Hindi, English -> English). Keep code, identifiers and file paths unchanged.")
+        } else if (lang != "English") {
+            sb.append("\n\nLANGUAGE: reply to the user in $lang (keep code, identifiers and file paths unchanged).")
+        } else {
+            sb.append("\n\nLANGUAGE: reply in English.")
+        }
         return sb.toString()
     }
 
-    private fun saveResumeCheckpoint(
-        req: RunRequest,
-        prompt: String,
-        context: String,
-        step: Int,
-        partial: String = ""
-    ) {
-        val o = JSONObject()
-            .put("projectId", req.projectId)
-            .put("conversationId", req.conversationId)
-            .put("prompt", prompt.take(20_000))
-            .put("context", context.take(12_000))
-            .put("step", step)
-            .put("partial", partial.take(4_000))
-        settings.pendingAgentRun = o.toString()
-    }
-
-    private fun loadResumeContext(): String? {
-        val raw = settings.pendingAgentRun ?: return null
-        return try {
-            JSONObject(raw).optString("context").takeIf { it.isNotBlank() }
-        } catch (_: Exception) {
-            null
+    /** Short English title for the Summary panel, produced by a tiny extra call (a few tokens). */
+    private fun requestTitle(req: RunRequest, assistantId: String, prompt: String, isFirstTurn: Boolean) {
+        scope.launch {
+            try {
+                val resp = providerRepository.executeWithFailover(
+                    projectId = req.projectId,
+                    conversationId = req.conversationId,
+                    request = LlmRequest(
+                        systemPrompt = "Write a short English title (3 to 7 words, imperative mood, no quotes, no trailing punctuation) describing the task in the user's message. The message may be informal Hinglish. Output ONLY the title.",
+                        messages = listOf(LlmMessage(role = "user", content = prompt.take(700))),
+                        tools = emptyList(),
+                        reasoningLevel = ReasoningLevel.OFF,
+                        maxTokens = 30
+                    ),
+                    preferredProviderId = settings.preferredProviderId
+                )
+                val title = resp.content.trim().trim('"', '\'', '.', ' ', '\n').lineSequence().firstOrNull().orEmpty().take(70)
+                if (title.length >= 3) {
+                    messageDao.insertToolStep(
+                        ToolStepEntity(
+                            id = UUID.randomUUID().toString(), messageId = assistantId, stepIndex = 0,
+                            toolName = "note", argumentsJson = JSONObject().put("title", title).put("text", "").toString(),
+                            resultText = "", isError = false, status = "COMPLETED", durationMs = 0L
+                        )
+                    )
+                    if (isFirstTurn) renameConversationIfDefault(req.conversationId, title)
+                    _agentEvents.tryEmit(AgentEvent.NoteAdded(title))
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // the title is optional
+            }
         }
     }
 
-    private fun clearResumeCheckpoint() {
-        settings.pendingAgentRun = null
+    /** Old file contents are the biggest token cost: keep only the newest tool results in full. */
+    private fun compactToolResults(messages: MutableList<LlmMessage>) {
+        val toolIdx = messages.indices.filter { messages[it].role == "tool" }
+        val total = toolIdx.sumOf { messages[it].content.length }
+        if (total < 60_000) return
+        for (i in toolIdx.dropLast(6)) {
+            val m = messages[i]
+            if (m.content.length > 500) {
+                messages[i] = m.copy(content = m.content.take(400) + "\n[older tool result trimmed to save tokens]")
+            }
+        }
     }
 
     private suspend fun runAgentLoop(
         req: RunRequest,
         prompt: String,
         images: List<String>,
-        docs: List<LlmDocument> = emptyList(),
-        resumeContext: String? = null
+        docs: List<LlmDocument> = emptyList()
     ): LoopResult {
         val project = projectRepository.getProject(req.projectId)
         if (project == null) {
@@ -561,31 +601,27 @@ RULES
         )
 
         try {
-            val cp = projectRepository.createCheckpoint(req.projectId, "Before: ${prompt.lineSequence().firstOrNull().orEmpty().take(50)}")
-            projectRepository.recordRunCheckpoint(req.projectId, cp.id)
+            if (req.mode == AgentMode.BUILD && project.id != ProjectRepository.SCRATCH_ID) {
+                val cp = projectRepository.createCheckpoint(req.projectId, "Before: ${prompt.lineSequence().firstOrNull().orEmpty().take(50)}")
+                projectRepository.recordRunCheckpoint(req.projectId, cp.id)
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             // continue without checkpoint
         }
 
-        val systemPrompt = buildSystemPrompt(project.name, project.systemPrompt) +
-            "\n\nCURRENT TASK SCOPE (stay inside this scope unless a direct dependency requires otherwise):\n" +
-            prompt.take(8_000)
-        val messages = ArrayList<LlmMessage>(history)
-        val resumeInstruction = resumeContext?.let {
-            "Continue the interrupted task from the persisted checkpoint below. Do not restart completed work. Verify the current project state and continue from the next required action.\n\nCheckpoint:\n$it"
+        val hasProject = project.id != ProjectRepository.SCRATCH_ID
+        val systemPrompt = buildSystemPrompt(project.name, project.systemPrompt, req.mode, hasProject)
+        // No project attached = nothing to read or edit, so no tools (the model just talks)
+        val activeTools = when {
+            !hasProject -> emptyList()
+            req.mode == AgentMode.CHAT -> toolsList.filter { it.name in READ_ONLY_TOOLS }
+            else -> toolsList
         }
-        messages.add(
-            LlmMessage(
-                role = "user",
-                content = if (resumeInstruction != null) resumeInstruction else prompt,
-                imagesBase64 = if (resumeInstruction != null) emptyList() else images,
-                docs = if (resumeInstruction != null) emptyList() else docs
-            )
-        )
+        val messages = ArrayList<LlmMessage>(history)
+        messages.add(LlmMessage(role = "user", content = prompt, imagesBase64 = images, docs = docs))
 
-        val resumeContextBuilder = StringBuilder(resumeContext ?: "Original task: ${prompt.take(1500)}")
         val maxSteps = settings.maxSteps
         val fullText = StringBuilder()
         val reasoningAll = StringBuilder()
@@ -602,17 +638,19 @@ RULES
         var hitStepLimit = false
         val touchedAll = LinkedHashSet<String>()
         val removedAll = LinkedHashSet<String>()
-        var lastActionFingerprint: String? = null
-        var consecutiveActionRepeats = 0
-        val actionCounts = HashMap<String, Int>()
-        var blockedRepeatedActions = 0
+        // Loop guards: the agent must not wander through files forever and waste tokens
+        val seenCalls = HashSet<String>()
+        var exploreCalls = 0
+        var dupCount = 0
+        var forceFinal = false
+        var titleRequested = false
+        val softLimit = if (req.mode == AgentMode.BUILD) 8 else 4
+        val hardLimit = if (req.mode == AgentMode.BUILD) 12 else 6
 
-        var step = 0
         try {
-            saveResumeCheckpoint(req, prompt, resumeContextBuilder.toString(), 0)
+            var step = 0
             while (true) {
                 step++
-                saveResumeCheckpoint(req, prompt, resumeContextBuilder.toString(), step, fullText.toString())
                 if (step > maxSteps) {
                     hitStepLimit = true
                     break
@@ -627,6 +665,7 @@ RULES
                     }
                 }
 
+                compactToolResults(messages)
                 status(if (step == 1) "Thinking…" else "Working (step $step)…")
                 val stepText = StringBuilder()
                 val level = resolveReasoning(settings.reasoningLevel, prompt, step, lastToolError)
@@ -637,7 +676,7 @@ RULES
                     request = LlmRequest(
                         systemPrompt = systemPrompt,
                         messages = messages,
-                        tools = toolsList,
+                        tools = activeTools,
                         reasoningLevel = level
                     ),
                     preferredProviderId = settings.preferredProviderId,
@@ -664,9 +703,42 @@ RULES
                     if (reasoningAll.isNotEmpty()) reasoningAll.append("\n\n")
                     reasoningAll.append(response.reasoning)
                 }
+                if (forceFinal && response.toolCalls.isNotEmpty()) {
+                    // The model ignored "stop exploring": end here with an honest message instead of burning more tokens.
+                    if (fullText.isEmpty()) {
+                        fullText.append(
+                            "I looked through the project but could not reach a clear result, so I stopped to save your tokens. " +
+                                "Please tell me the file or screen to look at (or describe the exact change), and I will continue from there."
+                        )
+                    }
+                    break
+                }
                 if (response.toolCalls.isNotEmpty()) {
-                    // Tool-call text is an internal progress note, not assistant history.
-                    // The Summary UI derives its wording from the real tool actions below.
+                    // Text written before tool calls = progress note for the Summary panel
+                    val raw = response.content.trim()
+                    if (raw.isNotEmpty()) {
+                        var noteText = raw
+                        var title: String? = null
+                        val m = Regex("^TITLE:\\s*(.+?)\\s*(\\n|$)").find(raw)
+                        if (m != null) {
+                            title = m.groupValues[1].trim()
+                            noteText = raw.substring(m.range.last + 1).trim()
+                        }
+                        toolIndex++
+                        val noteArgs = JSONObject().put("text", noteText.take(300))
+                        if (title != null) noteArgs.put("title", title.take(80))
+                        messageDao.insertToolStep(
+                            ToolStepEntity(
+                                id = UUID.randomUUID().toString(), messageId = assistantId, stepIndex = toolIndex,
+                                toolName = "note", argumentsJson = noteArgs.toString(),
+                                resultText = "", isError = false, status = "COMPLETED", durationMs = 0L
+                            )
+                        )
+                        if (title != null && history.isEmpty()) {
+                            renameConversationIfDefault(req.conversationId, title)
+                        }
+                        _agentEvents.tryEmit(AgentEvent.NoteAdded(noteText))
+                    }
                     _agentEvents.tryEmit(AgentEvent.StreamingReset)
                 } else if (response.content.isNotBlank()) {
                     var answer = response.content.trim()
@@ -684,8 +756,7 @@ RULES
                 messages.add(
                     LlmMessage(
                         role = "assistant",
-                        // Tool-call progress text is UI-only; do not feed it back into the model context.
-                        content = if (response.toolCalls.isEmpty()) response.content else "",
+                        content = response.content,
                         toolCalls = response.toolCalls.ifEmpty { null },
                         rawContentJson = response.rawContentJson,
                         rawFormat = response.rawFormat
@@ -703,6 +774,31 @@ RULES
                 var finished = false
                 lastToolError = false
                 for (call in response.toolCalls) {
+                    val isExplore = call.name in READ_ONLY_TOOLS
+                    val callKey = call.name + "|" + call.argumentsJson.trim()
+
+                    // Same read/search again = going in circles: answer from memory instead of running it
+                    if (isExplore && callKey in seenCalls) {
+                        dupCount++
+                        messages.add(
+                            LlmMessage(
+                                role = "tool",
+                                content = "You already ran this exact call earlier in this run, its result is above. Do not repeat it. " +
+                                    "Use what you know: make the edit, answer the user, or ask ONE clarifying question.",
+                                toolCallId = call.id,
+                                toolName = call.name
+                            )
+                        )
+                        if (dupCount >= 3) forceFinal = true
+                        continue
+                    }
+                    if (isExplore) seenCalls.add(callKey)
+
+                    if (!titleRequested) {
+                        titleRequested = true
+                        requestTitle(req, assistantId, prompt, history.isEmpty())
+                    }
+
                     toolIndex++
                     val stepId = UUID.randomUUID().toString()
                     _agentEvents.tryEmit(AgentEvent.ToolStarted(toolIndex, call.name, call.argumentsJson))
@@ -715,33 +811,36 @@ RULES
                         )
                     )
                     val t0 = System.currentTimeMillis()
-                    val actionFingerprint = toolFingerprint(call)
-                    if (actionFingerprint == lastActionFingerprint) {
-                        consecutiveActionRepeats++
-                    } else {
-                        lastActionFingerprint = actionFingerprint
-                        consecutiveActionRepeats = 1
-                    }
-                    val actionCount = (actionCounts[actionFingerprint] ?: 0) + 1
-                    actionCounts[actionFingerprint] = actionCount
                     val result = if (call.name == "finish") {
                         val s = try { JSONObject(call.argumentsJson).optString("summary") } catch (e: Exception) { "" }
                         finishSummary = s
                         finished = true
                         ToolResult("Done.")
-                    } else if (actionCount > 2) {
-                        blockedRepeatedActions++
-                        ToolResult(
-                            "Blocked repeated ${call.name} action #$actionCount. Use a different query/range/file or finish if the task is already verified.",
-                            isError = true
-                        )
                     } else {
-                        executeTool(req.projectId, call)
+                        executeTool(req.projectId, call, req.mode)
                     }
-                    if (result.changed) anyChange = true
+                    if (result.changed) {
+                        anyChange = true
+                        seenCalls.clear() // files changed: reading them again is legitimate
+                    }
                     touchedAll.addAll(result.touched)
                     removedAll.addAll(result.removed)
                     if (result.isError) lastToolError = true
+
+                    var toolText = result.text
+                    if (toolText.length > 14_000) toolText = toolText.take(14_000) + "\n[result truncated]"
+                    if (isExplore) {
+                        exploreCalls++
+                        if (exploreCalls >= hardLimit) {
+                            forceFinal = true
+                            toolText += "\n\n[SYSTEM: exploration limit reached, you must stop browsing now. Reply to the user in plain text, in their language: " +
+                                "what you found, what you could not find, and either the exact change you would make or ONE specific question for the user.]"
+                        } else if (exploreCalls >= softLimit) {
+                            toolText += "\n\n[SYSTEM: you have already used $exploreCalls exploration calls. Decide now: make the edit, answer the user, " +
+                                "or ask a question. Do not keep browsing files.]"
+                        }
+                    }
+
                     messageDao.insertToolStep(
                         ToolStepEntity(
                             id = stepId, messageId = assistantId, stepIndex = toolIndex,
@@ -752,29 +851,19 @@ RULES
                         )
                     )
                     _agentEvents.tryEmit(AgentEvent.ToolFinished(toolIndex, call.name, result.text.take(500), result.isError))
-                    resumeContextBuilder.append("\nStep ").append(toolIndex).append(": ").append(call.name)
-                        .append("\nArguments: ").append(call.argumentsJson.take(1200))
-                        .append("\nResult: ").append(result.text.take(2500))
-                    saveResumeCheckpoint(req, prompt, resumeContextBuilder.toString(), step, fullText.toString())
                     messages.add(
                         LlmMessage(
                             role = "tool",
-                            content = result.text,
+                            content = toolText,
                             toolCallId = call.id,
                             toolName = call.name
                         )
                     )
                 }
                 if (finished) break
-                if (blockedRepeatedActions >= 2) {
-                    errorText = "The agent repeated the same action too often. The loop was stopped to prevent wasted work."
-                    break
-                }
             }
         } catch (e: CancellationException) {
             withContext(NonCancellable) {
-                if (userStopRequested) clearResumeCheckpoint()
-                else saveResumeCheckpoint(req, prompt, resumeContextBuilder.toString(), step, fullText.toString())
                 finalizeMessage(
                     assistantId, req.conversationId,
                     (fullText.toString() + "\n\n⏹ Stopped by user.").trim(),
@@ -785,7 +874,6 @@ RULES
             throw e
         } catch (e: Exception) {
             val msg = e.message ?: e.javaClass.simpleName
-            saveResumeCheckpoint(req, prompt, resumeContextBuilder.toString(), step, fullText.toString())
             finalizeMessage(
                 assistantId, req.conversationId,
                 (fullText.toString() + "\n\n⚠️ $msg").trim(),
@@ -801,6 +889,10 @@ RULES
             if (body.isNotEmpty()) body.append("\n\n")
             body.append(fs.trim())
         }
+        if (body.isBlank() && anyChange) {
+            val names = (touchedAll + removedAll).map { it.substringAfterLast('/') }.distinct().take(8)
+            body.append("Done. I changed: ").append(names.joinToString(", ")).append(". Check the Changes tab to review or undo.")
+        }
         if (hitStepLimit) {
             body.append("\n\n⏸ Reached the step limit ($maxSteps). Send \"continue\" to keep going, or raise the limit in Settings.")
         }
@@ -811,11 +903,6 @@ RULES
             reasoningAll.toString(), if (errorText != null) "ERROR" else "SUCCESS",
             providerName, modelName, totalPrompt, totalCompletion, totalCached
         )
-        if (errorText == null && !hitStepLimit) {
-            clearResumeCheckpoint()
-        } else if (errorText != null || hitStepLimit) {
-            saveResumeCheckpoint(req, prompt, resumeContextBuilder.toString(), step, fullText.toString())
-        }
         _agentEvents.tryEmit(AgentEvent.Finished(fs ?: fullText.toString().take(200), toolIndex))
         // a file edited and later deleted/moved in the same run is not "touched" any more
         touchedAll.removeAll(removedAll)
@@ -840,16 +927,6 @@ RULES
             )
         )
         touchConversation(conversationId)
-    }
-
-    /** Stable fingerprint used only to stop accidental consecutive tool loops.
-     *  Exact repeats are allowed twice; a third identical action must change strategy.
-     */
-    private fun toolFingerprint(call: LlmToolCall): String {
-        val normalizedArgs = call.argumentsJson
-            .replace(Regex("\\s+"), " ")
-            .trim()
-        return call.name + "|" + normalizedArgs
     }
 
     private fun describeCall(call: LlmToolCall): String {
@@ -920,7 +997,14 @@ RULES
         }
     }
 
-    private suspend fun executeTool(projectId: String, call: LlmToolCall): ToolResult {
+    private suspend fun executeTool(projectId: String, call: LlmToolCall, mode: AgentMode): ToolResult {
+        if (mode == AgentMode.CHAT && call.name !in READ_ONLY_TOOLS) {
+            return ToolResult(
+                "Chat mode is read-only: you cannot use ${call.name}. Do not retry it. Tell the user (in their language) that they are in Chat mode " +
+                    "and should switch to Build mode (the Chat / Build switch next to the message box) before you can change files, then wait for them to say done.",
+                isError = true
+            )
+        }
         val args = try {
             JSONObject(if (call.argumentsJson.isBlank()) "{}" else call.argumentsJson)
         } catch (e: Exception) {

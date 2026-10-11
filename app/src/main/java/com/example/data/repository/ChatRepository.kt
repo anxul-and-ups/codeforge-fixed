@@ -63,16 +63,24 @@ class ChatRepository(
 
     fun observeConversation(id: String) = conversationDao.observeConversation(id)
 
+    suspend fun getConversation(id: String): ConversationEntity? = conversationDao.getConversationById(id)
 
     suspend fun moveConversationToProject(id: String, projectId: String) {
         val c = conversationDao.getConversationById(id) ?: return
         conversationDao.updateConversation(c.copy(projectId = projectId, updatedAt = System.currentTimeMillis()))
     }
 
+    /** Updates the delivery state of a user message: SENDING, SUCCESS or ERROR. */
+    suspend fun setMessageStatus(messageId: String, status: String) = withContext(Dispatchers.IO) {
+        val m = messageDao.getMessageById(messageId) ?: return@withContext
+        messageDao.updateMessage(m.copy(status = status))
+    }
+
     suspend fun addUserMessage(
         conversationId: String,
         content: String,
-        attachments: List<AttachmentEntity> = emptyList()
+        attachments: List<AttachmentEntity> = emptyList(),
+        status: String = "SUCCESS"
     ): MessageEntity = withContext(Dispatchers.IO) {
         val messageId = UUID.randomUUID().toString()
         val entity = MessageEntity(
@@ -81,7 +89,7 @@ class ChatRepository(
             sender = "USER",
             content = content,
             timestamp = System.currentTimeMillis(),
-            status = "SUCCESS"
+            status = status
         )
         messageDao.insertMessage(entity)
         for (att in attachments) {
@@ -91,7 +99,8 @@ class ChatRepository(
         // Auto update conversation title if it's default
         val conv = conversationDao.getConversationById(conversationId)
         if (conv != null && (conv.title == "New Chat" || conv.title.startsWith("Chat #"))) {
-            val autoTitle = content.take(30).trim() + if (content.length > 30) "…" else ""
+            val firstText = content.lineSequence().firstOrNull { it.isNotBlank() && !it.startsWith("📎") } ?: content
+            val autoTitle = firstText.take(30).trim() + if (firstText.length > 30) "…" else ""
             conversationDao.updateConversation(conv.copy(title = autoTitle, updatedAt = System.currentTimeMillis()))
         }
         entity

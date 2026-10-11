@@ -8,6 +8,7 @@ import com.example.data.local.entity.CheckpointEntity
 import com.example.data.local.entity.ProjectEntity
 import com.example.data.security.KeyStoreManager
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import org.json.JSONArray
@@ -35,7 +36,23 @@ class ProjectRepository(
     private val projectDao: ProjectDao,
     private val checkpointDao: CheckpointDao
 ) {
-    val allProjects: Flow<List<ProjectEntity>> = projectDao.getAllProjects()
+    companion object {
+        /** Hidden placeholder project for clean chats (no files). */
+        const val SCRATCH_ID = "scratch"
+    }
+
+    /** All real projects (the hidden "no project" placeholder is not listed). */
+    val allProjects: Flow<List<ProjectEntity>> = projectDao.getAllProjects().map { list -> list.filter { it.id != SCRATCH_ID } }
+
+    /** The empty placeholder project that new chats start in, so they do NOT inherit an old chat's ZIP. */
+    suspend fun getOrCreateScratchProject(): ProjectEntity = withContext(Dispatchers.IO) {
+        projectDao.getProjectById(SCRATCH_ID)?.let { return@withContext it }
+        val root = File(File(context.filesDir, "projects"), SCRATCH_ID)
+        root.mkdirs()
+        val entity = ProjectEntity(id = SCRATCH_ID, name = "No project", rootPath = root.absolutePath, fileCount = 0)
+        projectDao.insertProject(entity)
+        entity
+    }
 
     suspend fun getProject(id: String): ProjectEntity? = projectDao.getProjectById(id)
 

@@ -1,5 +1,14 @@
 package com.example.ui.components
 
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.MutableTransitionState
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -23,6 +32,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -117,7 +127,41 @@ private fun autoSentence(phase: Phase): String {
     }
 }
 
-/** Groups real tool actions into clean titled phases; no model-generated progress text is persisted. */
+/** Several short "thinking" sentences generated from what the agent really did. */
+private fun autoSentences(phase: Phase): List<String> {
+    val tools = phase.tools
+    fun q(t: ToolStepEntity): String =
+        try { JSONObject(t.argumentsJson).optString("query") } catch (e: Exception) { "" }
+    val out = ArrayList<String>()
+    when (phase.cat) {
+        Cat.EXPLORE -> {
+            val queries = tools.filter { it.toolName == "search_code" }.map { q(it) }.filter { it.isNotBlank() }.distinct()
+            if (queries.isNotEmpty()) {
+                out.add("Looking for " + queries.take(3).joinToString(", ") { "“$it”" } + " across the project.")
+            }
+            if (tools.any { it.toolName == "list_files" }) out.add("Browsing the project folders to find the right place.")
+            val reads = tools.filter { it.toolName == "read_file" }.map { shortName(stepPath(it)) }.distinct()
+            if (reads.isNotEmpty()) out.add("Opening " + listNames(reads) + " to see how " + (if (reads.size == 1) "it works." else "they work."))
+        }
+        Cat.CHANGE -> {
+            for (t in tools.take(4)) {
+                val n = shortName(stepPath(t))
+                when (t.toolName) {
+                    "edit_file" -> out.add("Editing $n.")
+                    "write_file" -> out.add("Writing $n.")
+                    "delete_file" -> out.add("Removing $n.")
+                    "move_file" -> out.add("Moving $n.")
+                }
+            }
+            if (tools.size > 4) out.add("…and ${tools.size - 4} more changes.")
+        }
+        Cat.CHECK -> out.add("Re-reading " + listNames(tools.map { shortName(stepPath(it)) }).ifBlank { "the changes" } + " to make sure everything is correct.")
+    }
+    if (out.isEmpty()) out.add(autoSentence(phase))
+    return out
+}
+
+/** Groups the raw steps into titled phases (model notes are used when present, otherwise generated). */
 private fun buildPhases(steps: List<ToolStepEntity>): List<Phase> {
     val phases = ArrayList<Phase>()
     var cur: Phase? = null
@@ -126,7 +170,13 @@ private fun buildPhases(steps: List<ToolStepEntity>): List<Phase> {
     var seenChange = false
     for (st in steps) {
         if (st.toolName == "finish") continue
-        if (st.toolName == "note") continue
+        if (st.toolName == "note") {
+            val t = noteText(st)
+            if (t.isNotBlank()) pending = if (pending == null) t else pending + " " + t
+            val ti = noteTitle(st)
+            if (ti != null) pendingTitle = ti
+            continue
+        }
         val isChange = st.toolName == "edit_file" || st.toolName == "write_file" ||
             st.toolName == "delete_file" || st.toolName == "move_file"
         val cat = when {
@@ -169,13 +219,15 @@ private fun buildPhases(steps: List<ToolStepEntity>): List<Phase> {
     }
     for (ph in phases) {
         if (ph.title == null) ph.title = autoTitle(ph)
-        if (ph.sentences.isEmpty()) ph.sentences.add(autoSentence(ph))
+        if (ph.sentences.isEmpty()) ph.sentences.addAll(autoSentences(ph))
     }
     return phases
 }
 
 /** Title for the whole task. */
 private fun overallTitle(steps: List<ToolStepEntity>, phases: List<Phase>): String {
+    val modelTitle = steps.firstNotNullOfOrNull { if (it.toolName == "note") noteTitle(it) else null }
+    if (modelTitle != null) return modelTitle
     val changed = steps.filter { it.toolName == "edit_file" || it.toolName == "write_file" }.map { shortName(stepPath(it)) }
     if (changed.isNotEmpty()) return "Update " + listNames(changed)
     return phases.firstOrNull()?.title ?: "Working on your request"
@@ -204,11 +256,10 @@ fun describeStepSentence(step: ToolStepEntity): String {
 fun AgentSummaryBar(
     steps: List<ToolStepEntity>,
     running: Boolean,
-    liveStatus: String = "",
     fallbackTitle: String,
     modifier: Modifier = Modifier
 ) {
-    if (steps.isEmpty() && !running) return
+    if (steps.isEmpty()) return
     var open by remember { mutableStateOf(false) }
 
     val sorted = remember(steps) { steps.sortedBy { it.stepIndex } }
@@ -216,7 +267,6 @@ fun AgentSummaryBar(
     val tools = remember(sorted) { sorted.filter { it.toolName != "note" && it.toolName != "finish" } }
     val title = remember(sorted) { overallTitle(sorted, buildPhases(sorted)) }
     val latest: String = when {
-        running && liveStatus.isNotBlank() -> liveStatus
         running -> {
             val lastTool = tools.lastOrNull()
             val lastNote = notes.lastOrNull { noteText(it).isNotBlank() }
@@ -238,16 +288,35 @@ fun AgentSummaryBar(
             .padding(vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        CodingSummaryBadge(running = running)
+        if (running) {
+            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = AppColors.accent)
+        } else {
+            Icon(Icons.Default.History, contentDescription = null, tint = AppColors.textMuted, modifier = Modifier.size(18.dp))
+        }
         Spacer(modifier = Modifier.width(10.dp))
-        Text(
-            text = latest,
-            fontSize = 14.sp,
-            color = AppColors.textSecondary,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f, fill = false)
-        )
+        if (running) {
+            // the sentence slides up and fades whenever the agent moves on, with a light sweeping across it
+            AnimatedContent(
+                targetState = latest,
+                transitionSpec = {
+                    (fadeIn(tween(260)) + slideInVertically(tween(260)) { it / 2 }) togetherWith
+                        (fadeOut(tween(160)) + slideOutVertically(tween(160)) { -it / 2 })
+                },
+                label = "latest_sentence",
+                modifier = Modifier.weight(1f, fill = false)
+            ) { sentence ->
+                ShimmerText(text = sentence, fontSize = 14)
+            }
+        } else {
+            Text(
+                text = latest,
+                fontSize = 14.sp,
+                color = AppColors.textSecondary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false)
+            )
+        }
         if (!running) {
             Text(
                 text = "  ·  ${tools.size} step" + (if (tools.size == 1) "" else "s") + (if (failed > 0) " · $failed failed" else ""),
@@ -269,110 +338,6 @@ fun AgentSummaryBar(
         ) {
             SummarySheetContent(title = title, steps = sorted, running = running, onClose = { open = false })
         }
-    }
-}
-
-private fun compactActionSummary(steps: List<ToolStepEntity>): String {
-    val reads = steps.count { it.toolName == "read_file" }
-    val searches = steps.count { it.toolName == "search_code" }
-    val lists = steps.count { it.toolName == "list_files" }
-    val edits = steps.count { it.toolName == "edit_file" || it.toolName == "write_file" || it.toolName == "delete_file" || it.toolName == "move_file" }
-    val parts = ArrayList<String>(4)
-    if (lists > 0) parts.add("${lists} file listing" + if (lists == 1) "" else "s")
-    if (reads > 0) parts.add("${reads} file read" + if (reads == 1) "" else "s")
-    if (searches > 0) parts.add("${searches} search" + if (searches == 1) "" else "es")
-    if (edits > 0) parts.add("${edits} change" + if (edits == 1) "" else "s")
-    return if (parts.isEmpty()) "${steps.size} agent action" + if (steps.size == 1) "" else "s" else parts.joinToString(" · ")
-}
-
-@Composable
-private fun CleanActionList(steps: List<ToolStepEntity>) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(10.dp))
-            .background(AppColors.codeBg)
-            .padding(vertical = 5.dp)
-    ) {
-        for (step in steps) {
-            val a = try { JSONObject(step.argumentsJson) } catch (e: Exception) { JSONObject() }
-            val (verb, target) = when (step.toolName) {
-                "list_files" -> "List" to a.optString("path", ".")
-                "read_file" -> {
-                    val range = if (a.has("start_line")) " :${a.optInt("start_line")}-${a.optInt("end_line", 0)}" else ""
-                    "Read" to (a.optString("path") + range)
-                }
-                "search_code" -> "Search" to a.optString("query").take(80)
-                "edit_file" -> "Edit" to a.optString("path")
-                "write_file" -> "Write" to a.optString("path")
-                "delete_file" -> "Delete" to a.optString("path")
-                "move_file" -> "Move" to (a.optString("from_path") + " → " + a.optString("to_path"))
-                else -> step.toolName to ""
-            }
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                when {
-                    step.status == "RUNNING" -> CircularProgressIndicator(
-                        modifier = Modifier.size(13.dp), strokeWidth = 1.6.dp, color = AppColors.accent
-                    )
-                    step.isError -> Icon(
-                        Icons.Default.Close, contentDescription = "Failed",
-                        tint = AppColors.error, modifier = Modifier.size(14.dp)
-                    )
-                    else -> Icon(
-                        Icons.Default.Check, contentDescription = "Done",
-                        tint = AppColors.ok, modifier = Modifier.size(14.dp)
-                    )
-                }
-                Spacer(modifier = Modifier.width(9.dp))
-                Text(
-                    text = verb,
-                    fontSize = 12.sp,
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.SemiBold,
-                    color = if (step.isError) AppColors.error else AppColors.accent
-                )
-                Spacer(modifier = Modifier.width(9.dp))
-                Text(
-                    text = target,
-                    fontSize = 12.sp,
-                    fontFamily = FontFamily.Monospace,
-                    color = AppColors.textPrimary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f)
-                )
-                if (step.durationMs > 0L) {
-                    Spacer(modifier = Modifier.width(7.dp))
-                    Text(
-                        text = "${step.durationMs}ms",
-                        fontSize = 10.sp,
-                        color = AppColors.textMuted
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun CodingSummaryBadge(running: Boolean) {
-    Box(
-        modifier = Modifier
-            .size(34.dp)
-            .clip(RoundedCornerShape(8.dp))
-            .border(1.dp, AppColors.border, RoundedCornerShape(8.dp)),
-        contentAlignment = Alignment.Center
-    ) {
-        Text(
-            text = ">_",
-            fontSize = 13.sp,
-            fontFamily = FontFamily.Monospace,
-            fontWeight = FontWeight.Bold,
-            color = if (running) AppColors.textPrimary else AppColors.textSecondary
-        )
     }
 }
 
@@ -414,6 +379,7 @@ private fun SummarySheetContent(
             items(phases.size) { index ->
                 val ph = phases[index]
                 val isLast = index == phases.size - 1
+                AppearAnimated {
                 Column {
 
                 // Phase title with the ">_" badge
@@ -470,11 +436,12 @@ private fun SummarySheetContent(
                                 color = AppColors.textSecondary
                             )
                             if (lastSentence && ph.tools.isNotEmpty()) {
-                                Spacer(modifier = Modifier.height(7.dp))
-                                CleanActionList(ph.tools)
+                                Spacer(modifier = Modifier.height(8.dp))
+                                ToolLines(ph.tools)
                             }
                         }
                     }
+                }
                 }
                 }
             }
@@ -484,7 +451,7 @@ private fun SummarySheetContent(
                     Row(modifier = Modifier.padding(start = 12.dp, top = 4.dp, bottom = 24.dp), verticalAlignment = Alignment.CenterVertically) {
                         CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = AppColors.accent)
                         Spacer(modifier = Modifier.width(14.dp))
-                        Text("Working…", fontSize = 15.sp, color = AppColors.textSecondary)
+                        ShimmerText(text = "Working…", fontSize = 15)
                     }
                 } else {
                     Row(modifier = Modifier.padding(start = 12.dp, top = 4.dp, bottom = 24.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -495,5 +462,18 @@ private fun SummarySheetContent(
                 }
             }
         }
+    }
+}
+
+
+/** Fades and slides its content in once, when it first shows up. */
+@Composable
+private fun AppearAnimated(content: @Composable () -> Unit) {
+    val state = remember { MutableTransitionState(false).apply { targetState = true } }
+    AnimatedVisibility(
+        visibleState = state,
+        enter = fadeIn(tween(380)) + slideInVertically(tween(380)) { it / 6 }
+    ) {
+        content()
     }
 }

@@ -1001,7 +1001,14 @@ class LlmClient(
     // ---------------------------------------------------------------------------------------
 
     /** Fetches the model list from the provider's API (/models). Throws on failure. */
-    suspend fun fetchModels(provider: ProviderConfigEntity): List<String> {
+    suspend fun fetchModels(provider: ProviderConfigEntity): List<String> =
+        fetchModelsDetailed(provider, false).models
+
+    /**
+     * Same as [fetchModels] plus counts. With [freeOnly] the list keeps only models that are free:
+     * the provider must publish prices (OpenRouter does) or mark them with a ":free" suffix.
+     */
+    suspend fun fetchModelsDetailed(provider: ProviderConfigEntity, freeOnly: Boolean): ModelFetch {
         val apiKey = KeyStoreManager.decrypt(provider.encryptedApiKey)
         val base = provider.baseUrl.trim().trimEnd('/')
         val format = provider.apiFormat.uppercase()
@@ -1026,6 +1033,8 @@ class LlmClient(
             if (!response.isSuccessful) throw apiError(response, "Model list")
             val obj = JSONObject(response.body?.string() ?: "{}")
             val out = mutableListOf<String>()
+            val freeIds = HashSet<String>()
+            var pricingKnown = false
             if (format == "GEMINI") {
                 val arr = obj.optJSONArray("models") ?: JSONArray()
                 for (i in 0 until arr.length()) {
@@ -1044,12 +1053,37 @@ class LlmClient(
                 for (i in 0 until arr.length()) {
                     val item = arr.opt(i)
                     when (item) {
-                        is JSONObject -> out.add(item.optString("id").ifEmpty { item.optString("name") })
-                        is String -> out.add(item)
+                        is JSONObject -> {
+                            val id = item.optString("id").ifEmpty { item.optString("name") }
+                            out.add(id)
+                            val pricing = item.optJSONObject("pricing")
+                            if (pricing != null) {
+                                pricingKnown = true
+                                fun zero(key: String): Boolean {
+                                    if (!pricing.has(key)) return true
+                                    val v = pricing.opt(key)
+                                    return v == null || v.toString().trim().toDoubleOrNull() == 0.0
+                                }
+                                if (zero("prompt") && zero("completion")) freeIds.add(id)
+                            }
+                            if (id.endsWith(":free")) {
+                                pricingKnown = true
+                                freeIds.add(id)
+                            }
+                        }
+                        is String -> {
+                            out.add(item)
+                            if (item.endsWith(":free")) {
+                                pricingKnown = true
+                                freeIds.add(item)
+                            }
+                        }
                     }
                 }
             }
-            out.filter { it.isNotBlank() }.sorted()
+            val all = out.filter { it.isNotBlank() }.distinct().sorted()
+            val shown = if (freeOnly && pricingKnown) all.filter { it in freeIds } else all
+            ModelFetch(models = shown, total = all.size, freeCount = freeIds.size, pricingKnown = pricingKnown)
         }
     }
 
@@ -1074,6 +1108,15 @@ class LlmClient(
 
     suspend fun testConnection(provider: ProviderConfigEntity): Boolean = testConnectionError(provider) == null
 }
+
+/** Result of loading a provider's model list. */
+data class ModelFetch(
+    val models: List<String>,
+    val total: Int,
+    val freeCount: Int,
+    /** False when the provider does not say which models are free (then "free only" cannot filter). */
+    val pricingKnown: Boolean
+)
 
 class ApiException(
     val statusCode: Int,

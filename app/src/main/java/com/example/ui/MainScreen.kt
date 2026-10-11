@@ -3,6 +3,12 @@ package com.example.ui
 import androidx.activity.compose.BackHandler
 import com.example.ui.theme.AppColors
 import androidx.compose.foundation.background
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.ime
@@ -141,7 +147,18 @@ fun MainScreen(
                 .padding(innerPadding)
                 .background(AppColors.bg)
         ) {
-            when (currentScreen) {
+            AnimatedContent(
+                targetState = currentScreen,
+                modifier = Modifier.fillMaxSize(),
+                transitionSpec = {
+                    // fade through with a tiny upward slide: cheap to draw and feels smooth
+                    (fadeIn(animationSpec = tween(durationMillis = 240, delayMillis = 50)) +
+                        slideInVertically(animationSpec = tween(durationMillis = 280)) { it / 28 }) togetherWith
+                        fadeOut(animationSpec = tween(durationMillis = 110))
+                },
+                label = "screen_transition"
+            ) { screen ->
+            when (screen) {
                 Screen.Chat -> {
                     ChatScreen(
                         viewModel = chatViewModel,
@@ -204,7 +221,6 @@ fun MainScreen(
                 Screen.Providers -> {
                     ProvidersScreen(
                         providerRepository = app.providerRepository,
-                        settingsStore = app.settingsStore,
                         startWithAdd = providersStartAdd,
                         startEditId = providersStartEditId,
                         onFinished = {
@@ -242,6 +258,7 @@ fun MainScreen(
                         modifier = Modifier.fillMaxSize()
                     )
                 }
+            }
             }
         }
     }

@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -73,7 +74,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.local.entity.MessageEntity
 import com.example.data.local.entity.ToolStepEntity
+import com.example.data.agent.AgentMode
 import com.example.ui.components.AgentSummaryBar
+import com.example.ui.components.ThinkingRow
+import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material3.CircularProgressIndicator as SendSpinner
 import com.example.ui.components.MarkdownContentView
 import com.example.ui.components.ProviderIcon
 import com.example.ui.components.ThinkingBlockView
@@ -95,7 +101,6 @@ fun ChatScreen(
     val toolStepsMap by viewModel.toolStepsMap.collectAsState()
     val providers by viewModel.providers.collectAsState()
     val preferredId by viewModel.preferredProviderId.collectAsState()
-    LaunchedEffect(providers) { viewModel.syncPreferredProvider() }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val drawerState = rememberDrawerState(DrawerValue.Closed)
@@ -104,6 +109,9 @@ fun ChatScreen(
     var showModelPicker by remember { mutableStateOf(false) }
     var showAttachMenu by remember { mutableStateOf(false) }
     var showRepoPicker by remember { mutableStateOf(false) }
+    var showProjectPicker by remember { mutableStateOf(false) }
+    val projectsList by viewModel.projectsList.collectAsState()
+    val isScratch = uiState.activeProject?.id == com.example.data.repository.ProjectRepository.SCRATCH_ID
 
     val visibleMessages = messages.filter { m ->
         !(m.status == "STREAMING" && m.content.isBlank() && toolStepsMap[m.id].isNullOrEmpty())
@@ -155,6 +163,21 @@ fun ChatScreen(
         )
     }
 
+    if (showProjectPicker) {
+        ProjectPickerDialog(
+            projects = projectsList,
+            activeProjectId = if (isScratch) null else uiState.activeProject?.id,
+            onPick = { p ->
+                showProjectPicker = false
+                viewModel.attachProjectToChat(p)
+            },
+            onNone = {
+                showProjectPicker = false
+                viewModel.detachProjectFromChat()
+            },
+            onDismiss = { showProjectPicker = false }
+        )
+    }
     if (showRepoPicker && githubManager != null) {
         com.example.ui.screens.github.RepoPickerDialog(
             manager = githubManager,
@@ -226,13 +249,27 @@ fun ChatScreen(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
-                    Text(
-                        text = uiState.activeProject?.name ?: "No project",
-                        fontSize = 12.sp,
-                        color = AppColors.textMuted,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
+                    Row(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .clickable { showProjectPicker = true },
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = if (isScratch) "No project · tap to attach" else (uiState.activeProject?.name ?: "No project"),
+                            fontSize = 12.sp,
+                            color = if (isScratch) AppColors.textMuted else AppColors.accent,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.widthIn(max = 240.dp)
+                        )
+                        Icon(
+                            Icons.Default.ArrowDropDown,
+                            contentDescription = "Choose project",
+                            tint = AppColors.textMuted,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
                 }
                 IconButton(onClick = { viewModel.newConversation() }) {
                     Icon(Icons.Default.Add, contentDescription = "New chat", tint = AppColors.textPrimary)
@@ -290,19 +327,15 @@ fun ChatScreen(
                         liveStatus = if (live) uiState.currentAgentStatus else "",
                         liveContent = if (live) uiState.streamingContent else "",
                         liveReasoning = if (live) uiState.streamingReasoning else "",
-                        fallbackTitle = uiState.activeConversation?.title?.takeIf { it != "New Chat" } ?: "Working on your request"
+                        fallbackTitle = uiState.activeConversation?.title?.takeIf { it != "New Chat" } ?: "Working on your request",
+                        isChatMode = uiState.mode == AgentMode.CHAT,
+                        onRetry = { viewModel.retryFailedMessage(message) },
+                        onSwitchToBuild = { viewModel.setMode(AgentMode.BUILD) }
                     )
                 }
 
-                if (uiState.isAgentRunning && streamingMessageId == null) {
-                    item {
-                        AgentSummaryBar(
-                            steps = emptyList(),
-                            running = true,
-                            liveStatus = uiState.currentAgentStatus.ifBlank { "Starting…" },
-                            fallbackTitle = uiState.activeConversation?.title?.takeIf { it != "New Chat" } ?: "Working on your request"
-                        )
-                    }
+                if ((uiState.isAgentRunning || uiState.isPreparing) && streamingMessageId == null) {
+                    item { ThinkingRow(uiState.currentAgentStatus) }
                 }
 
                 item { Spacer(modifier = Modifier.height(4.dp)) }
@@ -331,10 +364,33 @@ fun ChatScreen(
                         }
                     }
 
+                    // Chat / Build switch
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 12.dp, end = 12.dp, top = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        ModePill(mode = uiState.mode, onChange = { viewModel.setMode(it) })
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text(
+                            text = if (uiState.mode == AgentMode.CHAT) "Talk and ask. Cannot edit files." else "Can read and edit your project.",
+                            fontSize = 11.sp,
+                            color = AppColors.textMuted,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+
                     TextField(
                         value = inputText,
                         onValueChange = { inputText = it },
-                        placeholder = { Text("Describe the bug or the change…", fontSize = 15.sp) },
+                        placeholder = {
+                            Text(
+                                if (uiState.mode == AgentMode.CHAT) "Message CodeForge…" else "Describe the bug or the change…",
+                                fontSize = 15.sp
+                            )
+                        },
                         maxLines = 6,
                         colors = TextFieldDefaults.colors(
                             focusedContainerColor = Color.Transparent,
@@ -384,7 +440,7 @@ fun ChatScreen(
                             }
                         }
 
-                        // GitHub: clone one of your repositories (or connect first)
+                        // GitHub: clone one of your repositories (or connect first). 
                         IconButton(
                             onClick = {
                                 if (githubConnected) showRepoPicker = true else onOpenGitHub()
@@ -436,7 +492,7 @@ fun ChatScreen(
 
                         Spacer(modifier = Modifier.width(6.dp))
 
-                        val canSend = inputText.isNotBlank() || uiState.pendingAttachments.isNotEmpty()
+                        val canSend = (inputText.isNotBlank() || uiState.pendingAttachments.isNotEmpty()) && !uiState.isPreparing
                         if (uiState.isAgentRunning) {
                             IconButton(
                                 onClick = { viewModel.stopAgent() },
@@ -462,12 +518,16 @@ fun ChatScreen(
                                     .background(if (canSend) AppColors.accent else AppColors.surfaceAlt)
                                     .testTag("send_message_button")
                             ) {
-                                Icon(
-                                    Icons.Default.Send,
-                                    contentDescription = "Send",
-                                    tint = if (canSend) AppColors.onAccent else AppColors.textMuted,
-                                    modifier = Modifier.size(18.dp)
-                                )
+                                if (uiState.isPreparing) {
+                                    SendSpinner(modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = AppColors.textSecondary)
+                                } else {
+                                    Icon(
+                                        Icons.Default.Send,
+                                        contentDescription = "Send",
+                                        tint = if (canSend) AppColors.onAccent else AppColors.textMuted,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
                             }
                         }
                     }
@@ -518,7 +578,10 @@ private fun ChatMessage(
     liveStatus: String,
     liveContent: String,
     liveReasoning: String,
-    fallbackTitle: String
+    fallbackTitle: String,
+    isChatMode: Boolean,
+    onRetry: () -> Unit,
+    onSwitchToBuild: () -> Unit
 ) {
     val clipboard = LocalClipboardManager.current
     if (message.sender == "USER") {
@@ -554,6 +617,26 @@ private fun ChatMessage(
                     )
                 }
             }
+            // delivery state, like other chat apps: circle while sending, red note when it failed
+            val sendingNow = message.status == "SENDING" && System.currentTimeMillis() - message.timestamp < 120_000L
+            val sendFailed = message.status == "ERROR" || (message.status == "SENDING" && !sendingNow)
+            if (sendingNow) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(modifier = Modifier.size(10.dp), strokeWidth = 1.5.dp, color = AppColors.textMuted)
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Sending…", fontSize = 11.sp, color = AppColors.textMuted)
+                }
+            } else if (sendFailed) {
+                Text(
+                    text = "Not sent · tap to retry",
+                    fontSize = 11.sp,
+                    color = AppColors.error,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .clickable { onRetry() }
+                        .padding(2.dp)
+                )
+            }
         }
         return
     }
@@ -564,13 +647,8 @@ private fun ChatMessage(
             .testTag("assistant_message_bubble"),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        if (live || toolSteps.isNotEmpty()) {
-            AgentSummaryBar(
-                steps = toolSteps,
-                running = live,
-                liveStatus = liveStatus,
-                fallbackTitle = fallbackTitle
-            )
+        if (toolSteps.isNotEmpty()) {
+            AgentSummaryBar(steps = toolSteps, running = live, fallbackTitle = fallbackTitle)
         }
 
         val reasoning = if (live && liveReasoning.isNotBlank()) liveReasoning else message.reasoning
@@ -584,6 +662,64 @@ private fun ChatMessage(
             MarkdownContentView(content = text, textColor = AppColors.textPrimary)
         }
 
+        if (live && toolSteps.isEmpty()) {
+            ThinkingRow(liveStatus)
+        }
+
+        // Chat mode answered "please switch to Build mode": one tap to do it
+        if (!live && isChatMode && message.content.contains("build mode", ignoreCase = true)) {
+            Surface(
+                shape = RoundedCornerShape(12.dp),
+                color = AppColors.accentSoft,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(12.dp))
+                    .clickable { onSwitchToBuild() }
+            ) {
+                Text(
+                    text = "Switch to Build mode",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = AppColors.accent,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
+                )
+            }
+        }
+
+        // Files this run changed (for a quick overview next to the "work done" report)
+        if (!live) {
+            val changed = remember(toolSteps) {
+                val out = LinkedHashSet<String>()
+                for (st in toolSteps) {
+                    if (st.toolName == "edit_file" || st.toolName == "write_file" || st.toolName == "delete_file") {
+                        val path = try { org.json.JSONObject(st.argumentsJson).optString("path") } catch (e: Exception) { "" }
+                        if (path.isNotBlank() && !st.isError) out.add(path.substringAfterLast('/'))
+                    }
+                }
+                out.toList()
+            }
+            if (changed.isNotEmpty()) {
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Default.Check, contentDescription = null, tint = AppColors.ok, modifier = Modifier.size(14.dp))
+                    Text("Changed", fontSize = 12.sp, color = AppColors.textSecondary)
+                    for (name in changed.take(8)) {
+                        Surface(shape = RoundedCornerShape(8.dp), color = AppColors.surfaceAlt) {
+                            Text(
+                                text = name,
+                                fontSize = 11.sp,
+                                fontFamily = FontFamily.Monospace,
+                                color = AppColors.textPrimary,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                            )
+                        }
+                    }
+                    if (changed.size > 8) Text("+${changed.size - 8}", fontSize = 11.sp, color = AppColors.textMuted)
+                }
+            }
+        }
 
         if (!live) {
             val model = message.modelUsed
@@ -663,6 +799,104 @@ private fun EmptyChat(projectName: String?, onPrompt: (String) -> Unit) {
                     color = AppColors.textPrimary,
                     modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp)
                 )
+            }
+        }
+    }
+}
+
+
+@Composable
+private fun ModePill(mode: AgentMode, onChange: (AgentMode) -> Unit) {
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(14.dp))
+            .background(AppColors.surfaceAlt)
+            .padding(2.dp)
+    ) {
+        ModeSegment("Chat", mode == AgentMode.CHAT) { onChange(AgentMode.CHAT) }
+        ModeSegment("Build", mode == AgentMode.BUILD) { onChange(AgentMode.BUILD) }
+    }
+}
+
+@Composable
+private fun ModeSegment(label: String, selected: Boolean, onClick: () -> Unit) {
+    Text(
+        text = label,
+        fontSize = 12.sp,
+        fontWeight = FontWeight.SemiBold,
+        color = if (selected) AppColors.onAccent else AppColors.textSecondary,
+        modifier = Modifier
+            .clip(RoundedCornerShape(12.dp))
+            .background(if (selected) AppColors.accent else Color.Transparent)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 5.dp)
+    )
+}
+
+@Composable
+private fun ProjectPickerDialog(
+    projects: List<com.example.data.local.entity.ProjectEntity>,
+    activeProjectId: String?,
+    onPick: (com.example.data.local.entity.ProjectEntity) -> Unit,
+    onNone: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
+        Surface(shape = RoundedCornerShape(20.dp), color = AppColors.surface, modifier = Modifier.fillMaxWidth()) {
+            Column(modifier = Modifier.padding(vertical = 16.dp)) {
+                Text(
+                    "Project for this chat",
+                    fontSize = 17.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = AppColors.textPrimary,
+                    modifier = Modifier.padding(horizontal = 20.dp)
+                )
+                Text(
+                    "New chats start clean. Pick a project to work on, or attach a ZIP with the + button.",
+                    fontSize = 12.sp,
+                    color = AppColors.textSecondary,
+                    modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 2.dp, bottom = 8.dp)
+                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onNone() }
+                        .padding(horizontal = 20.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "No project (clean chat)",
+                        fontSize = 14.sp,
+                        color = if (activeProjectId == null) AppColors.accent else AppColors.textPrimary,
+                        fontWeight = if (activeProjectId == null) FontWeight.SemiBold else FontWeight.Normal,
+                        modifier = Modifier.weight(1f)
+                    )
+                    if (activeProjectId == null) Icon(Icons.Default.Check, null, tint = AppColors.accent, modifier = Modifier.size(18.dp))
+                }
+                LazyColumn(modifier = Modifier.heightIn(max = 320.dp)) {
+                    items(projects, key = { it.id }) { p ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onPick(p) }
+                                .padding(horizontal = 20.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    p.name,
+                                    fontSize = 14.sp,
+                                    color = if (p.id == activeProjectId) AppColors.accent else AppColors.textPrimary,
+                                    fontWeight = if (p.id == activeProjectId) FontWeight.SemiBold else FontWeight.Normal,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text("${p.fileCount} files", fontSize = 11.sp, color = AppColors.textMuted)
+                            }
+                            if (p.id == activeProjectId) Icon(Icons.Default.Check, null, tint = AppColors.accent, modifier = Modifier.size(18.dp))
+                        }
+                    }
+                }
             }
         }
     }

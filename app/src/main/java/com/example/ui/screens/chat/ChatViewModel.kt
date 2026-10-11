@@ -10,6 +10,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.CodeForgeApp
 import com.example.data.agent.AgentEvent
+import com.example.data.agent.AgentMode
 import com.example.data.agent.ApprovalRequest
 import com.example.data.agent.RunRequest
 import com.example.data.api.LlmDocument
@@ -54,7 +55,10 @@ data class ChatUiState(
     val pendingAttachments: List<AttachmentItem> = emptyList(),
     val warningSecretFile: String? = null,
     val approval: ApprovalRequest? = null,
-    val resumeAvailable: Boolean = false
+    /** CHAT = talk and look at code (read-only), BUILD = the agent may edit files. */
+    val mode: AgentMode = AgentMode.CHAT,
+    /** True from pressing send until the agent starts (importing a ZIP, saving the message...). */
+    val isPreparing: Boolean = false
 )
 
 data class AttachmentItem(
@@ -83,7 +87,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val reasoningBuf = StringBuilder()
     private var flushJob: Job? = null
 
-    private val _uiState = MutableStateFlow(ChatUiState(resumeAvailable = settings.hasPendingAgentRun))
+    private val _uiState = MutableStateFlow(
+        ChatUiState(mode = if (settings.agentMode == "BUILD") AgentMode.BUILD else AgentMode.CHAT)
+    )
     val uiState: StateFlow<ChatUiState> = _uiState.asStateFlow()
 
     /** Only changes when the project changes (not for every streamed token). */
@@ -110,13 +116,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _preferredProviderId = MutableStateFlow(settings.preferredProviderId)
     val preferredProviderId: StateFlow<String?> = _preferredProviderId.asStateFlow()
-
-    fun syncPreferredProvider() {
-        val current = settings.preferredProviderId
-        if (_preferredProviderId.value != current) {
-            _preferredProviderId.value = current
-        }
-    }
 
     val messages: StateFlow<List<MessageEntity>> = activeConversationId
         .flatMapLatest { id -> if (id == null) flowOf(emptyList()) else chatRepo.getMessages(id) }
@@ -185,14 +184,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     is AgentEvent.Finished -> {
                         streamBuf.setLength(0)
                         reasoningBuf.setLength(0)
-                        _uiState.update { it.copy(streamingContent = "", streamingReasoning = "", resumeAvailable = settings.hasPendingAgentRun) }
+                        _uiState.update { it.copy(streamingContent = "", streamingReasoning = "") }
                         refreshTick.update { it + 1 }
                     }
                     is AgentEvent.Error -> {
                         streamBuf.setLength(0)
                         reasoningBuf.setLength(0)
                         _uiState.update {
-                            it.copy(streamingContent = "", streamingReasoning = "", failoverNotice = "⚠️ ${event.error.take(200)}", resumeAvailable = settings.hasPendingAgentRun)
+                            it.copy(streamingContent = "", streamingReasoning = "", failoverNotice = "⚠️ ${event.error.take(200)}")
                         }
                         refreshTick.update { it + 1 }
                     }
@@ -219,31 +218,59 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 .collect { conv -> _uiState.update { it.copy(activeConversation = conv) } }
         }
 
-        // Project selection (restores the last used project; no race with an initial empty list)
+        // Project selection. A new app start (and every new chat) is CLEAN: it starts in the hidden
+        // "no project" placeholder, so it never inherits the ZIP of an old chat.
         viewModelScope.launch {
             projectRepo.allProjects.collect { projects ->
                 val current = _uiState.value.activeProject
-                if (projects.isEmpty()) {
-                    if (!creatingDefaultProject) {
-                        creatingDefaultProject = true
-                        try {
-                            val p = projectRepo.createProject("CodeForge App", "Android Starter")
-                            selectProject(p)
-                        } finally {
-                            creatingDefaultProject = false
-                        }
-                    }
-                } else if (current == null) {
-                    // App start: open the last project with a NEW empty chat. Old chats live in the side drawer.
-                    val project = projects.firstOrNull { it.id == settings.activeProjectId } ?: projects.first()
-                    switchProject(project, null, startFresh = true)
-                } else {
+                if (current == null) {
+                    val scratch = projectRepo.getOrCreateScratchProject()
+                    switchProject(scratch, null, startFresh = true)
+                } else if (current.id != com.example.data.repository.ProjectRepository.SCRATCH_ID) {
                     val fresh = projects.firstOrNull { it.id == current.id }
-                    if (fresh == null) selectProject(projects.first())
-                    else if (fresh != current) _uiState.update { it.copy(activeProject = fresh) }
+                    if (fresh == null) {
+                        // the open project was deleted
+                        val scratch = projectRepo.getOrCreateScratchProject()
+                        switchProject(scratch, null, startFresh = true)
+                    } else if (fresh != current) {
+                        _uiState.update { it.copy(activeProject = fresh) }
+                    }
                 }
             }
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Mode and project attached to the chat
+    // ---------------------------------------------------------------------------------------
+
+    val projectsList: StateFlow<List<ProjectEntity>> = projectRepo.allProjects
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    fun setMode(mode: AgentMode) {
+        settings.agentMode = mode.name
+        _uiState.update { it.copy(mode = mode) }
+    }
+
+    /** Opens an existing project inside the CURRENT chat (no need to upload the ZIP again). */
+    fun attachProjectToChat(project: ProjectEntity) {
+        if (agentEngine.isRunning.value) {
+            _uiState.update { it.copy(failoverNotice = "The agent is working. Press Stop first.") }
+            return
+        }
+        viewModelScope.launch {
+            val conv = _uiState.value.activeConversation
+            if (conv != null) {
+                chatRepo.moveConversationToProject(conv.id, project.id)
+                switchProject(project, conv.id)
+            } else {
+                switchProject(project, null)
+            }
+        }
+    }
+
+    fun detachProjectFromChat() {
+        viewModelScope.launch { attachProjectToChat(projectRepo.getOrCreateScratchProject()) }
     }
 
     // ---------------------------------------------------------------------------------------
@@ -386,15 +413,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun newConversation() {
-        val proj = _uiState.value.activeProject ?: return
         if (agentEngine.isRunning.value) return
         viewModelScope.launch {
+            val scratch = projectRepo.getOrCreateScratchProject()
             val currentId = activeConversationId.value
             val currentEmpty = currentId != null &&
                 app.database.messageDao().getMessagesForConversationOnce(currentId).isEmpty()
-            if (currentEmpty) return@launch // already looking at an empty chat
-            val conv = chatRepo.createConversation(proj.id, "New Chat")
-            setActiveConversation(conv.id)
+            if (currentEmpty && _uiState.value.activeProject?.id == scratch.id) return@launch // already a clean empty chat
+            val conv = chatRepo.createConversation(scratch.id, "New Chat")
+            switchProject(scratch, conv.id)
         }
     }
 
@@ -618,22 +645,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // ---------------------------------------------------------------------------------------
 
     fun sendMessage(promptText: String) {
-        val resumeWords = promptText.trim().lowercase()
-        val wantsResume = resumeWords == "continue" || resumeWords == "resume" ||
-            resumeWords == "continue karo" || resumeWords == "resume karo" ||
-            resumeWords.contains("wahi se continue") || resumeWords.contains("jahan ruka tha")
-        if (wantsResume && settings.hasPendingAgentRun) {
-            if (agentEngine.resumePending()) {
-                _uiState.update { it.copy(resumeAvailable = false, failoverNotice = null, currentAgentStatus = "Resuming…") }
-            } else {
-                _uiState.update { it.copy(resumeAvailable = false, failoverNotice = "No resumable work is available.") }
-            }
-            return
-        }
         val proj = _uiState.value.activeProject ?: return
         val conv = _uiState.value.activeConversation ?: return
         val attachments = _uiState.value.pendingAttachments
         if (promptText.isBlank() && attachments.isEmpty()) return
+        if (_uiState.value.isPreparing) return
         if (agentEngine.isRunning.value) {
             _uiState.update { it.copy(failoverNotice = "The agent is still working. Wait for it or press Stop.") }
             return
@@ -665,16 +681,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
         val docs = pdfs.map { LlmDocument(it.name, "application/pdf", it.pdfBase64 ?: "") }
 
+        val mode = _uiState.value.mode
         _uiState.update {
             it.copy(
                 pendingAttachments = emptyList(),
                 streamingContent = "",
                 streamingReasoning = "",
                 failoverNotice = null,
-                currentAgentStatus = "Starting…"
+                currentAgentStatus = "Thinking…",
+                isPreparing = true
             )
         }
         viewModelScope.launch {
+            // 1) the message shows up immediately with a "sending" circle
+            val sent = chatRepo.addUserMessage(conv.id, display, status = "SENDING")
             var projectId = proj.id
             if (zip != null) {
                 _uiState.update { it.copy(currentAgentStatus = "Importing ${zip.name}…") }
@@ -683,13 +703,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 } catch (e: kotlinx.coroutines.CancellationException) {
                     throw e
                 } catch (e: Throwable) {
-                    _uiState.update { it.copy(failoverNotice = "⚠️ ZIP import failed: ${e.message ?: e.javaClass.simpleName}".take(220)) }
+                    chatRepo.setMessageStatus(sent.id, "ERROR")
+                    _uiState.update {
+                        it.copy(isPreparing = false, failoverNotice = "⚠️ ZIP import failed: ${e.message ?: e.javaClass.simpleName}".take(220))
+                    }
                     return@launch
                 }
             }
-            chatRepo.addUserMessage(conv.id, display)
-            agentEngine.start(RunRequest(projectId, conv.id, prompt, images, docs))
-            _uiState.update { it.copy(resumeAvailable = false) }
+            // 2) delivered: the circle disappears and the agent starts
+            chatRepo.setMessageStatus(sent.id, "SUCCESS")
+            agentEngine.start(RunRequest(projectId, conv.id, prompt, images, docs, mode = mode))
+            _uiState.update { it.copy(isPreparing = false) }
         }
     }
 
@@ -716,6 +740,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun resolveApproval(approved: Boolean) {
         agentEngine.resolveApproval(approved)
+    }
+
+    /** A message that could not be delivered: remove it and send the text again. */
+    fun retryFailedMessage(message: MessageEntity) {
+        viewModelScope.launch {
+            val text = message.content.lines().filter { !it.startsWith("📎") }.joinToString("\n").trim()
+            app.database.messageDao().deleteMessage(message.id)
+            if (text.isNotEmpty()) {
+                sendMessage(text)
+            } else {
+                _uiState.update { it.copy(failoverNotice = "Attach the file again and press send.") }
+            }
+        }
     }
 
     fun retryLastMessage() {

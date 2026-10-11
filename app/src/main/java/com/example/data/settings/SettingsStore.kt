@@ -26,8 +26,26 @@ class SettingsStore(context: Context) {
         set(value) { prefs.edit().putBoolean("safe_mode", value).apply() }
 
     var language: String
-        get() = prefs.getString("language", "English") ?: "English"
+        get() {
+            // Old versions saved "English" just because the Settings screen was opened: treat that as Auto once.
+            if (!prefs.getBoolean("language_v2", false)) {
+                prefs.edit().putBoolean("language_v2", true).apply()
+                if ((prefs.getString("language", "English") ?: "English") == "English") {
+                    prefs.edit().putString("language", "Auto").apply()
+                }
+            }
+            return prefs.getString("language", "Auto") ?: "Auto"
+        }
         set(value) { prefs.edit().putString("language", value).apply() }
+
+    /** "CHAT" (talk, read-only) or "BUILD" (agent may edit files). New installs start in Chat. */
+    var agentMode: String
+        get() = prefs.getString("agent_mode", "CHAT") ?: "CHAT"
+        set(value) { prefs.edit().putString("agent_mode", value).apply() }
+
+    var importFreeModelsOnly: Boolean
+        get() = prefs.getBoolean("import_free_only", false)
+        set(value) { prefs.edit().putBoolean("import_free_only", value).apply() }
 
     var maxSteps: Int
         get() = prefs.getInt("max_steps", 25)
@@ -162,18 +180,6 @@ class SettingsStore(context: Context) {
         get() = prefs.getString("active_conversation_id", null)
         set(value) { prefs.edit().putString("active_conversation_id", value).apply() }
 
-    /** Small persistent checkpoint used to resume an interrupted agent run. */
-    var pendingAgentRun: String?
-        get() = prefs.getString("pending_agent_run", null)
-        set(value) {
-            prefs.edit().apply {
-                if (value == null) remove("pending_agent_run") else putString("pending_agent_run", value)
-            }.apply()
-        }
-
-    val hasPendingAgentRun: Boolean
-        get() = !pendingAgentRun.isNullOrBlank()
-
     val githubConfigured: Boolean
         get() = githubToken.isNotBlank()
 
@@ -189,6 +195,6 @@ class SettingsStore(context: Context) {
 
         const val DEFAULT_GLOBAL_PROMPT =
             "Be concise, write production-grade Kotlin, follow modern Android patterns, and double-check imports."
-        val LANGUAGES = listOf("English", "Hinglish", "Hindi", "Spanish", "French", "German")
+        val LANGUAGES = listOf("Auto", "English", "Hinglish", "Hindi", "Spanish", "French", "German")
     }
 }

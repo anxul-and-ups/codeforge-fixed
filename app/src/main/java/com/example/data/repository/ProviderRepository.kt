@@ -207,6 +207,10 @@ class ProviderRepository(
         return llmClient.fetchModels(provider)
     }
 
+    suspend fun fetchModelsDetailed(provider: ProviderConfigEntity, freeOnly: Boolean): com.example.data.api.ModelFetch {
+        return llmClient.fetchModelsDetailed(provider, freeOnly)
+    }
+
     suspend fun reorderProviders(orderedIds: List<String>) {
         orderedIds.forEachIndexed { index, id ->
             val p = providerDao.getProviderById(id)
