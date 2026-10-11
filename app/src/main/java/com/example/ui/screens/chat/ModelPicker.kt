@@ -18,8 +18,14 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
@@ -69,14 +75,19 @@ fun ModelPickerDialog(
     onAddProvider: () -> Unit,
     onDismiss: () -> Unit
 ) {
-    val ready = providers.filter { isProviderReady(it) }
+    // The chat picker follows the provider selected in Settings/chat, rather than
+    // mixing model lists from every configured provider.
+    var searchQuery by remember { mutableStateOf("") }
+    val selectedProvider = providers.firstOrNull { it.id == activeProviderId && isProviderReady(it) }
+    val ready = listOfNotNull(selectedProvider)
     val notReady = providers.filter { !isProviderReady(it) }
+    val query = searchQuery.trim()
 
     val rows = ArrayList<PickerRow>()
     for (p in ready) {
         rows.add(PickerRow.Header(p))
-        for (m in providerModels(p)) {
-            rows.add(PickerRow.Model(p, m, p.id == activeProviderId && m == p.selectedModel))
+        for (m in providerModels(p).filter { query.isEmpty() || it.contains(query, ignoreCase = true) }) {
+            rows.add(PickerRow.Model(p, m, m == p.selectedModel))
         }
     }
     if (notReady.isNotEmpty()) {
@@ -105,7 +116,23 @@ fun ModelPickerDialog(
                     color = AppColors.textSecondary,
                     modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 2.dp, bottom = 8.dp)
                 )
-                LazyColumn(modifier = Modifier.heightIn(max = 460.dp)) {
+                OutlinedTextField(
+                    value = searchQuery,
+                    onValueChange = { searchQuery = it },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                    singleLine = true,
+                    label = { Text("Search models") },
+                    placeholder = { Text("Search selected provider models") },
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = AppColors.textPrimary,
+                        unfocusedTextColor = AppColors.textPrimary,
+                        focusedBorderColor = AppColors.accent,
+                        cursorColor = AppColors.accent
+                    )
+                )
+                LazyColumn(modifier = Modifier.heightIn(max = 400.dp)) {
                     items(rows) { row ->
                         when (row) {
                             is PickerRow.Header -> Row(
