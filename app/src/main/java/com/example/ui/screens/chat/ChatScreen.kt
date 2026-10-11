@@ -723,6 +723,7 @@ private fun ChatMessage(
 
         if (!live) {
             val model = message.modelUsed
+            val provider = message.providerUsed
             Row(verticalAlignment = Alignment.CenterVertically) {
                 if (message.content.isNotBlank()) {
                     Text(
@@ -735,11 +736,20 @@ private fun ChatMessage(
                             .padding(vertical = 2.dp, horizontal = 2.dp)
                     )
                 }
-                if (!model.isNullOrBlank()) {
+                if (!model.isNullOrBlank() || !provider.isNullOrBlank()) {
                     Spacer(modifier = Modifier.width(10.dp))
-                    ProviderIcon(providerId = null, model = model, size = 14.dp)
+                    ProviderIcon(providerId = provider, model = model.orEmpty(), size = 14.dp)
+                    val attribution = listOfNotNull(
+                        provider?.takeIf { it.isNotBlank() }?.let { id ->
+                            id.replace('-', ' ').replace('_', ' ')
+                                .split(' ').joinToString(" ") { part ->
+                                    part.replaceFirstChar { ch -> ch.uppercase() }
+                                }
+                        },
+                        model?.takeIf { it.isNotBlank() }
+                    ).distinct().joinToString(" · ")
                     Text(
-                        text = "  $model",
+                        text = "  $attribution",
                         fontSize = 11.sp,
                         fontFamily = FontFamily.Monospace,
                         color = AppColors.textMuted,

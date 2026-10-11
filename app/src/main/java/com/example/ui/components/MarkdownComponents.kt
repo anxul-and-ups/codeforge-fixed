@@ -154,11 +154,16 @@ fun FormattedRichText(
                     }
                 }
 
-                // Regular character
+                // Keep ordinary text in contiguous runs. Appending one UTF-16
+                // character at a time splits Devanagari combining marks (matras/virama)
+                // into separate Compose spans, which can render as dotted circles.
+                val nextCode = text.indexOf('`', i).let { if (it < 0) len else it }
+                val nextBold = text.indexOf("**", i).let { if (it < 0) len else it }
+                val nextMarker = minOf(nextCode, nextBold).coerceAtLeast(i + 1)
                 withStyle(SpanStyle(color = defaultColor, fontSize = 14.sp)) {
-                    append(text[i].toString())
+                    append(text.substring(i, nextMarker))
                 }
-                i++
+                i = nextMarker
             }
         }
     }
