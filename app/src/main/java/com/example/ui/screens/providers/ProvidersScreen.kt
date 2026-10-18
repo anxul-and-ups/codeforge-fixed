@@ -587,6 +587,12 @@ fun AddProviderDialog(
     repo: ProviderRepository,
     onDismiss: () -> Unit
 ) {
+    var name by remember { androidx.compose.runtime.mutableStateOf("") }
+    var url by remember { androidx.compose.runtime.mutableStateOf("") }
+    var key by remember { androidx.compose.runtime.mutableStateOf("") }
+    var model by remember { androidx.compose.runtime.mutableStateOf("") }
+    var format by remember { androidx.compose.runtime.mutableStateOf("openai") }
+    var models by remember { androidx.compose.runtime.mutableStateOf(listOf<String>()) }
     var name by remember { mutableStateOf("") }
     var baseUrl by remember { mutableStateOf("") }
     var apiKey by remember { mutableStateOf("") }
