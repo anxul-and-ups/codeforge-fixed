@@ -435,6 +435,12 @@ private fun ProviderEditor(
                         }
                     }
                 }
+                var showAdvanced by remember { androidx.compose.runtime.mutableStateOf(false) }
+                var headers by remember { androidx.compose.runtime.mutableStateOf("") }
+                var vision by remember { androidx.compose.runtime.mutableStateOf(false) }
+                var tools by remember { androidx.compose.runtime.mutableStateOf(false) }
+                var error by remember { androidx.compose.runtime.mutableStateOf<String?>(null) }
+                var saving by remember { androidx.compose.runtime.mutableStateOf(false) }
                 TextButton(onClick = { showAdvanced = !showAdvanced }) {
                     Text(if (showAdvanced) "Hide advanced" else "Advanced options", fontSize = 13.sp, color = AppColors.textSecondary)
                 }
