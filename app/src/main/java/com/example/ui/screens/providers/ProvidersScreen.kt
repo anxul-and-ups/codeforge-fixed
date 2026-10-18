@@ -371,7 +371,8 @@ private fun ProviderEditor(
     fun draft(): ProviderConfigEntity = provider.copy(
         baseUrl = urlText.trim().trimEnd('/'),
         selectedModel = modelText.trim(),
-        encryptedApiKey = KeyStoreManager.encrypt(keyText.trim())
+        encryptedApiKey = KeyStoreManager.encrypt(keyText.trim()),
+        isEnabled = enabled
     )
 
     Dialog(
@@ -439,7 +440,7 @@ private fun ProviderEditor(
                 var headers by remember { androidx.compose.runtime.mutableStateOf("") }
                 var vision by remember { androidx.compose.runtime.mutableStateOf(false) }
                 var tools by remember { androidx.compose.runtime.mutableStateOf(false) }
-                var error by remember { androidx.compose.runtime.mutableStateOf<String?>(null) }
+                var errorMessage by remember { androidx.compose.runtime.mutableStateOf<String?>(null) }
                 var saving by remember { androidx.compose.runtime.mutableStateOf(false) }
                 TextButton(onClick = { showAdvanced = !showAdvanced }) {
                     Text(if (showAdvanced) "Hide advanced" else "Advanced options", fontSize = 13.sp, color = AppColors.textSecondary)
@@ -462,8 +463,8 @@ private fun ProviderEditor(
                     }
                 }
 
-                if (error != null) {
-                    Text(error ?: "", fontSize = 12.sp, color = AppColors.error)
+                if (errorMessage != null) {
+                    Text(errorMessage ?: "", fontSize = 12.sp, color = AppColors.error)
                 }
 
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
@@ -472,7 +473,7 @@ private fun ProviderEditor(
                     Button(
                         enabled = !saving,
                         onClick = {
-                            val u = url.trim()
+                            val u = urlText.trim()
                             val headersOk = headers.isBlank() || try {
                                 JSONObject(headers)
                                 true
@@ -480,34 +481,27 @@ private fun ProviderEditor(
                                 false
                             }
                             when {
-                                name.isBlank() -> error = "Enter a name."
+                                u.isBlank() -> errorMessage = "Enter the full base URL, for example https://api.example.com/v1"
                                 !(u.startsWith("http://") || u.startsWith("https://")) || u.length < 10 ->
-                                    error = "Enter the full base URL, for example https://api.example.com/v1"
-                                key.isBlank() -> error = "Enter the API key."
-                                model.isBlank() -> error = "Enter a model ID, or load the model list."
-                                !headersOk -> error = "Custom headers must be valid JSON."
+                                    errorMessage = "Enter the full base URL, for example https://api.example.com/v1"
+                                keyText.isBlank() -> errorMessage = "Enter the API key."
+                                modelText.isBlank() -> errorMessage = "Enter a model ID, or load the model list."
+                                !headersOk -> errorMessage = "Custom headers must be valid JSON."
                                 else -> {
-                                    error = null
+                                    errorMessage = null
                                     saving = true
                                     scope.launch {
                                         try {
-                                            repo.addCustomProvider(
-                                                name = name.trim(),
-                                                baseUrl = u,
-                                                apiFormat = format,
-                                                rawApiKey = key.trim(),
-                                                models = models.ifEmpty { listOf(model.trim()) },
-                                                selectedModel = model.trim(),
-                                                customHeadersJson = headers.ifBlank { null },
-                                                supportsVision = vision,
-                                                supportsTools = tools
-                                            )
-                                            Toast.makeText(context, "Provider added", Toast.LENGTH_SHORT).show()
+                                            // Update the existing provider
+                                            repo.updateProvider(draft())
+                                            // Persist advanced fields if needed (custom headers / vision/tools)
+                                            repo.updateProvider(draft().copy(customHeadersJson = headers.ifBlank { null }, supportsVision = vision, supportsTools = tools))
+                                            Toast.makeText(context, "Provider saved", Toast.LENGTH_SHORT).show()
                                             onDismiss()
                                         } catch (e: kotlinx.coroutines.CancellationException) {
                                             throw e
                                         } catch (e: Exception) {
-                                            error = "Could not save: ${e.message ?: e.javaClass.simpleName}"
+                                            errorMessage = "Could not save: ${e.message ?: e.javaClass.simpleName}"
                                         } finally {
                                             saving = false
                                         }
@@ -519,7 +513,7 @@ private fun ProviderEditor(
                             containerColor = AppColors.accent,
                             contentColor = AppColors.onAccent
                         )
-                    ) { Text("Add provider") }
+                    ) { Text("Save") }
                 }
             }
         }
