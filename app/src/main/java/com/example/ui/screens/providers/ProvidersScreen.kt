@@ -580,3 +580,35 @@ private fun ApiStatusLine(st: ApiStatus) {
         }
     }
 }
+
+
+@Composable
+fun AddProviderDialog(
+    repo: ProviderRepository,
+    onDismiss: () -> Unit
+) {
+    var name by remember { mutableStateOf("") }
+    var baseUrl by remember { mutableStateOf("") }
+    var apiKey by remember { mutableStateOf("") }
+    var modelText by remember { mutableStateOf("") }
+    
+    androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
+        androidx.compose.material3.Card {
+            Column(modifier = androidx.compose.ui.Modifier.padding(16.dp)) {
+                Text("Add Provider", fontWeight = androidx.compose.ui.text.font.FontWeight.Bold)
+                Spacer(modifier = androidx.compose.ui.Modifier.height(8.dp))
+                OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Name") })
+                OutlinedTextField(value = baseUrl, onValueChange = { baseUrl = it }, label = { Text("Base URL") })
+                OutlinedTextField(value = apiKey, onValueChange = { apiKey = it }, label = { Text("API Key") })
+                OutlinedTextField(value = modelText, onValueChange = { modelText = it }, label = { Text("Model") })
+                Spacer(modifier = androidx.compose.ui.Modifier.height(16.dp))
+                androidx.compose.material3.Button(onClick = {
+                    // Add logic here
+                    onDismiss()
+                }) {
+                    Text("Save")
+                }
+            }
+        }
+    }
+}
