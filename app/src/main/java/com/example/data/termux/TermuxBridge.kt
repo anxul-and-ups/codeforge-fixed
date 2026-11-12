@@ -144,8 +144,8 @@ class TermuxBridge(
 
     /** Fast HTTP client for 5-second `/health` heartbeat probes. */
     private val healthHttp = OkHttpClient.Builder()
-        .connectTimeout(2500, TimeUnit.MILLISECONDS)
-        .readTimeout(2500, TimeUnit.MILLISECONDS)
+        .connectTimeout(4000, TimeUnit.MILLISECONDS)
+        .readTimeout(4000, TimeUnit.MILLISECONDS)
         .writeTimeout(2500, TimeUnit.MILLISECONDS)
         .build()
 
@@ -270,7 +270,7 @@ class TermuxBridge(
         heartbeatJob = scope.launch(Dispatchers.IO) {
             while (isActive) {
                 checkEngineHealthOnce()
-                delay(5_000L)
+                delay(10_000L)
             }
         }
     }
@@ -734,7 +734,7 @@ class TermuxBridge(
 
     private fun buildForgeEnginePythonScript(): String = """
 import os, sys, json, time, shutil, subprocess, base64
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOME_DIR = "/data/data/com.termux/files/home"
 WORKSPACE = os.path.expanduser("~/forge")
@@ -820,13 +820,19 @@ class ForgeHandler(BaseHTTPRequestHandler):
             cwd = resolve_cwd(data.get("cwd", HOME_DIR))
             timeout = int(data.get("timeout", 120))
             try:
+                env = os.environ.copy()
+                env["PATH"] = "/data/data/com.termux/files/usr/bin:" + env.get("PATH", "")
+                env["HOME"] = HOME_DIR
                 p = subprocess.run(
                     cmd,
                     shell=True,
                     executable="/data/data/com.termux/files/usr/bin/bash" if os.path.exists("/data/data/com.termux/files/usr/bin/bash") else None,
                     cwd=cwd,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True,
+                    errors="replace",
                     timeout=timeout
                 )
                 self._send(200, {
@@ -856,6 +862,9 @@ if __name__ == "__main__":
     port = 47831
     if "--port" in sys.argv:
         port = int(sys.argv[sys.argv.index("--port") + 1])
-    HTTPServer(("127.0.0.1", port), ForgeHandler).serve_forever()
+    class ReusableThreadingServer(ThreadingHTTPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+    ReusableThreadingServer(("127.0.0.1", port), ForgeHandler).serve_forever()
     """.trimIndent()
 }

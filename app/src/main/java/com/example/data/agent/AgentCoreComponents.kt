@@ -381,7 +381,7 @@ class LoopGuard {
 
         // Check 1: Same call repeated 3 times with same result
         val identicalCount = history.takeLast(8).count { it.normalizedArgs == sig && it.resultHash == rHash }
-        if (identicalCount >= 3) {
+        if (identicalCount >= 2) {
             forbiddenSignatures.add(sig)
             return GuardDecision(
                 triggered = true,
@@ -431,11 +431,11 @@ class LoopGuard {
         }
 
         // Check 4: No progress for 8 steps
-        if (stepsWithoutProgress >= 8) {
+        if (stepsWithoutProgress >= 5) {
             return GuardDecision(
                 triggered = true,
                 shouldStop = true,
-                activityNote = "Paused after 8 steps without new progress",
+                activityNote = "Paused after 5 steps without new progress",
                 systemInjection = "[LOOP GUARD]: No new files changed or new information discovered in 8 steps. Summarize where you got to and ask the user."
             )
         }

@@ -727,6 +727,7 @@ PROGRESS NOTES (shown in the Activity Timeline, ALWAYS in English)
 
 RULES
 - Default working directory in Termux is `/data/data/com.termux/files/home`.
+- For simple checks (like counting files, checking folders, reading a file, or running a command), run ONE single command, read its STDOUT, and immediately give the final answer to the user. NEVER repeat or re-run a command that already succeeded.
 - Never read or print secrets (.env, keystores, google-services.json).
 - If a tool returns an HTTP Bridge error (401, 404, ECONNREFUSED, Timeout), stop immediately and report it clearly to the user. Never repeat the exact same failing call.
             """.trimIndent()
@@ -863,7 +864,7 @@ RULES
 
         val systemPrompt = buildSystemPrompt(project.id, project.name, project.systemPrompt, req.mode, hasProject)
         val activeTools = when {
-            req.mode == AgentMode.CHAT -> if (hasProject) toolsList.filter { it.name in READ_ONLY_TOOLS } else toolsList.filter { it.name == "ask_user" }
+            req.mode == AgentMode.CHAT -> toolsList.filter { it.name in READ_ONLY_TOOLS }
             !hasProject -> toolsList.filter { it.name in setOf("git_clone", "install_repo_tool", "run_installed_tool", "run_command", "ask_user", "plan", "finish") }
             else -> toolsList
         }
@@ -1034,7 +1035,7 @@ RULES
                             argsJson = call.argumentsJson,
                             isError = false,
                             fileChanged = false,
-                            newEvidence = call.name in READ_ONLY_TOOLS
+                            newEvidence = false
                         )
                         if (preDecision is LoopGuardDecision.BlockRepeatCall) {
                             toolIndex++
