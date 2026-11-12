@@ -422,6 +422,38 @@ fun ChatScreen(
                                 }
                             }
 
+                            // Live Termux HTTP Bridge Connection Pill (Polled every 5s via GET 127.0.0.1:47831/health)
+                            val isConnected = engineHealth.engineRunning
+                            val statusColor = if (isConnected) Color(0xFF3FB950) else Color(0xFFF85149)
+                            Surface(
+                                shape = RoundedCornerShape(10.dp),
+                                color = statusColor.copy(alpha = 0.14f),
+                                modifier = Modifier
+                                    .border(1.dp, statusColor.copy(alpha = 0.45f), RoundedCornerShape(10.dp))
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .clickable { showTerminalSheet = true }
+                                    .testTag("termux_connection_pill")
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(7.dp)
+                                            .clip(CircleShape)
+                                            .background(statusColor)
+                                    )
+                                    Spacer(modifier = Modifier.width(5.dp))
+                                    Text(
+                                        text = if (isConnected) "Connected" else "Disconnected",
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = statusColor
+                                    )
+                                }
+                            }
+
                             // Working Files Pill Badge
                             if (workingFiles.isNotEmpty()) {
                                 Surface(
@@ -477,7 +509,7 @@ fun ChatScreen(
                         Icon(
                             Icons.Default.Terminal,
                             contentDescription = "Open Terminal Drawer",
-                            tint = if (engineHealth.engineRunning) AppColors.ok else AppColors.textSecondary,
+                            tint = if (engineHealth.engineRunning) Color(0xFF3FB950) else Color(0xFFF85149),
                             modifier = Modifier.size(19.dp)
                         )
                     }
@@ -498,6 +530,57 @@ fun ChatScreen(
             }
 
             Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(AppColors.border))
+
+            // ---------------- Live Disconnected Alert Banner (Bug 3 Fix) ----------------
+            if (!engineHealth.engineRunning) {
+                Surface(
+                    color = Color(0xFF2D1215),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .border(0.5.dp, Color(0xFFF85149).copy(alpha = 0.55f))
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            Icons.Default.Warning,
+                            contentDescription = "Termux Disconnected",
+                            tint = Color(0xFFF85149),
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Disconnected · Termux Bridge (127.0.0.1:47831) Offline",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = Color(0xFFFFB4AB)
+                            )
+                            Text(
+                                text = "Start the Python HTTP bridge in Termux to enable chat & command execution.",
+                                fontSize = 11.sp,
+                                color = Color(0xFFFFB4AB).copy(alpha = 0.85f)
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(6.dp))
+                        TextButton(
+                            onClick = { viewModel.repairEngine() },
+                            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                        ) {
+                            Text("Retry", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = Color.White)
+                        }
+                        TextButton(
+                            onClick = { showTerminalSheet = true },
+                            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                        ) {
+                            Text("Commands", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF58A6FF))
+                        }
+                    }
+                }
+            }
 
             // ---------------- Failover / Status Notice banner ----------------
             val notice = uiState.failoverNotice
@@ -731,10 +814,15 @@ fun ChatScreen(
                                 inputText = it
                                 viewModel.saveDraftForCurrentChat(it)
                             },
+                            enabled = engineHealth.engineRunning,
                             placeholder = {
                                 Text(
-                                    text = "Type a message...",
-                                    fontSize = 15.sp
+                                    text = if (engineHealth.engineRunning) {
+                                        "Type a message..."
+                                    } else {
+                                        "Disconnected — Start Termux bridge on 127.0.0.1:47831..."
+                                    },
+                                    fontSize = 14.sp
                                 )
                             },
                             maxLines = 5,
@@ -748,15 +836,19 @@ fun ChatScreen(
                                 cursorColor = AppColors.accent,
                                 focusedTextColor = AppColors.textPrimary,
                                 unfocusedTextColor = AppColors.textPrimary,
+                                disabledTextColor = AppColors.textMuted,
                                 focusedPlaceholderColor = AppColors.textMuted,
-                                unfocusedPlaceholderColor = AppColors.textMuted
+                                unfocusedPlaceholderColor = AppColors.textMuted,
+                                disabledPlaceholderColor = Color(0xFFF85149).copy(alpha = 0.75f)
                             ),
                             modifier = Modifier
                                 .weight(1f)
                                 .testTag("chat_input_field")
                         )
 
-                        val canSend = (inputText.isNotBlank() || uiState.pendingAttachments.isNotEmpty()) && !uiState.isPreparing
+                        val canSend = engineHealth.engineRunning &&
+                            (inputText.isNotBlank() || uiState.pendingAttachments.isNotEmpty()) &&
+                            !uiState.isPreparing
                         if (uiState.isAgentRunning) {
                             // Stop Button: Dark circle with Red Rounded Square inside (matches video at 0:13)
                             Box(
@@ -1302,9 +1394,43 @@ private fun ChatMessage(
                 ThinkingBlockView(reasoning = reasoning)
             }
 
-            val text = if (live) (if (liveContent.length > 120) liveContent else "") else cleanAssistantContent
+            val text = if (live) liveContent else cleanAssistantContent
+            val isErrorBubble = !live && message.status == "ERROR" && !isInterrupted
             if (text.isNotBlank()) {
-                MarkdownContentView(content = text, textColor = AppColors.textPrimary)
+                if (isErrorBubble) {
+                    Surface(
+                        shape = RoundedCornerShape(14.dp),
+                        color = Color(0xFF2D1215),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .border(1.dp, Color(0xFFF85149), RoundedCornerShape(14.dp))
+                            .testTag("error_message_bubble")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.Top
+                        ) {
+                            Icon(
+                                Icons.Default.Warning,
+                                contentDescription = "Error",
+                                tint = Color(0xFFF85149),
+                                modifier = Modifier
+                                    .size(18.dp)
+                                    .padding(top = 2.dp)
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Text(
+                                text = text,
+                                fontSize = 14.sp,
+                                lineHeight = 20.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = Color(0xFFFFB4AB)
+                            )
+                        }
+                    }
+                } else {
+                    MarkdownContentView(content = text, textColor = AppColors.textPrimary)
+                }
             }
 
             if (live) {

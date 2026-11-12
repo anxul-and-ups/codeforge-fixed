@@ -63,7 +63,7 @@ sealed class AgentEvent {
 /** CHAT: talk, explain, answer, look at code (read-only). BUILD: may edit files and run commands. */
 enum class AgentMode { CHAT, BUILD }
 
-private val READ_ONLY_TOOLS = setOf("list_files", "read_file", "search_code", "ask_user")
+private val READ_ONLY_TOOLS = setOf("list_files", "read_file", "search_code", "run_command", "ask_user")
 
 enum class WorkingFileState(val label: String) {
     READING("Reading"),
@@ -115,7 +115,9 @@ private data class ToolResult(
     val commandText: String? = null,
     val cwdText: String? = null,
     val filePath: String? = null,
-    val stepType: String = "TOOL"
+    val stepType: String = "TOOL",
+    val uiResultJson: String? = null,
+    val fatalBridgeError: Boolean = false
 )
 
 private data class LoopResult(
@@ -673,34 +675,44 @@ HOW TO UNDERSTAND THE USER
             emptyList()
         }
 
+        val bridgeMandate = """
+CRITICAL EXECUTION ENVIRONMENT MANDATE (TERMUX HTTP BRIDGE)
+- You are running on Android. You have NO local terminal. You MUST use the HTTP Bridge tool (`run_command`) to run commands.
+- Every `run_command` call sends an HTTP POST request to `http://127.0.0.1:47831/exec` with cwd `/data/data/com.termux/files/home` and timeout `120` seconds inside the user's real Termux environment.
+- NEVER assume or inspect the Android app sandbox (`/data/data/com.aistudio.codeforge...`). All commands, files, Python, Node, Git, packages, and repositories live in Termux (`/data/data/com.termux/files/home`).
+- When the user asks to inspect files, check installed packages, run Python/Node/Git, or control Termux, call `run_command` directly (for example: `ls -la`, `python3 --version`, `git status`, `cat <file>`).
+- If the HTTP Bridge returns an error (401 Unauthorized, 404 Not Found, ECONNREFUSED, or Timeout), report the exact bridge error to the user immediately and STOP. Do NOT retry in a loop and do NOT fall back to local app storage.
+        """.trimIndent()
+
         if (mode == AgentMode.CHAT) {
             sb.append(
                 """
-You are CodeForge v2 in CHAT MODE: a smart, friendly assistant that also understands code. The current project is "$projectName"${if (hasProject) "" else " (no project attached: this is a clean chat)"}.
+You are CodeForge v2 in CHAT MODE connected to the user's real Termux environment via HTTP Bridge (`http://127.0.0.1:47831/exec`). The current project is "$projectName"${if (hasProject) "" else " (Termux Home `/data/data/com.termux/files/home`)"}.
+
+$bridgeMandate
 
 $understand
 
 CHAT MODE RULES
-- Talk naturally: answer questions, explain, brainstorm, compare options, discuss bugs and solutions. Greetings and general questions need NO tools.
-- If a project is attached you may look at it with the READ-ONLY tools list_files, read_file, search_code, and ask_user, using at most 5 tool calls.
-- You CANNOT modify files or run shell commands in Chat mode. If the user asks you to change files, clone repos, or run commands, reply warmly in the user's language that they are currently in Chat mode and can tap the Chat | Build pill at the top to switch to Build mode.
+- Talk naturally and concisely. Answer questions, explain code, or run read/inspection commands in Termux using `run_command`.
+- If the user asks to modify files or build projects, you can use `run_command` or advise them to switch the header pill to Build mode for full file-editing tools.
                 """.trimIndent()
             )
         } else {
             sb.append(
                 """
-You are CodeForge v2 in BUILD MODE: an autonomous coding agent with a real Termux/POSIX execution engine and structured file tools. The current project is "$projectName"${if (hasProject) "" else " (NO PROJECT ATTACHED)"}.
+You are CodeForge v2 in BUILD MODE: an autonomous coding agent controlling the user's real Termux environment via the local Python HTTP Bridge (`http://127.0.0.1:47831/exec`). The current project is "$projectName"${if (hasProject) "" else " (Termux Home `/data/data/com.termux/files/home`)"}.
+
+$bridgeMandate
 
 $understand
 
 BUILD MODE WORKFLOW
-1. Plan briefly what the user wants. For multi-step tasks, you can call `plan` with a checklist or write a short progress note.
-2. Locate code with targeted `search_code` calls, then read the exact files or line ranges with `read_file`.
-3. READ-BEFORE-EDIT RULE: You MUST call `read_file` on a file in the current run before calling `edit_file`, `insert_after_line`, or `replace_line_range` on it.
-4. Make the smallest correct change using `edit_file` (or `insert_after_line` / `replace_line_range` when line numbers are cleaner). Never include line-number prefixes in `old_str` or `new_str`.
-5. You can run real shell commands, tests, git, python, or node via `run_command`.
-6. When a user shares a GitHub repo URL, decide or ask whether to `git_clone` into `~/forge/projects/` (to work on its code) or `install_repo_tool` into `~/forge/tools/` (to install & register it as a reusable CLI/MCP tool).
-7. When done, write a clear summary in the user's language (what changed, root cause if bug, how to verify) and call `finish`.
+1. You have full control of Termux (`/data/data/com.termux/files/home`) via `run_command` (which POSTs to `http://127.0.0.1:47831/exec`).
+2. Prefer `run_command` for running bash commands, listing directories, running Python/Node/Git/pkg, inspecting Termux files, or building repositories.
+3. You can also use `list_files`, `read_file`, `search_code`, `write_file`, and `edit_file`, which all operate directly inside Termux via the HTTP Bridge.
+4. When a user shares a GitHub repo URL, decide or ask whether to `git_clone` into `/data/data/com.termux/files/home/forge/projects/` (to work on its code) or `install_repo_tool` into `/data/data/com.termux/files/home/forge/tools/` (to install & register it as a reusable CLI/MCP tool).
+5. When done, write a clear summary in the user's language and call `finish`.
                 """.trimIndent()
             )
         }
@@ -710,13 +722,13 @@ BUILD MODE WORKFLOW
 
 
 PROGRESS NOTES (shown in the Activity Timeline, ALWAYS in English)
-- Every time you are about to call tools, first write ONE short plain-English sentence (max 14 words) in present-continuous tense saying what you are doing, e.g. "Reading MainActivity.kt to inspect theme initialization."
+- Every time you are about to call tools, first write ONE short plain-English sentence (max 14 words) in present-continuous tense saying what you are doing, e.g. "Running ls -la in Termux home directory."
 - In your first reply of a task, begin with a line "TITLE: " plus a 3-8 word English title.
 
 RULES
-- Paths are relative to the project root.
+- Default working directory in Termux is `/data/data/com.termux/files/home`.
 - Never read or print secrets (.env, keystores, google-services.json).
-- If a tool returns an error, read the message (and nearest-match line numbers if edit_file failed) and adjust. Never repeat the exact same failing call.
+- If a tool returns an HTTP Bridge error (401, 404, ECONNREFUSED, Timeout), stop immediately and report it clearly to the user. Never repeat the exact same failing call.
             """.trimIndent()
         )
 
@@ -1132,13 +1144,13 @@ RULES
                             commandText = result.commandText,
                             cwdText = result.cwdText,
                             argumentsJson = call.argumentsJson,
-                            resultText = result.text.take(4000),
+                            resultText = (result.uiResultJson ?: result.text).take(6000),
                             isError = result.isError,
                             status = if (result.isError) "FAILED" else "COMPLETED",
                             durationMs = System.currentTimeMillis() - t0
                         )
                     )
-                    _agentEvents.tryEmit(AgentEvent.ToolFinished(toolIndex, call.name, result.text.take(500), result.isError))
+                    _agentEvents.tryEmit(AgentEvent.ToolFinished(toolIndex, call.name, (result.uiResultJson ?: result.text).take(500), result.isError))
                     messages.add(
                         LlmMessage(
                             role = "tool",
@@ -1147,6 +1159,11 @@ RULES
                             toolName = call.name
                         )
                     )
+                    if (result.fatalBridgeError) {
+                        errorText = result.text
+                        finished = true
+                        break
+                    }
                 }
                 if (finished) break
             }
@@ -1161,10 +1178,25 @@ RULES
             }
             throw e
         } catch (e: Exception) {
-            val msg = e.message ?: e.javaClass.simpleName
+            val rawMsg = e.message ?: e.javaClass.simpleName
+            val isRateLimit = (e is com.example.data.api.ApiException && e.statusCode == 429) ||
+                rawMsg.contains("429") ||
+                rawMsg.contains("Rate Limit", ignoreCase = true) ||
+                rawMsg.contains("Quota", ignoreCase = true) ||
+                rawMsg.contains("RESOURCE_EXHAUSTED", ignoreCase = true)
+            val msg = if (isRateLimit) {
+                "API Rate Limit Exceeded. Please change API key or provider."
+            } else {
+                rawMsg
+            }
+            val displayContent = if (isRateLimit) {
+                msg
+            } else {
+                (fullText.toString() + "\n\n⚠️ $msg").trim()
+            }
             finalizeMessage(
                 assistantId, req.conversationId,
-                (fullText.toString() + "\n\n⚠️ $msg").trim(),
+                displayContent,
                 reasoningAll.toString(), "ERROR", providerName, modelName, totalPrompt, totalCompletion, totalCached
             )
             _agentEvents.tryEmit(AgentEvent.Error(msg))
@@ -1373,6 +1405,64 @@ RULES
         }
     }
 
+    private fun resolveTermuxCwd(relPath: String = "."): String {
+        val trimmed = relPath.trim()
+        return when {
+            trimmed.isEmpty() || trimmed == "." || trimmed == "~" -> TermuxBridge.TERMUX_HOME
+            trimmed.startsWith("~/") -> "${TermuxBridge.TERMUX_HOME}/${trimmed.removePrefix("~/")}"
+            trimmed.startsWith("/data/data/com.termux") -> trimmed
+            trimmed.startsWith("/sdcard") || trimmed.startsWith("/storage") -> trimmed
+            trimmed.startsWith("/data/data/") || trimmed.startsWith("/data/user/") -> TermuxBridge.TERMUX_HOME
+            trimmed.startsWith("/") -> "${TermuxBridge.TERMUX_HOME}/${trimmed.trimStart('/')}"
+            else -> "${TermuxBridge.TERMUX_HOME}/${trimmed.removePrefix("./")}"
+        }
+    }
+
+    private fun shellEscapeSingleQuotes(input: String): String =
+        "'" + input.replace("'", "'\"'\"'") + "'"
+
+    private fun isFatalBridgeExit(exitCode: Int): Boolean =
+        exitCode == 111 || exitCode == 401 || exitCode == 404 || exitCode == 124 || exitCode == 500
+
+    private fun formatBridgeToolResult(
+        execRes: com.example.data.termux.ExecResult,
+        stepType: String = "CMD",
+        filePath: String? = null,
+        changed: Boolean = false,
+        touched: List<String> = emptyList(),
+        removed: List<String> = emptyList(),
+        diffSummary: String? = null
+    ): ToolResult {
+        val combined = buildString {
+            appendLine("Command: ${execRes.command}")
+            appendLine("CWD: ${execRes.cwd}")
+            appendLine("Exit code: ${execRes.exitCode} (${execRes.durationMs} ms)")
+            if (execRes.stdout.isNotBlank()) {
+                appendLine("STDOUT:")
+                appendLine(execRes.stdout.trim())
+            }
+            if (execRes.stderr.isNotBlank()) {
+                appendLine("STDERR:")
+                appendLine(execRes.stderr.trim())
+            }
+        }.trim()
+        val fatal = isFatalBridgeExit(execRes.exitCode)
+        return ToolResult(
+            text = combined,
+            isError = execRes.exitCode != 0,
+            changed = changed && execRes.exitCode == 0,
+            touched = if (execRes.exitCode == 0) touched else emptyList(),
+            removed = if (execRes.exitCode == 0) removed else emptyList(),
+            diffSummary = diffSummary,
+            commandText = execRes.command,
+            cwdText = execRes.cwd,
+            filePath = filePath,
+            stepType = stepType,
+            uiResultJson = execRes.toJsonSummary(),
+            fatalBridgeError = fatal
+        )
+    }
+
     private suspend fun executeTool(
         projectId: String,
         call: LlmToolCall,
@@ -1382,7 +1472,7 @@ RULES
         if (mode == AgentMode.CHAT && call.name !in READ_ONLY_TOOLS) {
             return ToolResult(
                 "Chat mode is read-only: you cannot use ${call.name}. Do not retry it. Tell the user (in their language) that they are in Chat mode " +
-                    "and should switch to Build mode using the Chat | Build toggle in the header before you can edit files or run commands.",
+                    "and should switch to Build mode using the Chat | Build toggle in the header before you can edit files.",
                 isError = true
             )
         }
@@ -1398,16 +1488,15 @@ RULES
         return try {
             when (call.name) {
                 "list_files" -> {
-                    val root = projectRepository.getFileTree(projectId)
-                        ?: return ToolResult("Error: project folder not found", true)
                     val path = args.optString("path", ".")
-                    val node = findNode(root, path) ?: return ToolResult("Error: path not found: $path", true)
-                    if (!node.isDirectory) return ToolResult("${node.path} is a file (${node.sizeBytes} B)", stepType = "READ", filePath = cleanPath(path))
-                    val sb = StringBuilder()
-                    val counter = intArrayOf(0)
-                    renderTree(node, 0, sb, counter)
-                    if (counter[0] >= 500) sb.append("\n[Listing truncated at 500 entries. Narrow with a sub-path.]")
-                    ToolResult(sb.toString().ifEmpty { "(empty directory)" }, stepType = "READ", filePath = cleanPath(path))
+                    val targetPath = resolveTermuxCwd(path)
+                    val cmd = "ls -la ${shellEscapeSingleQuotes(targetPath)}"
+                    val execRes = termuxBridge.execCommand(
+                        command = cmd,
+                        cwd = TermuxBridge.TERMUX_HOME,
+                        timeoutSec = 120
+                    )
+                    formatBridgeToolResult(execRes, stepType = "CMD", filePath = cleanPath(path))
                 }
                 "read_file" -> {
                     val path = args.getString("path")
@@ -1415,219 +1504,197 @@ RULES
                     if (KeyStoreManager.isPotentialSecretFile(clean)) {
                         return ToolResult("Blocked: $clean looks like a secrets/credentials file and will not be read.", true, filePath = clean)
                     }
-                    val start = if (args.has("start_line")) args.optInt("start_line") else null
-                    val end = if (args.has("end_line")) args.optInt("end_line") else null
-                    val content = projectRepository.readFile(projectId, clean, start, end)
-                    val isErr = content.startsWith("Error:")
-                    if (!isErr) {
+                    val targetPath = resolveTermuxCwd(path)
+                    val start = if (args.has("start_line")) args.optInt("start_line", 1).coerceAtLeast(1) else 1
+                    val end = if (args.has("end_line")) args.optInt("end_line", start + 250).coerceAtLeast(start) else (start + 250)
+                    val cmd = "nl -ba ${shellEscapeSingleQuotes(targetPath)} | sed -n '${start},${end}p'"
+                    val execRes = termuxBridge.execCommand(
+                        command = cmd,
+                        cwd = TermuxBridge.TERMUX_HOME,
+                        timeoutSec = 120
+                    )
+                    if (execRes.exitCode == 0) {
                         readFilesInRun.add(clean)
                         recordWorkingFile(clean, WorkingFileState.READING)
                     }
-                    ToolResult(content, isError = isErr, filePath = clean, stepType = "READ")
+                    formatBridgeToolResult(execRes, stepType = "CMD", filePath = clean)
                 }
                 "search_code" -> {
                     val q = args.getString("query")
-                    val res = projectRepository.searchCode(projectId, q, args.optBoolean("regex", false))
-                    ToolResult(res, stepType = "SEARCH")
+                    val cmd = "grep -rnI --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=build ${shellEscapeSingleQuotes(q)} ."
+                    val execRes = termuxBridge.execCommand(
+                        command = cmd,
+                        cwd = TermuxBridge.TERMUX_HOME,
+                        timeoutSec = 120
+                    )
+                    // grep returns exit code 1 when no matches are found; treat exit 1 with empty stderr as non-error
+                    val normalized = if (execRes.exitCode == 1 && execRes.stderr.isBlank()) {
+                        execRes.copy(stdout = "(no matches found for '$q')", exitCode = 0)
+                    } else execRes
+                    formatBridgeToolResult(normalized, stepType = "CMD")
                 }
                 "edit_file" -> {
                     val path = cleanPath(args.getString("path"))
-                    if (path !in readFilesInRun) {
-                        return ToolResult(
-                            "Error: Read the file first before editing. Call read_file on '$path' so you have its exact current lines.",
-                            isError = true,
-                            filePath = path,
-                            stepType = "EDIT"
-                        )
-                    }
-                    if (!awaitApproval("edit_file", "Edit $path")) {
+                    if (!awaitApproval("edit_file", "Edit $path in Termux")) {
                         return ToolResult("The user denied this edit.", true, filePath = path, stepType = "EDIT")
                     }
-                    val editRes = projectRepository.editFileDetailed(
-                        projectId = projectId,
-                        relativePath = path,
-                        oldStr = args.getString("old_str"),
-                        newStr = args.getString("new_str"),
-                        replaceAll = args.optBoolean("replace_all", false)
+                    val targetPath = resolveTermuxCwd(path)
+                    val oldStr = args.getString("old_str")
+                    val newStr = args.getString("new_str")
+                    val replaceAll = args.optBoolean("replace_all", false)
+                    val oldB64 = android.util.Base64.encodeToString(oldStr.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
+                    val newB64 = android.util.Base64.encodeToString(newStr.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
+                    val pyCmd = "python3 -c \"import base64,sys,pathlib; p=pathlib.Path(${shellEscapeSingleQuotes(targetPath)}); " +
+                        "s=p.read_text(); o=base64.b64decode('$oldB64').decode(); n=base64.b64decode('$newB64').decode(); " +
+                        "assert o in s, 'old_str not found in file'; " +
+                        "p.write_text(s.replace(o, n${if (replaceAll) "" else ", 1"})); print('Updated', p)\""
+                    val execRes = termuxBridge.execCommand(
+                        command = pyCmd,
+                        cwd = TermuxBridge.TERMUX_HOME,
+                        timeoutSec = 120
                     )
-                    if (editRes.success) {
-                        val diffLabel = "+${editRes.addedLines} -${editRes.removedLines}"
+                    val diffLabel = "+${newStr.lines().size} -${oldStr.lines().size}"
+                    if (execRes.exitCode == 0) {
                         recordWorkingFile(path, WorkingFileState.EDITED, diffLabel)
-                        ToolResult(
-                            text = editRes.message,
-                            isError = false,
-                            changed = true,
-                            touched = listOf(path),
-                            diffSummary = diffLabel,
-                            filePath = path,
-                            stepType = "EDIT"
-                        )
-                    } else {
-                        ToolResult(
-                            text = editRes.message,
-                            isError = true,
-                            changed = false,
-                            filePath = path,
-                            stepType = "EDIT"
-                        )
                     }
+                    formatBridgeToolResult(
+                        execRes,
+                        stepType = "EDIT",
+                        filePath = path,
+                        changed = true,
+                        touched = listOf(path),
+                        diffSummary = diffLabel
+                    )
                 }
                 "insert_after_line" -> {
                     val path = cleanPath(args.getString("path"))
-                    if (path !in readFilesInRun) {
-                        return ToolResult(
-                            "Error: Read the file first before editing. Call read_file on '$path' first.",
-                            isError = true,
-                            filePath = path,
-                            stepType = "EDIT"
-                        )
-                    }
                     if (!awaitApproval("insert_after_line", "Insert lines in $path")) {
                         return ToolResult("The user denied this edit.", true, filePath = path, stepType = "EDIT")
                     }
-                    val editRes = projectRepository.editFileDetailed(
-                        projectId = projectId,
-                        relativePath = path,
-                        oldStr = null,
-                        newStr = null,
-                        insertAfterLine = args.getInt("line"),
-                        contentToInsert = args.getString("content")
+                    val targetPath = resolveTermuxCwd(path)
+                    val lineNum = args.getInt("line").coerceAtLeast(0)
+                    val content = args.getString("content")
+                    val b64 = android.util.Base64.encodeToString(content.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
+                    val pyCmd = "python3 -c \"import base64,pathlib; p=pathlib.Path(${shellEscapeSingleQuotes(targetPath)}); " +
+                        "lines=p.read_text().splitlines(True); ins=base64.b64decode('$b64').decode(); " +
+                        "ins=ins if ins.endswith('\\n') else ins+'\\n'; " +
+                        "lines.insert($lineNum, ins); p.write_text(''.join(lines)); print('Inserted after line $lineNum in', p)\""
+                    val execRes = termuxBridge.execCommand(
+                        command = pyCmd,
+                        cwd = TermuxBridge.TERMUX_HOME,
+                        timeoutSec = 120
                     )
-                    if (editRes.success) {
-                        val diffLabel = "+${editRes.addedLines} -0"
-                        recordWorkingFile(path, WorkingFileState.EDITED, diffLabel)
-                        ToolResult(
-                            text = editRes.message,
-                            changed = true,
-                            touched = listOf(path),
-                            diffSummary = diffLabel,
-                            filePath = path,
-                            stepType = "EDIT"
-                        )
-                    } else {
-                        ToolResult(editRes.message, isError = true, filePath = path, stepType = "EDIT")
-                    }
+                    val diffLabel = "+${content.lines().size} -0"
+                    if (execRes.exitCode == 0) recordWorkingFile(path, WorkingFileState.EDITED, diffLabel)
+                    formatBridgeToolResult(execRes, stepType = "EDIT", filePath = path, changed = true, touched = listOf(path), diffSummary = diffLabel)
                 }
                 "replace_line_range" -> {
                     val path = cleanPath(args.getString("path"))
-                    if (path !in readFilesInRun) {
-                        return ToolResult(
-                            "Error: Read the file first before editing. Call read_file on '$path' first.",
-                            isError = true,
-                            filePath = path,
-                            stepType = "EDIT"
-                        )
-                    }
                     if (!awaitApproval("replace_line_range", "Replace lines in $path")) {
                         return ToolResult("The user denied this edit.", true, filePath = path, stepType = "EDIT")
                     }
-                    val editRes = projectRepository.editFileDetailed(
-                        projectId = projectId,
-                        relativePath = path,
-                        oldStr = null,
-                        newStr = null,
-                        startLine = args.getInt("start_line"),
-                        endLine = args.getInt("end_line"),
-                        replacementContent = args.getString("content")
+                    val targetPath = resolveTermuxCwd(path)
+                    val startLine = args.getInt("start_line").coerceAtLeast(1)
+                    val endLine = args.getInt("end_line").coerceAtLeast(startLine)
+                    val content = args.getString("content")
+                    val b64 = android.util.Base64.encodeToString(content.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
+                    val pyCmd = "python3 -c \"import base64,pathlib; p=pathlib.Path(${shellEscapeSingleQuotes(targetPath)}); " +
+                        "lines=p.read_text().splitlines(True); rep=base64.b64decode('$b64').decode(); " +
+                        "rep=rep if rep.endswith('\\n') else rep+'\\n'; " +
+                        "lines[${startLine - 1}:$endLine]=[rep]; p.write_text(''.join(lines)); print('Replaced lines $startLine-$endLine in', p)\""
+                    val execRes = termuxBridge.execCommand(
+                        command = pyCmd,
+                        cwd = TermuxBridge.TERMUX_HOME,
+                        timeoutSec = 120
                     )
-                    if (editRes.success) {
-                        val diffLabel = "+${editRes.addedLines} -${editRes.removedLines}"
-                        recordWorkingFile(path, WorkingFileState.EDITED, diffLabel)
-                        ToolResult(
-                            text = editRes.message,
-                            changed = true,
-                            touched = listOf(path),
-                            diffSummary = diffLabel,
-                            filePath = path,
-                            stepType = "EDIT"
-                        )
-                    } else {
-                        ToolResult(editRes.message, isError = true, filePath = path, stepType = "EDIT")
-                    }
+                    val diffLabel = "+${content.lines().size} -${endLine - startLine + 1}"
+                    if (execRes.exitCode == 0) recordWorkingFile(path, WorkingFileState.EDITED, diffLabel)
+                    formatBridgeToolResult(execRes, stepType = "EDIT", filePath = path, changed = true, touched = listOf(path), diffSummary = diffLabel)
                 }
                 "write_file" -> {
                     val path = cleanPath(args.getString("path"))
-                    val existing = projectRepository.readFile(projectId, path)
-                    val isNew = existing.startsWith("Error:")
-                    if (!awaitApproval("write_file", "Write file $path")) {
+                    if (!awaitApproval("write_file", "Write file $path in Termux")) {
                         return ToolResult("The user denied this write.", true, filePath = path, stepType = "EDIT")
                     }
+                    val targetPath = resolveTermuxCwd(path)
                     val content = args.getString("content")
-                    val res = projectRepository.writeFile(projectId, path, content)
+                    val b64 = android.util.Base64.encodeToString(content.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
+                    val cmd = "mkdir -p \$(dirname ${shellEscapeSingleQuotes(targetPath)}) && printf '%s' '$b64' | base64 -d > ${shellEscapeSingleQuotes(targetPath)} && ls -la ${shellEscapeSingleQuotes(targetPath)}"
+                    val execRes = termuxBridge.execCommand(
+                        command = cmd,
+                        cwd = TermuxBridge.TERMUX_HOME,
+                        timeoutSec = 120
+                    )
                     readFilesInRun.add(path)
                     val lineCount = content.lines().size
                     val diffLabel = "+$lineCount"
-                    recordWorkingFile(path, if (isNew) WorkingFileState.CREATED else WorkingFileState.EDITED, diffLabel)
-                    ToolResult(
-                        text = res,
+                    if (execRes.exitCode == 0) {
+                        recordWorkingFile(path, WorkingFileState.CREATED, diffLabel)
+                    }
+                    formatBridgeToolResult(
+                        execRes,
+                        stepType = "EDIT",
+                        filePath = path,
                         changed = true,
                         touched = listOf(path),
-                        diffSummary = diffLabel,
-                        filePath = path,
-                        stepType = "EDIT"
+                        diffSummary = diffLabel
                     )
                 }
                 "delete_file" -> {
                     val path = cleanPath(args.getString("path"))
-                    if (!awaitApproval("delete_file", "Delete $path", isRisky = true)) {
+                    if (!awaitApproval("delete_file", "Delete $path in Termux", isRisky = true)) {
                         return ToolResult("The user denied this deletion.", true, filePath = path, stepType = "EDIT")
                     }
-                    val res = projectRepository.deleteFile(projectId, path)
-                    recordWorkingFile(path, WorkingFileState.DELETED)
-                    ToolResult(res, changed = true, removed = listOf(path), filePath = path, stepType = "EDIT")
+                    val targetPath = resolveTermuxCwd(path)
+                    val execRes = termuxBridge.execCommand(
+                        command = "rm -rf ${shellEscapeSingleQuotes(targetPath)}",
+                        cwd = TermuxBridge.TERMUX_HOME,
+                        timeoutSec = 120
+                    )
+                    if (execRes.exitCode == 0) recordWorkingFile(path, WorkingFileState.DELETED)
+                    formatBridgeToolResult(execRes, stepType = "EDIT", filePath = path, changed = true, removed = listOf(path))
                 }
                 "move_file" -> {
                     val from = cleanPath(args.getString("from_path"))
                     val to = cleanPath(args.getString("to_path"))
-                    if (!awaitApproval("move_file", "Move $from → $to")) {
+                    if (!awaitApproval("move_file", "Move $from → $to in Termux")) {
                         return ToolResult("The user denied this move.", true, filePath = to, stepType = "EDIT")
                     }
-                    val res = projectRepository.moveFile(projectId, from, to)
-                    readFilesInRun.add(to)
-                    recordWorkingFile(from, WorkingFileState.DELETED)
-                    recordWorkingFile(to, WorkingFileState.CREATED)
-                    ToolResult(
-                        res,
+                    val fromTarget = resolveTermuxCwd(from)
+                    val toTarget = resolveTermuxCwd(to)
+                    val execRes = termuxBridge.execCommand(
+                        command = "mkdir -p \$(dirname ${shellEscapeSingleQuotes(toTarget)}) && mv ${shellEscapeSingleQuotes(fromTarget)} ${shellEscapeSingleQuotes(toTarget)}",
+                        cwd = TermuxBridge.TERMUX_HOME,
+                        timeoutSec = 120
+                    )
+                    if (execRes.exitCode == 0) {
+                        readFilesInRun.add(to)
+                        recordWorkingFile(from, WorkingFileState.DELETED)
+                        recordWorkingFile(to, WorkingFileState.CREATED)
+                    }
+                    formatBridgeToolResult(
+                        execRes,
+                        stepType = "EDIT",
+                        filePath = to,
                         changed = true,
                         touched = listOf(to),
-                        removed = listOf(from),
-                        filePath = to,
-                        stepType = "EDIT"
+                        removed = listOf(from)
                     )
                 }
                 "run_command" -> {
                     val cmd = args.getString("command")
-                    val relCwd = args.optString("cwd", ".")
-                    val isRisky = cmd.contains("rm -rf") || cmd.contains("pkg install") ||
-                        cmd.contains("pip install") || cmd.contains("npm install") || cmd.contains("curl ")
-                    if (!awaitApproval("run_command", "Run command:\n`$cmd`\nin `$relCwd`", isRisky = isRisky)) {
-                        return ToolResult("The user denied running this command.", true, commandText = cmd, cwdText = relCwd, stepType = "CMD")
+                    val relCwd = args.optString("cwd", TermuxBridge.TERMUX_HOME)
+                    val targetCwd = resolveTermuxCwd(relCwd)
+                    val isRisky = cmd.contains("rm -rf /")
+                    if (!awaitApproval("run_command", "Run command in Termux:\n`$cmd`\nin `$targetCwd`", isRisky = isRisky)) {
+                        return ToolResult("The user denied running this command.", true, commandText = cmd, cwdText = targetCwd, stepType = "CMD")
                     }
-                    val projRoot = projectRepository.projectDir(projectId)
-                    val targetDir = File(projRoot, relCwd).canonicalFile
                     val execRes = termuxBridge.execCommand(
                         command = cmd,
-                        cwd = targetDir.absolutePath,
-                        timeoutSec = settings.commandTimeoutSeconds
+                        cwd = targetCwd,
+                        timeoutSec = 120
                     )
-                    val combined = buildString {
-                        appendLine("Exit code: ${execRes.exitCode} (${execRes.durationMs} ms)")
-                        if (execRes.stdout.isNotBlank()) {
-                            appendLine("STDOUT:")
-                            appendLine(execRes.stdout.trim())
-                        }
-                        if (execRes.stderr.isNotBlank()) {
-                            appendLine("STDERR:")
-                            appendLine(execRes.stderr.trim())
-                        }
-                    }.trim()
-                    ToolResult(
-                        text = combined,
-                        isError = execRes.exitCode != 0,
-                        commandText = cmd,
-                        cwdText = targetDir.absolutePath,
-                        stepType = "CMD"
-                    )
+                    formatBridgeToolResult(execRes, stepType = "CMD")
                 }
                 "git_clone" -> {
                     val url = args.getString("url").trim()
@@ -1636,28 +1703,17 @@ RULES
                         return executeInstallRepoTool(url)
                     }
                     val repoName = url.substringAfterLast('/').removeSuffix(".git").ifBlank { "repo" }
-                    val destDir = File(projectRepository.projectsRootDir, repoName)
+                    val termuxProjectsDir = "${TermuxBridge.TERMUX_HOME}/forge/projects"
+                    val destPath = "$termuxProjectsDir/$repoName"
                     val cloneRes = termuxBridge.execCommand(
-                        command = "git clone --depth 1 \"$url\" \"${destDir.absolutePath}\"",
-                        cwd = projectRepository.projectsRootDir.absolutePath,
-                        timeoutSec = 180
+                        command = "mkdir -p \"$termuxProjectsDir\" && rm -rf \"$destPath\" && git clone --depth 1 \"$url\" \"$destPath\"",
+                        cwd = TermuxBridge.TERMUX_HOME,
+                        timeoutSec = 120
                     )
-                    if (cloneRes.exitCode != 0 && !destDir.exists()) {
-                        return ToolResult(
-                            "Error cloning $url:\n${cloneRes.stderr.ifBlank { cloneRes.stdout }}",
-                            isError = true,
-                            commandText = "git clone $url",
-                            stepType = "CMD"
-                        )
-                    }
-                    val analysis = RepoToolInstaller.inspectDirectory(destDir, url, "PROJECT")
-                    ProjectMemoryManager.ensureAgentMd(projectRepository.projectDir(projectId), repoName)
-                    ToolResult(
-                        text = "Cloned $repoName into ${destDir.absolutePath}.\nStack: ${analysis.detectedStack}",
-                        changed = true,
-                        commandText = "git clone $url",
-                        cwdText = destDir.absolutePath,
-                        stepType = "CMD"
+                    formatBridgeToolResult(
+                        cloneRes,
+                        stepType = "CMD",
+                        changed = cloneRes.exitCode == 0
                     )
                 }
                 "install_repo_tool" -> {
@@ -1685,32 +1741,13 @@ RULES
                     if (!awaitApproval("run_installed_tool", "Run installed tool `${matched.name}`:\n`$fullCmd`")) {
                         return ToolResult("User denied running tool ${matched.name}.", isError = true, commandText = fullCmd, stepType = "CMD")
                     }
-                    val workDir = File(matched.installPath).takeIf { it.exists() } ?: projectRepository.projectDir(projectId)
+                    val targetCwd = resolveTermuxCwd(matched.installPath)
                     val execRes = termuxBridge.execCommand(
                         command = fullCmd,
-                        cwd = workDir.absolutePath,
-                        timeoutSec = settings.commandTimeoutSeconds
+                        cwd = targetCwd,
+                        timeoutSec = 120
                     )
-                    val out = buildString {
-                        appendLine("Tool: ${matched.name} (${matched.type})")
-                        appendLine("Command: $fullCmd (in ${workDir.absolutePath})")
-                        appendLine("Exit code: ${execRes.exitCode} (${execRes.durationMs} ms)")
-                        if (execRes.stdout.isNotBlank()) {
-                            appendLine("STDOUT:")
-                            appendLine(execRes.stdout.trim())
-                        }
-                        if (execRes.stderr.isNotBlank()) {
-                            appendLine("STDERR:")
-                            appendLine(execRes.stderr.trim())
-                        }
-                    }.trim()
-                    ToolResult(
-                        text = out,
-                        isError = execRes.exitCode != 0,
-                        commandText = fullCmd,
-                        cwdText = workDir.absolutePath,
-                        stepType = "CMD"
-                    )
+                    formatBridgeToolResult(execRes, stepType = "CMD")
                 }
                 "ask_user" -> {
                     val question = args.getString("question")

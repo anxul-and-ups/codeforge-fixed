@@ -27,9 +27,10 @@ import java.util.concurrent.TimeUnit
  */
 class LlmClient(
     private val okHttpClient: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(45, TimeUnit.SECONDS)
-        .readTimeout(180, TimeUnit.SECONDS)
-        .writeTimeout(60, TimeUnit.SECONDS)
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(15, TimeUnit.SECONDS)
+        .callTimeout(30, TimeUnit.SECONDS)
         .build()
 ) {
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
@@ -157,9 +158,9 @@ class LlmClient(
     }
 
     private fun budgetFor(level: ReasoningLevel): Int = when (level) {
-        ReasoningLevel.OFF -> 0
-        ReasoningLevel.LOW -> 1500
-        ReasoningLevel.MEDIUM, ReasoningLevel.AUTO -> 4000
+        ReasoningLevel.OFF, ReasoningLevel.AUTO -> 0
+        ReasoningLevel.LOW -> 1024
+        ReasoningLevel.MEDIUM -> 4000
         ReasoningLevel.HIGH -> 12000
     }
 

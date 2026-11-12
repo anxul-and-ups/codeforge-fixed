@@ -787,13 +787,26 @@ class ProviderRepository(
                         )
                     )
                     previousProvider = provider
-                    delay(350)
+                    if (ordered.size > 1) {
+                        delay(150)
+                    }
                     break
                 }
             }
         }
 
-        throw lastException ?: RuntimeException("All entries in the fallback chain are currently unavailable.")
+        val finalErr = lastException
+        if (finalErr != null) {
+            val errClass = classifyError(finalErr)
+            val isRateOrQuota = errClass == ProviderErrorClass.RATE_LIMIT ||
+                errClass == ProviderErrorClass.QUOTA_EXHAUSTED ||
+                (finalErr is ApiException && finalErr.statusCode == 429)
+            if (isRateOrQuota) {
+                throw ApiException(429, "API Rate Limit Exceeded. Please change API key or provider.")
+            }
+            throw finalErr
+        }
+        throw RuntimeException("All entries in the fallback chain are currently unavailable.")
     }
 
     private fun compactMessagesForContextLimit(messages: List<com.example.data.api.LlmMessage>): List<com.example.data.api.LlmMessage> {

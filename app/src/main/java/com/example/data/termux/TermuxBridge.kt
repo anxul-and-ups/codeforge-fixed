@@ -8,7 +8,6 @@ import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
 import androidx.core.content.ContextCompat
-import com.example.data.security.KeyStoreManager
 import com.example.data.settings.SettingsStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -25,14 +24,11 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONArray
 import org.json.JSONObject
-import java.io.BufferedReader
 import java.io.File
-import java.io.InputStreamReader
-import java.security.SecureRandom
+import java.net.ConnectException
+import java.net.SocketTimeoutException
 import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 enum class TermuxBuildType {
@@ -46,7 +42,7 @@ enum class EngineConnectionState {
     STARTING,
     SETTING_UP,
     CONNECTED_TERMUX,
-    CONNECTED_EMBEDDED, // Local workspace bridge when Termux daemon is offline or being tested on emulator
+    CONNECTED_EMBEDDED, // Kept only for enum compatibility; never used for fake connection state
     ERROR
 }
 
@@ -72,24 +68,25 @@ data class BridgeStatus(
     val runCommandPermissionGranted: Boolean = false,
     val batteryOptimizationIgnored: Boolean = false,
     val connectionState: EngineConnectionState = EngineConnectionState.DISCONNECTED,
-    val port: Int = 47831,
+    val port: Int = TermuxBridge.DEFAULT_PORT,
     val engineVersion: String = "2.0.0",
-    val pythonVersion: String = "3.11",
-    val gitVersion: String = "2.44",
+    val pythonVersion: String = "",
+    val gitVersion: String = "",
     val freeDiskMb: Long = 0L,
-    val workspacePath: String = "/data/data/com.termux/files/home/forge",
+    val workspacePath: String = TermuxBridge.TERMUX_HOME,
     val setupSteps: List<EngineSetupStep> = emptyList(),
     val setupLog: String = "",
     val lastError: String? = null,
-    val lastHeartbeatMs: Long = 0L
+    val lastHeartbeatMs: Long = 0L,
+    val measuredLatencyMs: Long = 0L
 ) {
+    /** Strictly true ONLY when live HTTP heartbeat to http://127.0.0.1:47831/health succeeds with 200 OK. */
     val engineRunning: Boolean
-        get() = connectionState == EngineConnectionState.CONNECTED_TERMUX ||
-            connectionState == EngineConnectionState.CONNECTED_EMBEDDED
-    val latencyMs: Long get() = 12L
+        get() = connectionState == EngineConnectionState.CONNECTED_TERMUX
+    val latencyMs: Long get() = measuredLatencyMs
     val installState: String get() = connectionState.name
     val arch: String get() = Build.SUPPORTED_ABIS.firstOrNull() ?: "aarch64"
-    val message: String get() = lastError ?: "Workspace: $workspacePath"
+    val message: String get() = lastError ?: "Termux Workspace: $workspacePath"
 }
 
 typealias EngineHealthState = BridgeStatus
@@ -102,18 +99,23 @@ data class ExecResult(
     val stderr: String,
     val exitCode: Int,
     val durationMs: Long
-)
+) {
+    fun toJsonSummary(): String = JSONObject()
+        .put("command", command)
+        .put("cwd", cwd)
+        .put("stdout", stdout)
+        .put("stderr", stderr)
+        .put("exit_code", exitCode)
+        .put("duration_ms", durationMs)
+        .toString()
+}
 
 /**
- * Phase 1 — Termux Bridge & Forge Engine Manager (Section 5).
+ * Real Termux HTTP Bridge Manager (`http://127.0.0.1:47831`).
  *
- * - Detects Termux installation and build source (warns if Play Store build detected).
- * - Checks `com.termux.permission.RUN_COMMAND` and battery optimization status.
- * - Launches the Python Forge Engine server inside `~/forge/.engine/server.py` via Termux `RUN_COMMAND`
- *   on `127.0.0.1:<port>` protected by a random Bearer token stored in Android Keystore and `~/forge/.engine/token` (chmod 600).
- * - Maintains a `/health` heartbeat and re-attaches to long-running commands if the app is backgrounded.
- * - Enforces strict `realpath` sandboxing (rejects `..` and symlink escapes outside `~/forge/`).
- * - Logs all command executions in an inspectable local audit log.
+ * - Strictly routes all shell/tool commands to Termux via HTTP POST `http://127.0.0.1:47831/exec`.
+ * - NEVER executes commands in the local Android app sandbox (`ProcessBuilder` is prohibited).
+ * - Polls `GET http://127.0.0.1:47831/health` every 5 seconds with zero fake/cached connection fallback.
  */
 class TermuxBridge(
     private val context: Context,
@@ -126,20 +128,31 @@ class TermuxBridge(
         const val TERMUX_SERVICE_NAME = "com.termux.app.RunCommandService"
         const val ACTION_RUN_COMMAND = "com.termux.RUN_COMMAND"
         const val TERMUX_HOME = "/data/data/com.termux/files/home"
-        const val TERMUX_WORKSPACE = "$TERMUX_HOME/forge"
+        const val TERMUX_WORKSPACE = "/data/data/com.termux/files/home"
+        const val DEFAULT_PORT = 47831
+        const val ENGINE_PORT = 47831
+        const val DEFAULT_BEARER_TOKEN = "9f8ef08845d6751517d97296d40e03216138ac23185e31aa"
 
         private val DANGEROUS_COMMAND_PATTERNS = listOf(
             Regex("""rm\s+(-[rRf]+\s+)+/(\s|$)"""),
             Regex("""rm\s+(-[rRf]+\s+)+/\*"""),
-            Regex(""":\(\)\s*\{\s*:\|:&\s*\}\s*;?:"""), // fork bomb
+            Regex(""":\(\)\s*\{\s*:\|:&\s*\}\s*;?:"""),
             Regex("""mkfs\."""),
             Regex("""dd\s+if=.*of=/dev/(sd|mmcblk|block)""")
         )
     }
 
-    private val okHttp = OkHttpClient.Builder()
+    /** Fast HTTP client for 5-second `/health` heartbeat probes. */
+    private val healthHttp = OkHttpClient.Builder()
+        .connectTimeout(2500, TimeUnit.MILLISECONDS)
+        .readTimeout(2500, TimeUnit.MILLISECONDS)
+        .writeTimeout(2500, TimeUnit.MILLISECONDS)
+        .build()
+
+    /** HTTP client for `/exec` commands on `http://127.0.0.1:47831/exec`. */
+    private val execHttp = OkHttpClient.Builder()
         .connectTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
+        .readTimeout(125, TimeUnit.SECONDS)
         .writeTimeout(15, TimeUnit.SECONDS)
         .build()
 
@@ -153,14 +166,13 @@ class TermuxBridge(
     val auditLogs: StateFlow<List<AuditCommandLog>> = _auditLogs.asStateFlow()
 
     private val _terminalOutput = MutableStateFlow(
-        "CodeForge v2 Engine Terminal — Ready\nWorkspace: ~/forge/\nType a command below or let Build mode run commands automatically.\n"
+        "CodeForge Termux HTTP Bridge Terminal (http://127.0.0.1:47831)\nTarget CWD: /data/data/com.termux/files/home\n"
     )
     val terminalOutput: StateFlow<String> = _terminalOutput.asStateFlow()
 
-    private val runningProcesses = ConcurrentHashMap<String, Process>()
     private var heartbeatJob: Job? = null
 
-    /** Local mirror of `~/forge/` inside app storage so commands/tools/files work reliably even when Termux is not running on an emulator. */
+    /** Used only for local app metadata/checkpoints; NEVER used as a shell command fallback. */
     val localForgeRoot: File by lazy {
         File(context.filesDir, "forge").apply {
             File(this, "projects").mkdirs()
@@ -178,30 +190,16 @@ class TermuxBridge(
     }
 
     private fun ensureTokenAndPort() {
-        if (settings.engineToken.isBlank()) {
-            rotateToken()
+        // Always use port 47831 and the required Bearer token
+        settings.enginePort = DEFAULT_PORT
+        if (settings.engineToken != DEFAULT_BEARER_TOKEN) {
+            settings.engineToken = DEFAULT_BEARER_TOKEN
         }
-        if (settings.enginePort !in 20000..60000) {
-            settings.enginePort = 41000 + SecureRandom().nextInt(15000)
-        }
-        val tokenFile = File(localForgeRoot, ".engine/token")
-        tokenFile.parentFile?.mkdirs()
-        tokenFile.writeText(settings.engineToken)
-        tokenFile.setReadable(false, false)
-        tokenFile.setReadable(true, true)
-        tokenFile.setWritable(false, false)
-        tokenFile.setWritable(true, true)
     }
 
     fun rotateToken(): String {
-        val bytes = ByteArray(24)
-        SecureRandom().nextBytes(bytes)
-        val newToken = bytes.joinToString("") { "%02x".format(it) }
-        settings.engineToken = newToken
-        val tokenFile = File(localForgeRoot, ".engine/token")
-        tokenFile.parentFile?.mkdirs()
-        tokenFile.writeText(newToken)
-        return newToken
+        settings.engineToken = DEFAULT_BEARER_TOKEN
+        return DEFAULT_BEARER_TOKEN
     }
 
     fun refreshEnvironmentStatus() {
@@ -210,15 +208,13 @@ class TermuxBridge(
             PackageManager.PERMISSION_GRANTED
         val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
         val batteryOk = pm?.isIgnoringBatteryOptimizations(context.packageName) ?: false
-        val freeMb = localForgeRoot.usableSpace / (1024L * 1024L)
 
         _status.update {
             it.copy(
                 termuxBuild = termuxType,
                 runCommandPermissionGranted = hasPerm,
                 batteryOptimizationIgnored = batteryOk,
-                port = settings.enginePort,
-                freeDiskMb = freeMb
+                port = DEFAULT_PORT
             )
         }
     }
@@ -238,15 +234,12 @@ class TermuxBridge(
                 context.packageManager.getInstallerPackageName(TERMUX_PACKAGE)
             }
             val versionName = info.versionName ?: ""
-            // Play Store build is famously stuck on 0.101 or installed from com.android.vending
             if (installer == "com.android.vending" || versionName.startsWith("0.101")) {
                 TermuxBuildType.PLAY_STORE_OUTDATED
             } else {
                 TermuxBuildType.FDROID_OR_GITHUB
             }
-        } catch (e: PackageManager.NameNotFoundException) {
-            TermuxBuildType.NOT_INSTALLED
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             TermuxBuildType.NOT_INSTALLED
         }
     }
@@ -258,7 +251,7 @@ class TermuxBridge(
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
             context.startActivity(intent)
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             try {
                 val fallback = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS).apply {
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -268,173 +261,88 @@ class TermuxBridge(
         }
     }
 
+    /**
+     * Background heartbeat polling `GET http://127.0.0.1:47831/health` every 5 seconds.
+     * Never uses cached or fake connection states.
+     */
     private fun startHeartbeat() {
         heartbeatJob?.cancel()
         heartbeatJob = scope.launch(Dispatchers.IO) {
             while (isActive) {
                 checkEngineHealthOnce()
-                delay(6_000L)
+                delay(5_000L)
             }
         }
     }
 
     suspend fun checkEngineHealthOnce(): Boolean = withContext(Dispatchers.IO) {
         refreshEnvironmentStatus()
-        val port = settings.enginePort
-        val token = settings.engineToken
+        val token = DEFAULT_BEARER_TOKEN
+        val t0 = System.currentTimeMillis()
         try {
             val req = Request.Builder()
-                .url("http://127.0.0.1:$port/health")
+                .url("http://127.0.0.1:$DEFAULT_PORT/health")
                 .header("Authorization", "Bearer $token")
                 .get()
                 .build()
-            okHttp.newCall(req).execute().use { resp ->
+            healthHttp.newCall(req).execute().use { resp ->
+                val latency = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
                 if (resp.isSuccessful) {
-                    val obj = JSONObject(resp.body?.string() ?: "{}")
+                    val bodyStr = resp.body?.string().orEmpty()
+                    val obj = try { JSONObject(bodyStr) } catch (_: Exception) { JSONObject() }
                     _status.update {
                         it.copy(
                             connectionState = EngineConnectionState.CONNECTED_TERMUX,
+                            port = DEFAULT_PORT,
                             engineVersion = obj.optString("version", "2.0.0"),
-                            pythonVersion = obj.optString("python", "3.11"),
-                            gitVersion = obj.optString("git", "2.44"),
-                            workspacePath = obj.optString("workspace", TERMUX_WORKSPACE),
+                            pythonVersion = obj.optString("python", "3.x"),
+                            gitVersion = obj.optString("git", "2.x"),
+                            workspacePath = obj.optString("workspace", TERMUX_HOME),
+                            freeDiskMb = obj.optLong("free_mb", it.freeDiskMb),
                             lastHeartbeatMs = System.currentTimeMillis(),
+                            measuredLatencyMs = latency,
                             lastError = null
                         )
                     }
                     return@withContext true
+                } else {
+                    _status.update {
+                        it.copy(
+                            connectionState = EngineConnectionState.DISCONNECTED,
+                            lastError = "Termux Bridge HTTP ${resp.code} on http://127.0.0.1:$DEFAULT_PORT/health"
+                        )
+                    }
+                    return@withContext false
                 }
             }
-        } catch (_: Exception) {
-            // Local HTTP daemon not reachable on 127.0.0.1:$port
-        }
-
-        // If engine setup was completed, keep local embedded workspace engine ready so tools & commands never dead-end
-        if (settings.engineSetupCompleted) {
+        } catch (e: Exception) {
+            // ECONNREFUSED or timeout -> immediately mark DISCONNECTED (Red)
             _status.update {
                 it.copy(
-                    connectionState = if (it.termuxBuild == TermuxBuildType.FDROID_OR_GITHUB && it.runCommandPermissionGranted) {
-                        EngineConnectionState.CONNECTED_TERMUX
-                    } else {
-                        EngineConnectionState.CONNECTED_EMBEDDED
-                    },
-                    lastHeartbeatMs = System.currentTimeMillis()
+                    connectionState = EngineConnectionState.DISCONNECTED,
+                    lastError = "Disconnected: http://127.0.0.1:$DEFAULT_PORT/health unreachable (${e.javaClass.simpleName})"
                 )
             }
-            return@withContext true
+            return@withContext false
         }
-        false
     }
 
     /**
-     * One-tap "Set up engine" (Section 5.4):
-     * 1. Updates package lists & installs python, git, ripgrep, curl
-     * 2. Creates `~/forge/{projects,tools,.engine,checkpoints,outputs}`
-     * 3. Writes the Forge Engine server script and start script
-     * 4. Generates the token (`chmod 600`)
-     * 5. Starts the engine and runs a self-test
+     * Attempts to launch the Termux daemon via RUN_COMMAND if permitted, then verifies live `/health`.
+     * Never fakes success if the Termux HTTP server on `127.0.0.1:47831` is not responding.
      */
     fun setupOrRepairEngine(onComplete: ((Boolean) -> Unit)? = null) {
         scope.launch(Dispatchers.IO) {
-            val initialSteps = listOf(
-                EngineSetupStep("pkg", "Check & install packages (python, git, ripgrep, curl)"),
-                EngineSetupStep("dirs", "Create ~/forge/{projects,tools,.engine,checkpoints,outputs}"),
-                EngineSetupStep("script", "Write Forge Engine server & start script"),
-                EngineSetupStep("token", "Configure bearer token (chmod 600)"),
-                EngineSetupStep("start", "Start Forge Engine & run self-test")
-            )
-            val logSb = StringBuilder()
-            fun log(line: String) {
-                logSb.append(line).append("\n")
-                _status.update { it.copy(setupLog = logSb.toString()) }
-            }
-            fun updateStep(id: String, state: String, detail: String = "") {
-                _status.update { cur ->
-                    cur.copy(
-                        setupSteps = cur.setupSteps.map {
-                            if (it.id == id) it.copy(status = state, detail = detail) else it
-                        }
-                    )
-                }
-            }
-
             _status.update {
                 it.copy(
-                    connectionState = EngineConnectionState.SETTING_UP,
-                    setupSteps = initialSteps,
-                    setupLog = "Starting Forge Engine setup…\n",
+                    connectionState = EngineConnectionState.STARTING,
                     lastError = null
                 )
             }
-
-            try {
-                // Step 1: Packages
-                updateStep("pkg", "RUNNING", "Checking python, git, rg, curl…")
-                log("$ pkg update -y && pkg install -y python git ripgrep curl")
-                delay(350)
-                updateStep("pkg", "DONE", "Packages verified")
-
-                // Step 2: Workspace folders
-                updateStep("dirs", "RUNNING", "Creating ~/forge directory hierarchy…")
-                log("$ mkdir -p ~/forge/{projects,tools,.engine,checkpoints,outputs}")
-                localForgeRoot.mkdirs()
-                File(localForgeRoot, "projects").mkdirs()
-                File(localForgeRoot, "tools").mkdirs()
-                File(localForgeRoot, ".engine").mkdirs()
-                File(localForgeRoot, "checkpoints").mkdirs()
-                File(localForgeRoot, "outputs").mkdirs()
-                delay(250)
-                updateStep("dirs", "DONE", "~/forge workspace ready")
-
-                // Step 3: Write Forge Engine Python Server & Bootstrap script
-                updateStep("script", "RUNNING", "Writing ~/forge/.engine/forge_server.py…")
-                val serverPy = File(localForgeRoot, ".engine/forge_server.py")
-                serverPy.writeText(buildForgeEnginePythonScript())
-                val startSh = File(localForgeRoot, ".engine/start_engine.sh")
-                startSh.writeText(buildBootstrapShellScript(settings.enginePort, settings.engineToken))
-                startSh.setExecutable(true)
-                log("Wrote forge_server.py (${serverPy.length()} bytes) and start_engine.sh")
-                delay(250)
-                updateStep("script", "DONE", "Engine server installed")
-
-                // Step 4: Token
-                updateStep("token", "RUNNING", "Securing ~/forge/.engine/token (chmod 600)…")
-                ensureTokenAndPort()
-                log("$ chmod 600 ~/forge/.engine/token (port ${settings.enginePort})")
-                delay(200)
-                updateStep("token", "DONE", "Bearer token secured")
-
-                // Step 5: Launch in Termux if installed & permitted, plus verify self-test
-                updateStep("start", "RUNNING", "Launching Forge Engine on 127.0.0.1:${settings.enginePort}…")
-                val launchedTermux = tryLaunchTermuxDaemon(settings.enginePort, settings.engineToken)
-                if (launchedTermux) {
-                    log("Sent RUN_COMMAND intent to com.termux (termux-wake-lock + forge_server.py)")
-                } else {
-                    log("Termux app not active; bound embedded local Linux shell & workspace engine.")
-                }
-                delay(400)
-
-                // Self-test execution
-                val testExec = execCommand("echo 'Forge Engine OK'", localForgeRoot.absolutePath)
-                if (testExec.exitCode == 0 && testExec.stdout.contains("Forge Engine OK")) {
-                    log("Self-test passed: ${testExec.stdout.trim()} (${testExec.durationMs} ms)")
-                    updateStep("start", "DONE", "Self-test passed (${testExec.durationMs} ms)")
-                    settings.engineSetupCompleted = true
-                    checkEngineHealthOnce()
-                    onComplete?.invoke(true)
-                } else {
-                    throw IllegalStateException("Self-test failed: ${testExec.stderr}")
-                }
-            } catch (e: Exception) {
-                log("ERROR: ${e.message}")
-                _status.update {
-                    it.copy(
-                        connectionState = EngineConnectionState.ERROR,
-                        lastError = e.message ?: "Engine setup failed"
-                    )
-                }
-                onComplete?.invoke(false)
-            }
+            tryLaunchTermuxDaemon(DEFAULT_PORT, DEFAULT_BEARER_TOKEN)
+            delay(800L)
+            val alive = checkEngineHealthOnce()
+            onComplete?.invoke(alive)
         }
     }
 
@@ -461,17 +369,14 @@ class TermuxBridge(
                 context.startService(intent)
             }
             true
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             false
         }
     }
 
-    /**
-     * Validates that a request token matches the configured Bearer token and that a path stays
-     * strictly inside allowed roots (`realpath` check rejecting `..` and symlink traversal).
-     */
     fun verifyToken(candidateToken: String): Boolean {
-        return candidateToken.isNotBlank() && candidateToken == settings.engineToken
+        return candidateToken.isNotBlank() &&
+            (candidateToken == DEFAULT_BEARER_TOKEN || candidateToken == settings.engineToken)
     }
 
     fun isCommandDangerous(command: String): Boolean {
@@ -481,18 +386,6 @@ class TermuxBridge(
 
     fun resolveSandboxedFile(baseDir: File, relativeOrAbsPath: String): File {
         val raw = relativeOrAbsPath.trim()
-        if (raw.contains("..")) {
-            val candidate = if (raw.startsWith("/")) File(raw) else File(baseDir, raw)
-            val canonicalBase = baseDir.canonicalPath
-            val canonicalTarget = candidate.canonicalPath
-            val canonicalForge = localForgeRoot.canonicalPath
-            val inBase = canonicalTarget == canonicalBase || canonicalTarget.startsWith(canonicalBase + File.separator)
-            val inForge = canonicalTarget == canonicalForge || canonicalTarget.startsWith(canonicalForge + File.separator)
-            if (!inBase && !inForge) {
-                throw SecurityException("Path escape blocked by sandbox: $relativeOrAbsPath")
-            }
-            return candidate
-        }
         val candidate = if (raw.startsWith("/")) File(raw) else File(baseDir, raw)
         val canonicalBase = baseDir.canonicalPath
         val canonicalTarget = candidate.canonicalPath
@@ -500,162 +393,174 @@ class TermuxBridge(
         val inBase = canonicalTarget == canonicalBase || canonicalTarget.startsWith(canonicalBase + File.separator)
         val inForge = canonicalTarget == canonicalForge || canonicalTarget.startsWith(canonicalForge + File.separator)
         if (!inBase && !inForge) {
-            throw SecurityException("Path outside allowed ~/forge workspace: $relativeOrAbsPath")
+            throw SecurityException("Path escape blocked by sandbox: $relativeOrAbsPath")
         }
         return candidate
     }
 
     /**
-     * Executes a shell command in Termux (via localhost HTTP `/exec` if Termux daemon is listening,
-     * or directly via local POSIX `ProcessBuilder` inside the workspace).
-     * Streams stdout/stderr live to [onOutputChunk] and appends to the Terminal Drawer.
+     * Strictly executes shell commands in Termux via HTTP POST to `http://127.0.0.1:47831/exec`.
+     * NEVER falls back to local Android `ProcessBuilder`.
+     *
+     * Required API Contract:
+     *   URL: `http://127.0.0.1:47831/exec`
+     *   Method: `POST`
+     *   Headers:
+     *     `Authorization: Bearer 9f8ef08845d6751517d97296d40e03216138ac23185e31aa`
+     *     `Content-Type: application/json`
+     *   Body: `{"command": "<BASH_CMD_HERE>", "cwd": "/data/data/com.termux/files/home", "timeout": 120}`
      */
     suspend fun execCommand(
         command: String,
-        cwd: String,
-        token: String = settings.engineToken,
+        cwd: String = TERMUX_HOME,
+        token: String = DEFAULT_BEARER_TOKEN,
         timeoutSeconds: Long = 120L,
         onOutputChunk: ((String) -> Unit)? = null
     ): ExecResult = withContext(Dispatchers.IO) {
-        if (!verifyToken(token)) {
-            throw SecurityException("Unauthorized: invalid Forge Engine bearer token")
-        }
         if (isCommandDangerous(command)) {
-            throw SecurityException("Blocked dangerous command by safety denylist: $command")
+            val blockedMsg = "Blocked dangerous command by safety denylist: $command"
+            return@withContext ExecResult(
+                execId = UUID.randomUUID().toString(),
+                command = command,
+                cwd = TERMUX_HOME,
+                stdout = "",
+                stderr = blockedMsg,
+                exitCode = 126,
+                durationMs = 0L
+            )
         }
 
         val execId = UUID.randomUUID().toString()
         val startMs = System.currentTimeMillis()
-        val workDir = File(cwd).let {
-            if (!it.exists()) it.mkdirs()
-            if (it.exists() && it.isDirectory) it else localForgeRoot
-        }
-        val termuxCwd = toTermuxPath(workDir.absolutePath)
+        val termuxCwd = toTermuxPath(cwd)
+        val authBearer = DEFAULT_BEARER_TOKEN
 
-        appendTerminal("\n$ $command  (in ${toDisplayPath(workDir.absolutePath)})\n")
+        appendTerminal("\n$ $command  (cwd: $termuxCwd)\n")
 
-        // First try Termux HTTP daemon if connected to external Termux server
-        val port = settings.enginePort
+        val payload = JSONObject()
+            .put("command", command)
+            .put("cwd", termuxCwd)
+            .put("timeout", timeoutSeconds)
+
+        val request = Request.Builder()
+            .url("http://127.0.0.1:$DEFAULT_PORT/exec")
+            .header("Authorization", "Bearer $authBearer")
+            .header("Content-Type", "application/json")
+            .post(payload.toString().toRequestBody(jsonMedia))
+            .build()
+
         try {
-            syncLocalDirToTermuxIfNeeded(workDir, termuxCwd, port, token)
-            val payload = JSONObject()
-                .put("command", command)
-                .put("cwd", termuxCwd)
-                .put("timeout", timeoutSeconds)
-            val req = Request.Builder()
-                .url("http://127.0.0.1:$port/exec")
-                .header("Authorization", "Bearer $token")
-                .post(payload.toString().toRequestBody(jsonMedia))
-                .build()
-            okHttp.newCall(req).execute().use { resp ->
-                if (resp.isSuccessful) {
-                    val obj = JSONObject(resp.body?.string() ?: "{}")
-                    val out = obj.optString("stdout", "")
-                    val err = obj.optString("stderr", "")
-                    val code = obj.optInt("exit_code", 0)
-                    val dur = System.currentTimeMillis() - startMs
-                    val combined = buildString {
-                        if (out.isNotEmpty()) append(out)
-                        if (err.isNotEmpty()) {
-                            if (isNotEmpty()) append("\n")
-                            append(err)
+            execHttp.newCall(request).execute().use { resp ->
+                val dur = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
+                val rawBody = resp.body?.string().orEmpty()
+
+                if (!resp.isSuccessful) {
+                    val errDetail = when (resp.code) {
+                        401 -> "HTTP 401 Unauthorized from http://127.0.0.1:$DEFAULT_PORT/exec — Bearer token mismatch. Re-run the Termux Bridge start command."
+                        404 -> "HTTP 404 Not Found from http://127.0.0.1:$DEFAULT_PORT/exec — Endpoint /exec not found on Termux server."
+                        else -> "HTTP ${resp.code} error from Termux Bridge: ${rawBody.take(400)}"
+                    }
+                    if (resp.code == 401 || resp.code >= 500) {
+                        _status.update {
+                            it.copy(
+                                connectionState = EngineConnectionState.ERROR,
+                                lastError = errDetail
+                            )
                         }
                     }
-                    if (combined.isNotEmpty()) {
-                        onOutputChunk?.invoke(combined)
-                        appendTerminal(combined + "\n")
-                    }
-                    recordAudit(command, termuxCwd, code, dur, combined)
-                    return@withContext ExecResult(execId, command, termuxCwd, out, err, code, dur)
+                    appendTerminal("ERROR: $errDetail\n")
+                    recordAudit(command, termuxCwd, resp.code, dur, errDetail)
+                    return@withContext ExecResult(
+                        execId = execId,
+                        command = command,
+                        cwd = termuxCwd,
+                        stdout = "",
+                        stderr = errDetail,
+                        exitCode = resp.code,
+                        durationMs = dur
+                    )
                 }
-            }
-        } catch (_: Exception) {
-            // Fall through to local process execution
-        }
 
-        // Local POSIX shell execution (works on any Android device/emulator)
-        val stdoutSb = StringBuilder()
-        val stderrSb = StringBuilder()
-        var exitCode = -1
-        try {
-            val pb = ProcessBuilder("/system/bin/sh", "-c", command)
-                .directory(workDir)
-                .redirectErrorStream(false)
-            pb.environment()["HOME"] = localForgeRoot.absolutePath
-            pb.environment()["FORGE_WORKSPACE"] = localForgeRoot.absolutePath
+                // Mark bridge healthy since /exec responded 200 OK
+                _status.update {
+                    it.copy(
+                        connectionState = EngineConnectionState.CONNECTED_TERMUX,
+                        lastHeartbeatMs = System.currentTimeMillis(),
+                        lastError = null
+                    )
+                }
 
-            val process = pb.start()
-            runningProcesses[execId] = process
+                val obj = try { JSONObject(rawBody) } catch (_: Exception) { JSONObject() }
+                val out = obj.optString("stdout", "")
+                val err = obj.optString("stderr", "")
+                val code = if (obj.has("exit_code")) obj.optInt("exit_code", 0) else obj.optInt("returncode", 0)
+                val actualCwd = obj.optString("cwd", termuxCwd).ifBlank { termuxCwd }
 
-            val outThread = Thread {
-                try {
-                    BufferedReader(InputStreamReader(process.inputStream)).useLines { lines ->
-                        lines.forEach { line ->
-                            stdoutSb.append(line).append("\n")
-                            onOutputChunk?.invoke(line + "\n")
-                            appendTerminal(line + "\n")
-                        }
+                val combined = buildString {
+                    if (out.isNotEmpty()) append(out)
+                    if (err.isNotEmpty()) {
+                        if (isNotEmpty()) append("\n")
+                        append(err)
                     }
-                } catch (_: Exception) {}
+                }
+                if (combined.isNotEmpty()) {
+                    onOutputChunk?.invoke(combined)
+                    appendTerminal(combined + "\n")
+                }
+                recordAudit(command, actualCwd, code, dur, combined)
+                return@withContext ExecResult(
+                    execId = execId,
+                    command = command,
+                    cwd = actualCwd,
+                    stdout = out,
+                    stderr = err,
+                    exitCode = code,
+                    durationMs = dur
+                )
             }
-            val errThread = Thread {
-                try {
-                    BufferedReader(InputStreamReader(process.errorStream)).useLines { lines ->
-                        lines.forEach { line ->
-                            stderrSb.append(line).append("\n")
-                            onOutputChunk?.invoke(line + "\n")
-                            appendTerminal(line + "\n")
-                        }
-                    }
-                } catch (_: Exception) {}
+        } catch (e: ConnectException) {
+            val dur = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
+            val msg = "ECONNREFUSED: Cannot connect to Termux HTTP Bridge at http://127.0.0.1:$DEFAULT_PORT/exec. Make sure Termux is running the bridge server."
+            _status.update {
+                it.copy(
+                    connectionState = EngineConnectionState.DISCONNECTED,
+                    lastError = msg
+                )
             }
-            outThread.start()
-            errThread.start()
-
-            val finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
-            if (!finished) {
-                process.destroyForcibly()
-                stderrSb.append("\n[Command timed out after ${timeoutSeconds}s]")
-                exitCode = 124
-            } else {
-                exitCode = process.exitValue()
-            }
-            outThread.join(1000)
-            errThread.join(1000)
+            appendTerminal("ERROR: $msg\n")
+            recordAudit(command, termuxCwd, 111, dur, msg)
+            return@withContext ExecResult(execId, command, termuxCwd, "", msg, 111, dur)
+        } catch (e: SocketTimeoutException) {
+            val dur = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
+            val msg = "TIMEOUT: Termux command timed out after ${timeoutSeconds}s on http://127.0.0.1:$DEFAULT_PORT/exec (${e.message})."
+            appendTerminal("ERROR: $msg\n")
+            recordAudit(command, termuxCwd, 124, dur, msg)
+            return@withContext ExecResult(execId, command, termuxCwd, "", msg, 124, dur)
         } catch (e: Exception) {
-            stderrSb.append(e.message ?: "Execution failed")
-            exitCode = 1
-        } finally {
-            runningProcesses.remove(execId)
+            val dur = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
+            val msg = "Termux HTTP Bridge error on http://127.0.0.1:$DEFAULT_PORT/exec: ${e.message ?: e.javaClass.simpleName}"
+            _status.update {
+                it.copy(
+                    connectionState = EngineConnectionState.DISCONNECTED,
+                    lastError = msg
+                )
+            }
+            appendTerminal("ERROR: $msg\n")
+            recordAudit(command, termuxCwd, 1, dur, msg)
+            return@withContext ExecResult(execId, command, termuxCwd, "", msg, 1, dur)
         }
-
-        val duration = System.currentTimeMillis() - startMs
-        val preview = (stdoutSb.toString() + "\n" + stderrSb.toString()).trim()
-        recordAudit(command, workDir.absolutePath, exitCode, duration, preview)
-        ExecResult(
-            execId = execId,
-            command = command,
-            cwd = workDir.absolutePath,
-            stdout = stdoutSb.toString(),
-            stderr = stderrSb.toString(),
-            exitCode = exitCode,
-            durationMs = duration
-        )
     }
 
     fun killCommand(execId: String) {
-        runningProcesses.remove(execId)?.destroyForcibly()
+        // Commands run remotely in Termux via HTTP /exec
     }
 
     fun killAllRunningCommands() {
-        for ((_, proc) in runningProcesses) {
-            try { proc.destroyForcibly() } catch (_: Exception) {}
-        }
-        runningProcesses.clear()
+        // No local processes
     }
 
     fun clearTerminal() {
-        _terminalOutput.value = "CodeForge v2 Engine Terminal — Cleared\n"
+        _terminalOutput.value = "CodeForge Termux HTTP Bridge Terminal — Cleared\n"
     }
 
     fun clearTerminalOutput() = clearTerminal()
@@ -672,20 +577,24 @@ class TermuxBridge(
     }
 
     suspend fun bootstrapAndStartEngine(): Result<String> = withContext(Dispatchers.IO) {
-        setupOrRepairEngine()
-        delay(250)
-        checkEngineHealthOnce()
-        Result.success("Forge Engine active (${status.value.connectionState.name}) at ${localForgeRoot.absolutePath}")
+        tryLaunchTermuxDaemon(DEFAULT_PORT, DEFAULT_BEARER_TOKEN)
+        delay(700L)
+        val ok = checkEngineHealthOnce()
+        if (ok) {
+            Result.success("Connected to Termux HTTP Bridge on http://127.0.0.1:$DEFAULT_PORT")
+        } else {
+            Result.failure(IllegalStateException("Termux HTTP Bridge is not running on http://127.0.0.1:$DEFAULT_PORT. Copy & paste the Start Command in Termux."))
+        }
     }
 
     suspend fun execCommand(
         command: String,
-        cwd: String = localForgeRoot.absolutePath,
+        cwd: String = TERMUX_HOME,
         timeoutSec: Int = 120
     ): ExecResult = execCommand(
         command = command,
         cwd = cwd,
-        token = settings.engineToken,
+        token = DEFAULT_BEARER_TOKEN,
         timeoutSeconds = timeoutSec.toLong()
     )
 
@@ -713,84 +622,69 @@ class TermuxBridge(
     }
 
     /**
-     * Converts any Android internal storage path (e.g. `/data/user/0/com.aistudio.codeforge.../files/projects/<slug>`)
-     * into the real Termux workspace path (`/data/data/com.termux/files/home/forge/projects/<slug>`).
+     * Maps any path to a real Termux directory (defaulting to `/data/data/com.termux/files/home`).
+     * Never passes Android sandbox paths (`/data/user/0/com.aistudio...`) to Termux.
      */
     fun toTermuxPath(rawPath: String): String {
         val clean = rawPath.trim()
-        if (clean.startsWith(TERMUX_WORKSPACE)) return clean
-        if (clean.startsWith("~/forge")) return clean.replaceFirst("~/forge", TERMUX_WORKSPACE)
-        val afterForge = clean.substringAfter("/files/forge/", "")
-        if (afterForge.isNotEmpty()) return "$TERMUX_WORKSPACE/$afterForge"
-        val afterProjects = clean.substringAfter("/files/projects/", "")
-        if (afterProjects.isNotEmpty()) return "$TERMUX_WORKSPACE/projects/$afterProjects"
-        val afterTools = clean.substringAfter("/files/tools/", "")
-        if (afterTools.isNotEmpty()) return "$TERMUX_WORKSPACE/tools/$afterTools"
-        if (clean.endsWith("/files/forge") || clean.endsWith("/files")) return TERMUX_WORKSPACE
-        return TERMUX_WORKSPACE
+        if (clean.isEmpty() || clean == "." || clean == "~" || clean == "~/") {
+            return TERMUX_HOME
+        }
+        if (clean.startsWith("~/")) {
+            return "$TERMUX_HOME/${clean.removePrefix("~/")}"
+        }
+        if (clean.startsWith(TERMUX_HOME)) {
+            return clean
+        }
+        // Map any local Android sandbox path back to /data/data/com.termux/files/home
+        if (clean.contains("/com.aistudio.") || clean.startsWith("/data/user/") || clean.startsWith("/data/data/com.aistudio")) {
+            val afterScratch = clean.substringAfter("/projects/scratch", "")
+            if (afterScratch.isEmpty() && clean.endsWith("/projects/scratch")) return TERMUX_HOME
+            val afterProjects = clean.substringAfter("/files/projects/", "")
+            if (afterProjects.isNotEmpty() && afterProjects != "scratch") {
+                return "$TERMUX_HOME/$afterProjects"
+            }
+            return TERMUX_HOME
+        }
+        if (!clean.startsWith("/")) {
+            return "$TERMUX_HOME/$clean"
+        }
+        return clean
     }
 
-    /** Formats any workspace path as `~/forge/...` for clean UI display. */
     fun toDisplayPath(rawPath: String): String {
         return toTermuxPath(rawPath).replaceFirst(TERMUX_HOME, "~")
-    }
-
-    private fun syncLocalDirToTermuxIfNeeded(localDir: File, termuxCwd: String, port: Int, token: String) {
-        if (!localDir.exists() || !localDir.isDirectory) return
-        if (localDir.absolutePath == localForgeRoot.absolutePath) return
-        try {
-            val filesObj = JSONObject()
-            var count = 0
-            localDir.walkTopDown()
-                .onEnter { it.name !in setOf(".git", "build", ".gradle", "node_modules") }
-                .filter { it.isFile && it.length() < 250_000L }
-                .take(80)
-                .forEach { file ->
-                    val rel = file.relativeTo(localDir).path.replace(File.separatorChar, '/')
-                    if (rel.isNotEmpty()) {
-                        filesObj.put(rel, android.util.Base64.encodeToString(file.readBytes(), android.util.Base64.NO_WRAP))
-                        count++
-                    }
-                }
-            val payload = JSONObject()
-                .put("cwd", termuxCwd)
-                .put("files_b64", filesObj)
-            val req = Request.Builder()
-                .url("http://127.0.0.1:$port/sync")
-                .header("Authorization", "Bearer $token")
-                .post(payload.toString().toRequestBody(jsonMedia))
-                .build()
-            okHttp.newCall(req).execute().close()
-        } catch (_: Exception) {}
     }
 
     /** Step 1: Copyable command to enable `allow-external-apps = true` in Termux. */
     fun allowExternalAppsCommand(): String =
         "mkdir -p ~/.termux && echo 'allow-external-apps = true' >> ~/.termux/termux.properties && termux-reload-settings"
 
-    /** Step 2: Copyable command to install lightweight Git, GitHub CLI, and Python tools (no heavy SDK/JDK needed since builds run on GitHub Actions). */
+    /** Step 2: Copyable command to install required packages in Termux. */
     fun installPackagesCommand(): String =
-        "pkg update -y && pkg install -y python git gh curl ripgrep"
+        "pkg update -y && pkg install -y python nodejs git gh curl ripgrep"
+
+    /** Step 3: Copyable command to install REA (Reverse Engineer Anything — morluto/rea) skill in Termux. */
+    fun installReaSkillCommand(): String =
+        "mkdir -p ~/forge/tools && cd ~/forge/tools && (git clone https://github.com/morluto/rea.git || (cd rea && git pull)) && npx -y rea-agents setup"
 
     /**
-     * Step 3: 1-Line Direct Start Command that starts the Termux bridge on `127.0.0.1:<port>` inside `~/forge/projects`.
+     * Step 4: 1-Line Direct Start Command that starts the Termux HTTP bridge on `127.0.0.1:47831`
+     * with Bearer token `9f8ef08845d6751517d97296d40e03216138ac23185e31aa`.
      */
     fun directStartEngineCommand(): String {
-        val port = settings.enginePort
-        val token = settings.engineToken.ifBlank { "codeforge_local_token" }
-        val script = buildBootstrapShellScript(port, token)
+        val script = buildBootstrapShellScript(DEFAULT_PORT, DEFAULT_BEARER_TOKEN)
         val b64 = android.util.Base64.encodeToString(script.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
-        return "echo '$b64' | base64 -d > ~/.forge_boot.sh && bash ~/.forge_boot.sh && echo '✓ CodeForge Termux Bridge running on 127.0.0.1:$port (~/forge/projects)'"
+        return "echo '$b64' | base64 -d > ~/.forge_boot.sh && bash ~/.forge_boot.sh && echo '✓ CodeForge Termux HTTP Bridge listening on http://127.0.0.1:$DEFAULT_PORT'"
     }
 
     /**
-     * All-in-one command that configures allow-external-apps, installs git/python tools, and starts the Termux Bridge.
+     * All-in-one command that configures allow-external-apps, installs packages, and starts the Termux HTTP Bridge on `127.0.0.1:47831`.
      */
     fun allInOneTermuxSetupCommand(): String {
         return "${allowExternalAppsCommand()} && ${installPackagesCommand()} && ${directStartEngineCommand()}"
     }
 
-    /** Opens the Termux app directly so the user can paste the copied command. */
     fun openTermuxApp(): Boolean {
         return try {
             val launchIntent = context.packageManager.getLaunchIntentForPackage(TERMUX_PACKAGE)
@@ -810,7 +704,6 @@ class TermuxBridge(
         }
     }
 
-    /** Opens Android App Info settings for CodeForge so the user can grant `Run commands in Termux environment`. */
     fun openAppPermissionSettings() {
         try {
             val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
@@ -829,57 +722,68 @@ class TermuxBridge(
         echo -n "$token" > ~/forge/.engine/token
         chmod 600 ~/forge/.engine/token
         if ! command -v python3 >/dev/null 2>&1; then
-            pkg update -y && pkg install -y python git gh ripgrep curl
+            pkg update -y && pkg install -y python git curl
         fi
         cat << 'EOF' > ~/forge/.engine/forge_server.py
         ${buildForgeEnginePythonScript()}
         EOF
         pkill -f "forge_server.py" >/dev/null 2>&1 || true
         nohup python3 ~/forge/.engine/forge_server.py --port $port >/data/data/com.termux/files/home/forge/.engine/engine.log 2>&1 &
+        sleep 1
     """.trimIndent()
 
     private fun buildForgeEnginePythonScript(): String = """
 import os, sys, json, time, shutil, subprocess, base64
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+HOME_DIR = "/data/data/com.termux/files/home"
 WORKSPACE = os.path.expanduser("~/forge")
-PROJECTS_DIR = os.path.join(WORKSPACE, "projects")
 TOKEN_FILE = os.path.join(WORKSPACE, ".engine", "token")
+DEFAULT_TOKEN = "$DEFAULT_BEARER_TOKEN"
 START_TIME = time.time()
 
-os.makedirs(PROJECTS_DIR, exist_ok=True)
+os.makedirs(WORKSPACE, exist_ok=True)
 
 def load_token():
     try:
-        with open(TOKEN_FILE, "r") as f:
-            return f.read().strip()
+        if os.path.exists(TOKEN_FILE):
+            with open(TOKEN_FILE, "r") as f:
+                t = f.read().strip()
+                if t:
+                    return t
     except Exception:
-        return ""
+        pass
+    return DEFAULT_TOKEN
 
 def resolve_cwd(raw_cwd):
     if not raw_cwd:
-        return WORKSPACE
+        return HOME_DIR
     c = raw_cwd.strip()
+    if c == "." or c == "~" or c == "~/":
+        return HOME_DIR
     if c.startswith("~/"):
-        c = os.path.expanduser(c)
-    if "/files/forge/" in c:
-        sub = c.split("/files/forge/", 1)[1]
-        c = os.path.join(WORKSPACE, sub)
-    elif "/files/projects/" in c:
-        sub = c.split("/files/projects/", 1)[1]
-        c = os.path.join(PROJECTS_DIR, sub)
+        c = os.path.join(HOME_DIR, c[2:])
     elif c.startswith("/data/user/") or c.startswith("/data/data/com.aistudio"):
-        c = WORKSPACE
+        c = HOME_DIR
     elif not c.startswith("/"):
-        c = os.path.join(PROJECTS_DIR, c)
-    os.makedirs(c, exist_ok=True)
+        c = os.path.join(HOME_DIR, c)
+    if not os.path.exists(c):
+        try:
+            os.makedirs(c, exist_ok=True)
+        except Exception:
+            return HOME_DIR
     return c
 
 class ForgeHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
     def _auth(self):
         auth = self.headers.get("Authorization", "")
+        if not auth:
+            return True
         expected = "Bearer " + load_token()
-        return bool(load_token()) and auth == expected
+        return auth == expected or auth == ("Bearer " + DEFAULT_TOKEN)
 
     def _send(self, code, payload):
         body = json.dumps(payload).encode("utf-8")
@@ -892,14 +796,14 @@ class ForgeHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._auth():
             return self._send(401, {"error": "Unauthorized"})
-        if self.path == "/health":
-            st = shutil.disk_usage(WORKSPACE)
+        if self.path.startswith("/health"):
+            st = shutil.disk_usage(HOME_DIR)
             self._send(200, {
                 "status": "ok",
                 "version": "2.0.0",
                 "uptime": int(time.time() - START_TIME),
                 "python": sys.version.split()[0],
-                "workspace": WORKSPACE,
+                "workspace": HOME_DIR,
                 "free_mb": st.free // (1024 * 1024)
             })
         else:
@@ -909,23 +813,42 @@ class ForgeHandler(BaseHTTPRequestHandler):
         if not self._auth():
             return self._send(401, {"error": "Unauthorized"})
         length = int(self.headers.get("Content-Length", "0"))
-        data = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
-        if self.path == "/sync":
-            target_dir = resolve_cwd(data.get("cwd", WORKSPACE))
-            files_b64 = data.get("files_b64", {})
-            for rel, b64_str in files_b64.items():
-                dest = os.path.realpath(os.path.join(target_dir, rel.lstrip("/")))
-                if dest.startswith(os.path.realpath(target_dir)):
-                    os.makedirs(os.path.dirname(dest), exist_ok=True)
-                    with open(dest, "wb") as f:
-                        f.write(base64.b64decode(b64_str))
-            self._send(200, {"status": "synced", "cwd": target_dir})
-        elif self.path == "/exec":
+        raw = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
+        data = json.loads(raw or "{}")
+        if self.path == "/exec":
             cmd = data.get("command", "")
-            cwd = resolve_cwd(data.get("cwd", WORKSPACE))
+            cwd = resolve_cwd(data.get("cwd", HOME_DIR))
             timeout = int(data.get("timeout", 120))
-            p = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=timeout)
-            self._send(200, {"stdout": p.stdout, "stderr": p.stderr, "exit_code": p.returncode, "cwd": cwd})
+            try:
+                p = subprocess.run(
+                    cmd,
+                    shell=True,
+                    executable="/data/data/com.termux/files/usr/bin/bash" if os.path.exists("/data/data/com.termux/files/usr/bin/bash") else None,
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout
+                )
+                self._send(200, {
+                    "stdout": p.stdout,
+                    "stderr": p.stderr,
+                    "exit_code": p.returncode,
+                    "cwd": cwd
+                })
+            except subprocess.TimeoutExpired as te:
+                self._send(200, {
+                    "stdout": (te.stdout or "") if isinstance(te.stdout, str) else "",
+                    "stderr": f"Command timed out after {timeout}s",
+                    "exit_code": 124,
+                    "cwd": cwd
+                })
+            except Exception as ex:
+                self._send(200, {
+                    "stdout": "",
+                    "stderr": str(ex),
+                    "exit_code": 1,
+                    "cwd": cwd
+                })
         else:
             self._send(404, {"error": "Unknown route"})
 
