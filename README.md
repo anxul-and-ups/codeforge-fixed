@@ -1,63 +1,28 @@
-# CodeForge — Android AI Coding Agent
+# CodeForge v2 — Autonomous Android Coding & Execution Workspace
 
-Chat-based coding agent for Android (Kotlin + Jetpack Compose). Import a project ZIP, chat about bugs/features, send screenshots and files, and get the fixed project back as a ZIP. Works like Claude Code / Codex, but on a phone, with your own API keys.
+CodeForge v2 is an autonomous AI coding agent and Termux/POSIX execution workspace for Android.
 
-## Interface
-- Clean light/dark UI (Settings → Appearance: System / Light / Dark).
-- Chat header shows the active model; tap it to switch provider/model. Each reply shows which model answered.
-- The agent's work is shown live as a terminal-style log (Read / Edit / Search / Write …); tap a line to see details or the exact edit.
-- Every app start opens a NEW chat. Old chats are in the side drawer (menu button, top left), across all projects.
-- The model selector sits inside the message box next to the send button.
-- While the agent works, a one-line English summary is shown; tap it to open the "Summary" sheet (title + step-by-step progress, with the exact files read/edited).
-- Attachments are sent together with your message: images, PDF (read natively by Claude/Gemini/OpenAI), text/code files, .docx, and project .zip (imported when you press send; the chat stays).
-- Builds tab: every GitHub build result and its error log, with Copy / Share / Send to AI. When a build fails, the AI asks your permission before fixing it (Settings → GitHub).
+## Key Capabilities in v2
+1. **Termux & Forge Engine Bridge (`TermuxBridge.kt`)**:
+   - Connects to F-Droid / GitHub Termux via `com.termux.permission.RUN_COMMAND` and boots a loopback daemon (`127.0.0.1`, `~/forge/.engine/forge_server.py`) authenticated with a Keystore-backed Bearer token.
+   - Falls back automatically to an embedded POSIX workspace shell (`~/forge`) when Termux is not installed.
+   - Pull-up **Forge Terminal Drawer** in Chat and **"Show command"** toggle + 1-tap Copy on every command step.
+2. **Multi-Tier File Edit Engine & Loop Guard (`AgentCoreComponents.kt`)**:
+   - Enforces **Read-Before-Edit** on every run.
+   - Multi-tier matching (exact → line-prefix stripped → whitespace-tolerant → indentation-insensitive → `insert_after_line` / `replace_line_range`) with nearest-match line-number snippets when an edit fails.
+   - `LoopGuard` prevents 3x identical calls, recovers from 3x failed edits on the same file, and halts 8-step no-progress loops.
+3. **Server-Only Live Model Discovery & 9-Class Failover (`ProviderRepository.kt`)**:
+   - **Zero hardcoded model names** anywhere in the codebase. Models, context windows, and capabilities are fetched live from each provider's `/models` endpoint when you tap **Test Connection** or **Test All**.
+   - Multi-key rotation per provider and automatic failover across `RATE_LIMIT` (429), `QUOTA_EXHAUSTED`, `AUTH` (401/403), `MODEL_UNAVAILABLE` (404), `CONTEXT_TOO_LONG`, `TRANSIENT` (5xx), `CONTENT_BLOCKED`, `NETWORK_DOWN`, and `BAD_REQUEST`.
+   - Includes a live **Fault Simulator** in Settings to test failover on demand.
+4. **Projects Workspace (`~/forge/projects/<slug>`), `AGENT.md` Memory & Tools Manager (`~/forge/tools/<tool>`)**:
+   - Every project has its own directory, Git branch tracking, automatic checkpoints, and `AGENT.md` memory file.
+   - GitHub repositories can be cloned as a project or installed as a reusable CLI/MCP tool after Termux/ARM compatibility inspection and Plan Card approval.
+   - APK / archive attachments are analyzed into `ANALYSIS.md` and end with the **"Save this source to a project?"** prompt.
 
-- Provider/model logos (Claude, OpenAI, Gemini, DeepSeek, Kimi, Grok, Perplexity) are shown next to model names; custom providers use the app icon.
-- Files tab: green tick on every edited file and its folders, syntax-highlighted scrollable viewer, Download/Share ZIP. Changes tab: Undo / Redo of AI runs.
-
-## GitHub
-- Settings → GitHub: enter your username and token, press Save. The profile (name, bio, repos) is shown and everything is written to the terminal-style GitHub log.
-- Several accounts: "Add account", switch or remove them. No branch setting: the repository's default branch is used.
-- Create a repository from the app, or choose any existing one. "Push to GitHub" first shows how many files are new / modified / deleted, then uploads everything as one commit. Empty repositories get the whole project folder by folder.
-- Chat box: small GitHub icon lists all your repositories (with search) and clones the chosen one as a project.
-
-## Chat mode and Build mode
-- Switch next to the message box. **Chat**: a normal assistant (like Claude/ChatGPT/Gemini): talks, explains, answers, and can read your project (read-only) to say which file contains something. It cannot edit; if you ask for a change it tells you to switch to **Build** (a "Switch to Build mode" button appears), then say "done". **Build**: the agent edits files.
-- New chats are always clean (no project). Attach a ZIP with + or tap the project name under the chat title to open an existing project.
-- Loop guards: repeated identical reads/searches are blocked, exploration is limited and then the agent must answer or ask a question, old tool results are trimmed to save tokens.
-- Replies follow your language (Settings → language "Auto" = same language as you, Hinglish included).
-- Messages show a circle while sending; "Thinking…" shimmers right away. The Summary sheet has titled phases, animated progress, and every finished run ends with a short report of what changed (and the bug that was fixed).
-- Providers: Test shows a green "API is active" with the number of models; "Import only free models" keeps only free ones (works for providers that publish prices, like OpenRouter).
-
-## How it works
-1. Add an API key in the **Providers** tab (Anthropic, OpenAI, Gemini, DeepSeek, Groq, OpenRouter, Mistral, Ollama, or any custom endpoint).
-2. Import a ZIP in the **Files** tab.
-3. Chat. The agent reads/searches files with tools, edits them with exact-match patches, and summarises what changed.
-4. Review the diff, accept or reject per file, restore any checkpoint, export the fixed ZIP.
-
-## Build (no PC needed)
-Push this repo to GitHub. `.github/workflows/build.yml` builds a debug APK on every push; download it from the run's **Artifacts**.
-Android Studio is not required. The app uses the default auto-generated debug keystore.
-
-## GitHub auto-build & auto-fix
-Settings → GitHub: repository (`owner/repo`), branch, and a fine-grained token (Contents: read/write, Actions: read).
-- **Push project & build now**, or enable **Auto push, build & fix**.
-- The app commits only changed files as ONE commit, waits for the Actions run, and on failure feeds the extracted error log to the agent, which fixes and pushes again (max attempts configurable).
-
-## Providers, failover and thinking
-- Per-provider format: OpenAI-compatible, Anthropic, Gemini. "Fetch models" loads the current model list from the provider.
-- Failover chain follows the priority order (arrows in Providers). On rate limit, quota/billing, auth error, overload or network error the app switches to the next provider and continues the same chat. Bad requests (HTTP 400) are not failed over.
-- Thinking level: Off / Low / Medium / High / Auto (Auto picks per request). Mapped to Anthropic extended thinking, OpenAI reasoning effort and Gemini thinking budget. Unsupported options are dropped automatically.
-
-## Settings that are saved
-Thinking level, safe mode (confirm each edit/write/delete), reply language, max agent steps, global instructions, monthly budget with hard stop, GitHub repo/branch/token (token encrypted with Android Keystore).
-
-## Security
-- API keys are encrypted with the Android Keystore; cloud backup is disabled.
-- Secret-looking files (`.env`, keystores, `google-services.json`, ...) are never read by the agent, searched, or pushed to GitHub.
-- ZIP import is protected against path traversal.
-
-## Known limits
-- The app cannot compile code on the phone; builds run on GitHub Actions.
-- One API key per provider entry (add a second provider entry with the same URL for a second key).
-- Cost figures are estimates from a built-in price table.
+## Manual Verification Checklist
+- [ ] **Termux & Diagnostics**: Open **Settings → 1. Setup & Diagnostics** and tap **Run Self-Test** and **Start / Repair Engine**. Open the **Terminal Drawer** (`>_` icon in Chat header) and run `ls -la` or `echo hello`.
+- [ ] **Live Server Model Discovery**: Open **Settings → Manage Providers & Keys**, enter an API key (or local endpoint), and tap **Test Connection & Load Models**. Verify the green status dot, latency in ms, and live model list in the **Model Picker** bottom sheet.
+- [ ] **Fault Simulator & Failover**: In **Settings → 4. Fallback Engine & Fault Simulator**, tap **Simulate 429** and send a chat message to observe automatic key/provider failover and the entry in the **Recent Failover Activity Log**.
+- [ ] **Build Mode & Working Files**: Switch the header pill to **Build**, attach or create a project in **Projects**, ask the agent to edit a file, and tap the **Working Files** badge in the header to inspect `+X -Y` diffs or revert individual files.
+- [ ] **APK / Archive Analysis Save Prompt**: Attach an `.apk` or archive in Chat using `+` and send; verify the **"Save this source to a project?"** modal offers saving to a new project, active project (`reference/<name>/`), report only, or temporary output.

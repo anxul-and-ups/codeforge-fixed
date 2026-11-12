@@ -1,0 +1,8 @@
+{
+  "name": "CodeForge",
+  "description": "Mobile AI coding agent with Termux HTTP bridge, live server model discovery, and REA reverse-engineering workflow",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

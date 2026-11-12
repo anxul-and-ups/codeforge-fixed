@@ -493,7 +493,7 @@ class LlmClient(
         val base = provider.baseUrl.trim().trimEnd('/')
         val url = if (base.endsWith("/chat/completions")) base else "$base/chat/completions"
         val modelName = provider.selectedModel.lowercase().substringAfterLast('/')
-        val isReasoningModel = Regex("^(o\\d|gpt-5)").containsMatchIn(modelName)
+        val isReasoningModel = modelName.contains("reason") || modelName.startsWith("o1") || modelName.startsWith("o3") || modelName.startsWith("o4")
         val useCompletionTokens = isReasoningModel && base.contains("api.openai.com")
 
         val root = JSONObject()
@@ -1005,8 +1005,8 @@ class LlmClient(
         fetchModelsDetailed(provider, false).models
 
     /**
-     * Same as [fetchModels] plus counts. With [freeOnly] the list keeps only models that are free:
-     * the provider must publish prices (OpenRouter does) or mark them with a ":free" suffix.
+     * Fetches full model metadata directly from the server response (`/v1/models`, `v1beta/models`, `/models`)
+     * including id, displayName, contextWindow, maxOutput, supportsTools, supportsVision, and pricing.
      */
     suspend fun fetchModelsDetailed(provider: ProviderConfigEntity, freeOnly: Boolean): ModelFetch {
         val apiKey = KeyStoreManager.decrypt(provider.encryptedApiKey)
@@ -1033,6 +1033,7 @@ class LlmClient(
             if (!response.isSuccessful) throw apiError(response, "Model list")
             val obj = JSONObject(response.body?.string() ?: "{}")
             val out = mutableListOf<String>()
+            val richList = mutableListOf<ServerModelMetadata>()
             val freeIds = HashSet<String>()
             var pricingKnown = false
             if (format == "GEMINI") {
@@ -1046,7 +1047,23 @@ class LlmClient(
                             if (methods.optString(j) == "generateContent") ok = true
                         }
                     }
-                    if (ok) out.add(m.optString("name").removePrefix("models/"))
+                    if (!ok) continue
+                    val id = m.optString("name").removePrefix("models/")
+                    if (id.isBlank() || id.contains("embedding", ignoreCase = true) || id.contains("aqa", ignoreCase = true)) continue
+                    val display = m.optString("displayName").ifBlank { id }
+                    val ctx = m.optInt("inputTokenLimit", 0)
+                    val maxOut = m.optInt("outputTokenLimit", 0)
+                    out.add(id)
+                    richList.add(
+                        ServerModelMetadata(
+                            id = id,
+                            displayName = display,
+                            contextWindow = ctx,
+                            maxOutput = maxOut,
+                            supportsTools = true,
+                            supportsVision = true
+                        )
+                    )
                 }
             } else {
                 val arr = obj.optJSONArray("data") ?: obj.optJSONArray("models") ?: JSONArray()
@@ -1055,21 +1072,54 @@ class LlmClient(
                     when (item) {
                         is JSONObject -> {
                             val id = item.optString("id").ifEmpty { item.optString("name") }
+                            if (id.isBlank()) continue
+                            val lowerId = id.lowercase()
+                            if (lowerId.contains("embedding") || lowerId.contains("tts") || lowerId.contains("whisper") || lowerId.contains("moderation")) {
+                                continue
+                            }
                             out.add(id)
+                            val display = item.optString("display_name").ifEmpty { item.optString("name").ifEmpty { id } }
+                            val ctx = item.optInt("context_length", item.optInt("context_window", item.optInt("max_input_tokens", 0)))
+                            val topProv = item.optJSONObject("top_provider")
+                            val maxOut = item.optInt("max_output_tokens", topProv?.optInt("max_completion_tokens", 0) ?: 0)
+                            val arch = item.optJSONObject("architecture")
+                            val modality = arch?.optString("modality", "") ?: ""
+                            val hasVision = modality.contains("image") || provider.supportsVision
+                            val supportedParams = item.optJSONArray("supported_parameters")
+                            var hasTools = provider.supportsTools
+                            if (supportedParams != null) {
+                                hasTools = (0 until supportedParams.length()).any {
+                                    supportedParams.optString(it).contains("tool", ignoreCase = true)
+                                }
+                            }
+                            var inPrice = 0.0
+                            var outPrice = 0.0
                             val pricing = item.optJSONObject("pricing")
                             if (pricing != null) {
                                 pricingKnown = true
-                                fun zero(key: String): Boolean {
-                                    if (!pricing.has(key)) return true
-                                    val v = pricing.opt(key)
-                                    return v == null || v.toString().trim().toDoubleOrNull() == 0.0
-                                }
-                                if (zero("prompt") && zero("completion")) freeIds.add(id)
+                                val pPrompt = pricing.optString("prompt", "0").toDoubleOrNull() ?: 0.0
+                                val pComp = pricing.optString("completion", "0").toDoubleOrNull() ?: 0.0
+                                // OpenRouter reports price per token; convert to per-million if tiny
+                                inPrice = if (pPrompt in 0.0..0.01) pPrompt * 1_000_000.0 else pPrompt
+                                outPrice = if (pComp in 0.0..0.01) pComp * 1_000_000.0 else pComp
+                                if (pPrompt == 0.0 && pComp == 0.0) freeIds.add(id)
                             }
                             if (id.endsWith(":free")) {
                                 pricingKnown = true
                                 freeIds.add(id)
                             }
+                            richList.add(
+                                ServerModelMetadata(
+                                    id = id,
+                                    displayName = display,
+                                    contextWindow = ctx,
+                                    maxOutput = maxOut,
+                                    supportsTools = hasTools,
+                                    supportsVision = hasVision,
+                                    inputPricePerMillion = inPrice,
+                                    outputPricePerMillion = outPrice
+                                )
+                            )
                         }
                         is String -> {
                             out.add(item)
@@ -1077,25 +1127,46 @@ class LlmClient(
                                 pricingKnown = true
                                 freeIds.add(item)
                             }
+                            richList.add(ServerModelMetadata(id = item, displayName = item))
                         }
                     }
                 }
             }
             val all = out.filter { it.isNotBlank() }.distinct().sorted()
             val shown = if (freeOnly && pricingKnown) all.filter { it in freeIds } else all
-            ModelFetch(models = shown, total = all.size, freeCount = freeIds.size, pricingKnown = pricingKnown)
+            val filteredRich = richList.filter { it.id in shown }.distinctBy { it.id }
+            ModelFetch(
+                models = shown,
+                total = all.size,
+                freeCount = freeIds.size,
+                pricingKnown = pricingKnown,
+                richModels = filteredRich
+            )
         }
     }
 
     /** Returns null on success, otherwise a readable error message. */
     suspend fun testConnectionError(provider: ProviderConfigEntity): String? {
         return try {
+            // Step 1: Try cheap model-list endpoint first (0 tokens, confirms auth + reachability + fetches models)
+            val fetched = try {
+                fetchModelsDetailed(provider, false)
+            } catch (e: Exception) {
+                null
+            }
+            if (fetched != null && fetched.models.isNotEmpty()) {
+                return null
+            }
+            // Step 2: If model list endpoint is unsupported or empty, send a tiny completion if a model is selected
+            if (provider.selectedModel.isBlank()) {
+                return "Connected, but no model list was returned. Enter a custom model ID."
+            }
             val req = LlmRequest(
                 systemPrompt = "",
                 messages = listOf(LlmMessage(role = "user", content = "Reply with the single word OK")),
                 tools = emptyList(),
                 reasoningLevel = ReasoningLevel.OFF,
-                maxTokens = 32
+                maxTokens = 8
             )
             val res = execute(provider, req)
             if (res.content.isNotBlank() || res.completionTokens > 0) null else "Empty response from provider"
@@ -1109,13 +1180,25 @@ class LlmClient(
     suspend fun testConnection(provider: ProviderConfigEntity): Boolean = testConnectionError(provider) == null
 }
 
+data class ServerModelMetadata(
+    val id: String,
+    val displayName: String,
+    val contextWindow: Int = 0,
+    val maxOutput: Int = 0,
+    val supportsTools: Boolean = true,
+    val supportsVision: Boolean = false,
+    val inputPricePerMillion: Double = 0.0,
+    val outputPricePerMillion: Double = 0.0
+)
+
 /** Result of loading a provider's model list. */
 data class ModelFetch(
     val models: List<String>,
     val total: Int,
     val freeCount: Int,
     /** False when the provider does not say which models are free (then "free only" cannot filter). */
-    val pricingKnown: Boolean
+    val pricingKnown: Boolean,
+    val richModels: List<ServerModelMetadata> = emptyList()
 )
 
 class ApiException(

@@ -1,16 +1,18 @@
 package com.example.data.local.dao
 
 import androidx.room.Dao
-import androidx.room.Delete
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
-import androidx.room.Transaction
 import androidx.room.Update
+import com.example.data.local.entity.ApiKeyEntity
 import com.example.data.local.entity.AttachmentEntity
 import com.example.data.local.entity.CheckpointEntity
 import com.example.data.local.entity.ConversationEntity
+import com.example.data.local.entity.HealthStateEntity
+import com.example.data.local.entity.InstalledToolEntity
 import com.example.data.local.entity.MessageEntity
+import com.example.data.local.entity.ModelCacheEntity
 import com.example.data.local.entity.ProjectEntity
 import com.example.data.local.entity.ProviderConfigEntity
 import com.example.data.local.entity.ToolStepEntity
@@ -174,4 +176,71 @@ interface ProviderDao {
 
     @Query("DELETE FROM provider_configs WHERE id = :id")
     suspend fun deleteProvider(id: String)
+
+    // Multi-key & Server-fetched Model Cache & Health States
+    @Query("SELECT * FROM api_keys ORDER BY sortOrder ASC")
+    fun getAllApiKeys(): Flow<List<ApiKeyEntity>>
+
+    @Query("SELECT * FROM api_keys WHERE providerId = :providerId ORDER BY sortOrder ASC")
+    suspend fun getApiKeysForProviderOnce(providerId: String): List<ApiKeyEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertApiKey(key: ApiKeyEntity)
+
+    @Query("DELETE FROM api_keys WHERE id = :id")
+    suspend fun deleteApiKey(id: String)
+
+    @Query("SELECT * FROM model_cache ORDER BY favorite DESC, lastUsedAt DESC, displayName ASC")
+    fun getAllCachedModels(): Flow<List<ModelCacheEntity>>
+
+    @Query("SELECT * FROM model_cache WHERE providerId = :providerId ORDER BY favorite DESC, displayName ASC")
+    suspend fun getCachedModelsForProviderOnce(providerId: String): List<ModelCacheEntity>
+
+    @Query("SELECT * FROM model_cache WHERE modelId = :modelId LIMIT 1")
+    suspend fun getCachedModelById(modelId: String): ModelCacheEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertCachedModels(models: List<ModelCacheEntity>)
+
+    @Update
+    suspend fun updateCachedModel(model: ModelCacheEntity)
+
+    @Query("DELETE FROM model_cache WHERE providerId = :providerId")
+    suspend fun clearCachedModelsForProvider(providerId: String)
+
+    @Query("SELECT * FROM health_states")
+    fun getAllHealthStates(): Flow<List<HealthStateEntity>>
+
+    @Query("SELECT * FROM health_states WHERE keyId = :keyId AND modelId = :modelId LIMIT 1")
+    suspend fun getHealthState(keyId: String, modelId: String): HealthStateEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertHealthState(state: HealthStateEntity)
+}
+
+@Dao
+interface InstalledToolDao {
+    @Query("SELECT * FROM installed_tools ORDER BY installedAt DESC")
+    fun getAllTools(): Flow<List<InstalledToolEntity>>
+
+    @Query("SELECT * FROM installed_tools ORDER BY installedAt DESC")
+    suspend fun getAllToolsOnce(): List<InstalledToolEntity>
+
+    @Query("SELECT * FROM installed_tools WHERE enabled = 1 ORDER BY installedAt DESC")
+    suspend fun getEnabledToolsOnce(): List<InstalledToolEntity>
+
+    @Query("SELECT * FROM installed_tools WHERE id = :id LIMIT 1")
+    suspend fun getToolById(id: String): InstalledToolEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertTool(tool: InstalledToolEntity)
+
+    @Update
+    suspend fun updateTool(tool: InstalledToolEntity)
+
+    @Query("UPDATE installed_tools SET enabled = :enabled WHERE id = :id")
+    suspend fun setToolEnabled(id: String, enabled: Boolean)
+
+    @Query("DELETE FROM installed_tools WHERE id = :id")
+    suspend fun deleteTool(id: String)
 }

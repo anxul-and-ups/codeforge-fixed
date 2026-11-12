@@ -5,52 +5,94 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.Color
 
-enum class ThemeMode { SYSTEM, LIGHT, DARK }
+enum class ThemeMode { SYSTEM, LIGHT, DARK, AMOLED }
+
+enum class AccentPreset(val displayName: String, val darkColor: Color, val lightColor: Color, val softDark: Color, val softLight: Color) {
+    INDIGO("Indigo", Color(0xFF7C8CFF), Color(0xFF4B5EFF), Color(0xFF1E2440), Color(0xFFE8ECFF)),
+    TEAL("Teal", Color(0xFF38D9A9), Color(0xFF0CA678), Color(0xFF14332C), Color(0xFFE0FAF2)),
+    VIOLET("Violet", Color(0xFFA78BFA), Color(0xFF7C3AED), Color(0xFF281F42), Color(0xFFF0EBFF)),
+    AMBER("Amber", Color(0xFFF5B546), Color(0xFFD97706), Color(0xFF362814), Color(0xFFFFF4E0)),
+    ROSE("Rose", Color(0xFFFF6B8B), Color(0xFFE11D48), Color(0xFF3A1A24), Color(0xFFFFE8EE));
+
+    val label: String get() = displayName
+}
 
 /**
- * Single source of truth for all colours. Plain getters that read Compose state, so they work in
- * any context (composables, modifiers, default parameters) and update automatically when the
- * theme mode changes.
+ * Section 13.2 — Soft, Premium, Smooth Design System Tokens:
+ * - Dark (`#0E1014`), AMOLED (`#000000`), Light (`#F6F7F9`), System
+ * - Cards (`#161A20`), Elevated (`#1C2128`), Hairline border (`6-8%` white/black)
+ * - 5 user-selectable Accents (Indigo `#7C8CFF` default, Teal, Violet, Amber, Rose)
+ * - Semantic: success `#4CD7A0`, warning `#F5B546`, error `#FF6B7A`, info `#6FB7FF`
  */
 object AppColors {
-    var mode by mutableStateOf(ThemeMode.SYSTEM)
-    var systemDark by mutableStateOf(true)
+    var mode by mutableStateOf(ThemeMode.LIGHT)
+    var accentPreset by mutableStateOf(AccentPreset.AMBER)
+    var systemDark by mutableStateOf(false)
 
     val isDark: Boolean
         get() = when (mode) {
-            ThemeMode.DARK -> true
+            ThemeMode.DARK, ThemeMode.AMOLED -> true
             ThemeMode.LIGHT -> false
             ThemeMode.SYSTEM -> systemDark
         }
 
-    val bg: Color get() = if (isDark) Color(0xFF111214) else Color(0xFFF6F6F7)
-    val surface: Color get() = if (isDark) Color(0xFF1A1B1E) else Color(0xFFFFFFFF)
-    val surfaceAlt: Color get() = if (isDark) Color(0xFF25262A) else Color(0xFFEDEEF0)
-    val border: Color get() = if (isDark) Color(0xFF2E3035) else Color(0xFFE1E2E5)
-    val codeBg: Color get() = if (isDark) Color(0xFF0F1012) else Color(0xFFF0F1F3)
+    val isAmoled: Boolean
+        get() = mode == ThemeMode.AMOLED
 
-    val textPrimary: Color get() = if (isDark) Color(0xFFECECEF) else Color(0xFF1B1C1F)
-    val textSecondary: Color get() = if (isDark) Color(0xFFA3A4AB) else Color(0xFF5D5F67)
-    val textMuted: Color get() = if (isDark) Color(0xFF74757D) else Color(0xFF8A8C94)
+    val bg: Color
+        get() = when {
+            isAmoled -> Color(0xFF000000)
+            isDark -> Color(0xFF0E1014)
+            else -> Color(0xFFF6F7F9)
+        }
 
-    val accent: Color get() = if (isDark) Color(0xFF8FA8F5) else Color(0xFF3558D6)
-    val onAccent: Color get() = if (isDark) Color(0xFF0E1630) else Color(0xFFFFFFFF)
-    val accentSoft: Color get() = if (isDark) Color(0xFF232C48) else Color(0xFFE5EBFC)
+    val surface: Color
+        get() = when {
+            isAmoled -> Color(0xFF0B0D11)
+            isDark -> Color(0xFF161A20)
+            else -> Color(0xFFFFFFFF)
+        }
 
-    val warn: Color get() = if (isDark) Color(0xFFE2AD5B) else Color(0xFFA9680F)
-    val ok: Color get() = if (isDark) Color(0xFF68C493) else Color(0xFF237A4B)
-    val error: Color get() = if (isDark) Color(0xFFEA7C78) else Color(0xFFC8423D)
+    val surfaceAlt: Color
+        get() = when {
+            isAmoled -> Color(0xFF14181F)
+            isDark -> Color(0xFF1C2128)
+            else -> Color(0xFFEEF1F6)
+        }
+
+    val border: Color
+        get() = if (isDark) Color(0x14FFFFFF) else Color(0x12000000)
+
+    val codeBg: Color
+        get() = when {
+            isAmoled -> Color(0xFF050608)
+            isDark -> Color(0xFF0B0D11)
+            else -> Color(0xFFF0F2F6)
+        }
+
+    val textPrimary: Color get() = if (isDark) Color(0xFFE8EAEE) else Color(0xFF14171F)
+    val textSecondary: Color get() = if (isDark) Color(0xFF9AA3AF) else Color(0xFF525B68)
+    val textMuted: Color get() = if (isDark) Color(0xFF6B7480) else Color(0xFF848E9C)
+
+    val accent: Color get() = if (isDark) accentPreset.darkColor else accentPreset.lightColor
+    val onAccent: Color get() = if (isDark) Color(0xFF0A0D18) else Color(0xFFFFFFFF)
+    val accentSoft: Color get() = if (isDark) accentPreset.softDark else accentPreset.softLight
+
+    val ok: Color get() = if (isDark) Color(0xFF4CD7A0) else Color(0xFF129A66)
+    val warn: Color get() = if (isDark) Color(0xFFF5B546) else Color(0xFFC47F0A)
+    val error: Color get() = if (isDark) Color(0xFFFF6B7A) else Color(0xFFD93848)
+    val info: Color get() = if (isDark) Color(0xFF6FB7FF) else Color(0xFF1A73E8)
     val reasoning: Color get() = if (isDark) Color(0xFFB7A3DD) else Color(0xFF6F52AE)
 
     val synKeyword: Color get() = if (isDark) Color(0xFFC49BF0) else Color(0xFF7A3E9D)
-    val synString: Color get() = if (isDark) Color(0xFF9CCB7E) else Color(0xFF2E7D32)
-    val synComment: Color get() = if (isDark) Color(0xFF7C8089) else Color(0xFF7A7F87)
-    val synNumber: Color get() = if (isDark) Color(0xFFE5A559) else Color(0xFFB45F06)
-    val synType: Color get() = if (isDark) Color(0xFF7FB8E8) else Color(0xFF1F5FA8)
+    val synString: Color get() = if (isDark) Color(0xFF8CE09A) else Color(0xFF2E7D32)
+    val synComment: Color get() = if (isDark) Color(0xFF6B7480) else Color(0xFF7A7F87)
+    val synNumber: Color get() = if (isDark) Color(0xFFF5B546) else Color(0xFFB45F06)
+    val synType: Color get() = if (isDark) Color(0xFF6FB7FF) else Color(0xFF1F5FA8)
     val synAnnotation: Color get() = if (isDark) Color(0xFFD9BE7E) else Color(0xFF8A6D0B)
 
-    val diffAddBg: Color get() = if (isDark) Color(0xFF173225) else Color(0xFFE2F4E9)
-    val diffAddText: Color get() = if (isDark) Color(0xFF86D7A8) else Color(0xFF1C7343)
-    val diffRemoveBg: Color get() = if (isDark) Color(0xFF3A1D1F) else Color(0xFFFBE6E5)
-    val diffRemoveText: Color get() = if (isDark) Color(0xFFF2A3A0) else Color(0xFFAE312C)
+    val diffAddBg: Color get() = if (isDark) Color(0xFF122B22) else Color(0xFFE2F6EC)
+    val diffAddText: Color get() = if (isDark) Color(0xFF4CD7A0) else Color(0xFF147A50)
+    val diffRemoveBg: Color get() = if (isDark) Color(0xFF33181D) else Color(0xFFFDE8EA)
+    val diffRemoveText: Color get() = if (isDark) Color(0xFFFF6B7A) else Color(0xFFB82838)
 }

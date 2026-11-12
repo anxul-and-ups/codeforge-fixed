@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -27,31 +28,44 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.CloudUpload
+import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Restore
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Send
-import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.rememberDrawerState
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -65,6 +79,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -72,20 +87,20 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.data.agent.AgentMode
+import com.example.data.agent.WorkingFileEntry
+import com.example.data.agent.WorkingFileState
 import com.example.data.local.entity.MessageEntity
 import com.example.data.local.entity.ToolStepEntity
-import com.example.data.agent.AgentMode
 import com.example.ui.components.AgentSummaryBar
-import com.example.ui.components.ThinkingRow
-import androidx.compose.material.icons.filled.ArrowDropDown
-import androidx.compose.material.icons.filled.Check
-import androidx.compose.material3.CircularProgressIndicator as SendSpinner
 import com.example.ui.components.MarkdownContentView
 import com.example.ui.components.ProviderIcon
 import com.example.ui.components.ThinkingBlockView
+import com.example.ui.components.ThinkingRow
 import com.example.ui.theme.AppColors
 import kotlinx.coroutines.launch
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(
     viewModel: ChatViewModel,
@@ -93,6 +108,8 @@ fun ChatScreen(
     onAddProvider: () -> Unit = {},
     onSetupProvider: (String) -> Unit = {},
     onOpenGitHub: () -> Unit = {},
+    onOpenDiffReview: () -> Unit = {},
+    onOpenSettings: () -> Unit = {},
     githubManager: com.example.data.github.GitHubManager? = null,
     githubConnected: Boolean = false
 ) {
@@ -100,16 +117,25 @@ fun ChatScreen(
     val messages by viewModel.messages.collectAsState()
     val toolStepsMap by viewModel.toolStepsMap.collectAsState()
     val providers by viewModel.providers.collectAsState()
+    val cachedModels by viewModel.cachedModels.collectAsState()
     val preferredId by viewModel.preferredProviderId.collectAsState()
+    val workingFiles by viewModel.workingFiles.collectAsState()
+    val engineHealth by viewModel.engineHealth.collectAsState()
+    val terminalOutput by viewModel.terminalOutput.collectAsState()
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val drawerState = rememberDrawerState(DrawerValue.Closed)
 
-    var inputText by remember { mutableStateOf("") }
+    var inputText by remember(uiState.activeConversation?.id) {
+        mutableStateOf(viewModel.getDraftForCurrentChat())
+    }
     var showModelPicker by remember { mutableStateOf(false) }
+    var showAgentPicker by remember { mutableStateOf(false) }
     var showAttachMenu by remember { mutableStateOf(false) }
     var showRepoPicker by remember { mutableStateOf(false) }
     var showProjectPicker by remember { mutableStateOf(false) }
+    var showWorkingFilesSheet by remember { mutableStateOf(false) }
+    var showTerminalSheet by remember { mutableStateOf(false) }
     val projectsList by viewModel.projectsList.collectAsState()
     val isScratch = uiState.activeProject?.id == com.example.data.repository.ProjectRepository.SCRATCH_ID
 
@@ -120,8 +146,14 @@ fun ChatScreen(
 
     val activeProvider = providers.firstOrNull { it.id == preferredId && isProviderReady(it) }
         ?: providers.firstOrNull { isProviderReady(it) }
-    val modelLabel = activeProvider?.selectedModel ?: "Add a provider"
-    val modelReady = activeProvider != null
+    val providerPrefix = activeProvider?.id?.lowercase()?.takeIf { it.isNotBlank() }
+    val rawModelId = activeProvider?.selectedModel?.ifBlank { "pick-model" } ?: "add-provider"
+    val fullModelLabel = if (providerPrefix != null && !rawModelId.contains("/")) {
+        "$providerPrefix/$rawModelId"
+    } else {
+        rawModelId
+    }
+    val shortModelLabel = rawModelId.substringAfterLast('/')
 
     val photoPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
@@ -134,7 +166,6 @@ fun ChatScreen(
         if (uri != null) viewModel.addAttachment(uri, uri.lastPathSegment?.substringAfterLast('/') ?: "file", isImage = false)
     }
 
-    // Keep the newest content in view
     val stepCount = toolStepsMap.values.sumOf { it.size }
     LaunchedEffect(messages.size, stepCount, uiState.streamingContent.length / 40, uiState.isAgentRunning) {
         val total = listState.layoutInfo.totalItemsCount
@@ -193,6 +224,7 @@ fun ChatScreen(
         ModelPickerDialog(
             providers = providers,
             activeProviderId = activeProvider?.id,
+            cachedModels = cachedModels,
             onSelect = { pid, model ->
                 viewModel.selectModel(pid, model)
                 showModelPicker = false
@@ -205,7 +237,42 @@ fun ChatScreen(
                 showModelPicker = false
                 onAddProvider()
             },
+            onToggleFavorite = { pid, mid, fav -> viewModel.toggleFavoriteModel(pid, mid, fav) },
+            onAddCustomModelId = { pid, mid -> viewModel.addCustomModelId(pid, mid) },
+            onRefreshProviderModels = { pid -> viewModel.refreshProviderModels(pid) },
             onDismiss = { showModelPicker = false }
+        )
+    }
+    if (showAgentPicker) {
+        ChooseAgentBottomSheet(
+            currentMode = uiState.mode,
+            onSelectMode = { mode ->
+                viewModel.setMode(mode)
+                showAgentPicker = false
+            },
+            onDismiss = { showAgentPicker = false }
+        )
+    }
+    if (showWorkingFilesSheet) {
+        WorkingFilesBottomSheet(
+            workingFiles = workingFiles,
+            onOpenDiff = {
+                showWorkingFilesSheet = false
+                onOpenDiffReview()
+            },
+            onRevertFile = { path -> viewModel.revertSingleFile(path) },
+            onRevertAll = { viewModel.revertAllChangesInLastRun() },
+            onDismiss = { showWorkingFilesSheet = false }
+        )
+    }
+    if (showTerminalSheet) {
+        TerminalDrawerBottomSheet(
+            output = terminalOutput,
+            engineConnected = engineHealth.engineRunning,
+            onRunCommand = { cmd -> viewModel.runTerminalCommand(cmd) },
+            onClear = { viewModel.clearTerminal() },
+            onRepairEngine = { viewModel.repairEngine() },
+            onDismiss = { showTerminalSheet = false }
         )
     }
 
@@ -229,55 +296,210 @@ fun ChatScreen(
                 .background(AppColors.bg)
                 .imePadding()
         ) {
-            // ---------------- Header ----------------
-            Row(
+            // ---------------- Top Header (Matches Screenshot & Video) ----------------
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .background(AppColors.bg)
-                    .padding(horizontal = 4.dp, vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically
+                    .padding(horizontal = 8.dp, vertical = 6.dp)
             ) {
-                IconButton(onClick = { scope.launch { drawerState.open() } }) {
-                    Icon(Icons.Default.Menu, contentDescription = "Chats", tint = AppColors.textPrimary)
-                }
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = uiState.activeConversation?.title?.takeIf { it != "New Chat" } ?: "New chat",
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = AppColors.textPrimary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Row(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(6.dp))
-                            .clickable { showProjectPicker = true },
-                        verticalAlignment = Alignment.CenterVertically
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(
+                        onClick = { scope.launch { drawerState.open() } },
+                        modifier = Modifier.size(38.dp)
                     ) {
-                        Text(
-                            text = if (isScratch) "No project · tap to attach" else (uiState.activeProject?.name ?: "No project"),
-                            fontSize = 12.sp,
-                            color = if (isScratch) AppColors.textMuted else AppColors.accent,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.widthIn(max = 240.dp)
-                        )
                         Icon(
-                            Icons.Default.ArrowDropDown,
-                            contentDescription = "Choose project",
-                            tint = AppColors.textMuted,
-                            modifier = Modifier.size(16.dp)
+                            Icons.Default.Menu,
+                            contentDescription = "Conversations",
+                            tint = AppColors.textPrimary
+                        )
+                    }
+
+                    Column(modifier = Modifier.weight(1f)) {
+                        // Project title row
+                        Row(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .clickable { showProjectPicker = true }
+                                .padding(horizontal = 4.dp, vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = if (isScratch) {
+                                    uiState.activeConversation?.title?.takeIf { it != "New Chat" } ?: "CodeForge"
+                                } else {
+                                    uiState.activeProject?.name ?: "Project"
+                                },
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = AppColors.textPrimary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "~/forge/projects/${if (isScratch) "scratch" else (uiState.activeProject?.slug ?: "app")}",
+                                fontSize = 10.sp,
+                                fontFamily = FontFamily.Monospace,
+                                color = AppColors.textMuted,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(4.dp))
+
+                        // Model dropdown pill + Agent dropdown pill (`[ provider/model ⌄ ]  [ build ⌄ ]`)
+                        Row(
+                            modifier = Modifier.horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            // Model Dropdown Pill
+                            Surface(
+                                shape = RoundedCornerShape(10.dp),
+                                color = AppColors.surface,
+                                modifier = Modifier
+                                    .border(1.dp, AppColors.border, RoundedCornerShape(10.dp))
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .clickable { showModelPicker = true }
+                                    .testTag("model_chip")
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = fullModelLabel,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Medium,
+                                        color = AppColors.textPrimary,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.widthIn(max = 195.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Icon(
+                                        Icons.Default.KeyboardArrowDown,
+                                        contentDescription = "Select model",
+                                        tint = AppColors.accent,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
+                            }
+
+                            // Agent Mode Dropdown Pill (`build ⌄` / `plan ⌄`)
+                            val modeLabel = if (uiState.mode == AgentMode.BUILD) "build" else "plan"
+                            Surface(
+                                shape = RoundedCornerShape(10.dp),
+                                color = AppColors.surface,
+                                modifier = Modifier
+                                    .border(1.dp, AppColors.border, RoundedCornerShape(10.dp))
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .clickable { showAgentPicker = true }
+                                    .testTag("agent_mode_pill")
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = modeLabel,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Medium,
+                                        color = AppColors.textPrimary
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Icon(
+                                        Icons.Default.KeyboardArrowDown,
+                                        contentDescription = "Choose agent",
+                                        tint = AppColors.accent,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
+                            }
+
+                            // Working Files Pill Badge
+                            if (workingFiles.isNotEmpty()) {
+                                Surface(
+                                    shape = RoundedCornerShape(10.dp),
+                                    color = AppColors.accentSoft,
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .clickable { showWorkingFilesSheet = true }
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(
+                                            Icons.Default.Description,
+                                            contentDescription = "Working files",
+                                            tint = AppColors.accent,
+                                            modifier = Modifier.size(13.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text(
+                                            "${workingFiles.size}",
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = AppColors.accent
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // GitHub Actions Cloud Build trigger button
+                    if (!isScratch) {
+                        IconButton(
+                            onClick = { viewModel.pushAndBuild() },
+                            modifier = Modifier.size(36.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.CloudUpload,
+                                contentDescription = "Push & Build on GitHub Actions",
+                                tint = AppColors.accent,
+                                modifier = Modifier.size(19.dp)
+                            )
+                        }
+                    }
+
+                    // Terminal Drawer Button
+                    IconButton(
+                        onClick = { showTerminalSheet = true },
+                        modifier = Modifier.size(36.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.Terminal,
+                            contentDescription = "Open Terminal Drawer",
+                            tint = if (engineHealth.engineRunning) AppColors.ok else AppColors.textSecondary,
+                            modifier = Modifier.size(19.dp)
+                        )
+                    }
+
+                    // Settings Button (matches top-right gear in screenshot)
+                    IconButton(
+                        onClick = onOpenSettings,
+                        modifier = Modifier.size(36.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.Settings,
+                            contentDescription = "Settings",
+                            tint = AppColors.textSecondary,
+                            modifier = Modifier.size(20.dp)
                         )
                     }
                 }
-                IconButton(onClick = { viewModel.newConversation() }) {
-                    Icon(Icons.Default.Add, contentDescription = "New chat", tint = AppColors.textPrimary)
-                }
             }
+
             Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(AppColors.border))
 
-            // ---------------- Notice banner ----------------
+            // ---------------- Failover / Status Notice banner ----------------
             val notice = uiState.failoverNotice
             if (notice != null) {
                 Surface(color = AppColors.accentSoft, modifier = Modifier.fillMaxWidth()) {
@@ -304,16 +526,19 @@ fun ChatScreen(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth()
-                    .padding(horizontal = 14.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp)
+                    .padding(horizontal = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
                 item { Spacer(modifier = Modifier.height(4.dp)) }
 
                 if (visibleMessages.isEmpty() && !uiState.isAgentRunning) {
                     item {
                         EmptyChat(
-                            projectName = uiState.activeProject?.name,
-                            onPrompt = { inputText = it }
+                            projectName = if (isScratch) null else uiState.activeProject?.name,
+                            onPrompt = {
+                                inputText = it
+                                viewModel.saveDraftForCurrentChat(it)
+                            }
                         )
                     }
                 }
@@ -328,99 +553,144 @@ fun ChatScreen(
                         liveContent = if (live) uiState.streamingContent else "",
                         liveReasoning = if (live) uiState.streamingReasoning else "",
                         fallbackTitle = uiState.activeConversation?.title?.takeIf { it != "New Chat" } ?: "Working on your request",
+                        activeModelShortLabel = shortModelLabel,
                         isChatMode = uiState.mode == AgentMode.CHAT,
                         onRetry = { viewModel.retryFailedMessage(message) },
-                        onSwitchToBuild = { viewModel.setMode(AgentMode.BUILD) }
+                        onSwitchToBuild = { viewModel.setMode(AgentMode.BUILD) },
+                        onOpenWorkingFiles = { showWorkingFilesSheet = true }
                     )
                 }
 
                 if ((uiState.isAgentRunning || uiState.isPreparing) && streamingMessageId == null) {
-                    item { ThinkingRow(uiState.currentAgentStatus) }
+                    item {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            CodeForgeAvatarBadge()
+                            ThinkingRow(uiState.currentAgentStatus)
+                        }
+                    }
                 }
 
                 item { Spacer(modifier = Modifier.height(4.dp)) }
             }
 
-            // ---------------- Input (attach, text, model, send in one box) ----------------
-            Column(modifier = Modifier.padding(start = 10.dp, end = 10.dp, top = 6.dp, bottom = 8.dp)) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(24.dp))
-                        .background(AppColors.surface)
-                        .border(1.dp, AppColors.border, RoundedCornerShape(24.dp))
-                ) {
-                    if (uiState.pendingAttachments.isNotEmpty()) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .horizontalScroll(rememberScrollState())
-                                .padding(start = 12.dp, end = 12.dp, top = 10.dp),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            for (att in uiState.pendingAttachments) {
-                                AttachmentChip(name = att.name, isImage = att.isImage, onRemove = { viewModel.removeAttachment(att) })
+            // ---------------- Slash Command Suggestions Popup ----------------
+            if (inputText.startsWith("/") && !inputText.contains(" ")) {
+                val slashCommands = listOf(
+                    "/mode" to "Switch Build / Plan agent",
+                    "/model" to "Open live Model Picker",
+                    "/build" to "Sync & trigger GitHub Actions cloud build",
+                    "/files" to "Open Working Files panel",
+                    "/terminal" to "Open Forge Terminal drawer",
+                    "/clone " to "Clone a GitHub repository URL"
+                ).filter { it.first.startsWith(inputText.lowercase()) }
+                if (slashCommands.isNotEmpty()) {
+                    Surface(
+                        color = AppColors.surface,
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 2.dp)
+                            .border(1.dp, AppColors.border, RoundedCornerShape(14.dp))
+                    ) {
+                        Column(modifier = Modifier.padding(vertical = 4.dp)) {
+                            for ((cmd, desc) in slashCommands) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable {
+                                            when (cmd.trim()) {
+                                                "/mode" -> {
+                                                    showAgentPicker = true
+                                                    inputText = ""
+                                                }
+                                                "/model" -> {
+                                                    showModelPicker = true
+                                                    inputText = ""
+                                                }
+                                                "/build" -> {
+                                                    viewModel.pushAndBuild()
+                                                    inputText = ""
+                                                }
+                                                "/files" -> {
+                                                    showWorkingFilesSheet = true
+                                                    inputText = ""
+                                                }
+                                                "/terminal" -> {
+                                                    showTerminalSheet = true
+                                                    inputText = ""
+                                                }
+                                                else -> inputText = cmd
+                                            }
+                                        }
+                                        .padding(horizontal = 14.dp, vertical = 8.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text(cmd.trim(), fontSize = 13.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.SemiBold, color = AppColors.accent)
+                                    Text(desc, fontSize = 12.sp, color = AppColors.textSecondary)
+                                }
                             }
                         }
                     }
+                }
+            }
 
-                    // Chat / Build switch
+            // ---------------- Bottom Composer Pill (Matches Video & Screenshot) ----------------
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 10.dp, vertical = 8.dp)
+            ) {
+                if (uiState.pendingAttachments.isNotEmpty()) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(start = 12.dp, end = 12.dp, top = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                            .horizontalScroll(rememberScrollState())
+                            .padding(horizontal = 6.dp, vertical = 6.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        ModePill(mode = uiState.mode, onChange = { viewModel.setMode(it) })
-                        Spacer(modifier = Modifier.width(10.dp))
-                        Text(
-                            text = if (uiState.mode == AgentMode.CHAT) "Talk and ask. Cannot edit files." else "Can read and edit your project.",
-                            fontSize = 11.sp,
-                            color = AppColors.textMuted,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-
-                    TextField(
-                        value = inputText,
-                        onValueChange = { inputText = it },
-                        placeholder = {
-                            Text(
-                                if (uiState.mode == AgentMode.CHAT) "Message CodeForge…" else "Describe the bug or the change…",
-                                fontSize = 15.sp
+                        for (att in uiState.pendingAttachments) {
+                            AttachmentChip(
+                                name = att.name,
+                                isImage = att.isImage,
+                                onRemove = { viewModel.removeAttachment(att) }
                             )
-                        },
-                        maxLines = 6,
-                        colors = TextFieldDefaults.colors(
-                            focusedContainerColor = Color.Transparent,
-                            unfocusedContainerColor = Color.Transparent,
-                            disabledContainerColor = Color.Transparent,
-                            focusedIndicatorColor = Color.Transparent,
-                            unfocusedIndicatorColor = Color.Transparent,
-                            disabledIndicatorColor = Color.Transparent,
-                            cursorColor = AppColors.accent,
-                            focusedTextColor = AppColors.textPrimary,
-                            unfocusedTextColor = AppColors.textPrimary,
-                            focusedPlaceholderColor = AppColors.textMuted,
-                            unfocusedPlaceholderColor = AppColors.textMuted
-                        ),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .testTag("chat_input_field")
-                    )
+                        }
+                    }
+                }
 
+                Surface(
+                    shape = RoundedCornerShape(28.dp),
+                    color = AppColors.surface,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .border(1.dp, AppColors.border, RoundedCornerShape(28.dp))
+                ) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(start = 6.dp, end = 8.dp, bottom = 6.dp),
+                            .padding(start = 6.dp, end = 6.dp, top = 2.dp, bottom = 2.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Box {
-                            IconButton(onClick = { showAttachMenu = true }, modifier = Modifier.testTag("attach_button")) {
-                                Icon(Icons.Default.Add, contentDescription = "Attach", tint = AppColors.textSecondary)
+                            IconButton(
+                                onClick = { showAttachMenu = true },
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .testTag("attach_button")
+                            ) {
+                                Icon(
+                                    Icons.Default.Add,
+                                    contentDescription = "Attach",
+                                    tint = AppColors.textPrimary
+                                )
                             }
-                            DropdownMenu(expanded = showAttachMenu, onDismissRequest = { showAttachMenu = false }) {
+                            DropdownMenu(
+                                expanded = showAttachMenu,
+                                onDismissRequest = { showAttachMenu = false }
+                            ) {
                                 DropdownMenuItem(
                                     text = { Text("Photo / screenshot") },
                                     leadingIcon = { Icon(Icons.Default.Image, contentDescription = null) },
@@ -430,102 +700,111 @@ fun ChatScreen(
                                     }
                                 )
                                 DropdownMenuItem(
-                                    text = { Text("File, PDF or project ZIP") },
+                                    text = { Text("File, PDF, Project ZIP, or APK") },
                                     leadingIcon = { Icon(Icons.Default.AttachFile, contentDescription = null) },
                                     onClick = {
                                         showAttachMenu = false
                                         filePicker.launch(arrayOf("*/*"))
                                     }
                                 )
+                                DropdownMenuItem(
+                                    text = { Text("Clone GitHub Repository") },
+                                    leadingIcon = {
+                                        androidx.compose.foundation.Image(
+                                            painter = androidx.compose.ui.res.painterResource(com.example.R.drawable.ic_github),
+                                            contentDescription = null,
+                                            colorFilter = androidx.compose.ui.graphics.ColorFilter.tint(AppColors.textSecondary),
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    },
+                                    onClick = {
+                                        showAttachMenu = false
+                                        if (githubConnected) showRepoPicker = true else onOpenGitHub()
+                                    }
+                                )
                             }
                         }
 
-                        // GitHub: clone one of your repositories (or connect first). 
-                        IconButton(
-                            onClick = {
-                                if (githubConnected) showRepoPicker = true else onOpenGitHub()
+                        TextField(
+                            value = inputText,
+                            onValueChange = {
+                                inputText = it
+                                viewModel.saveDraftForCurrentChat(it)
                             },
-                            modifier = Modifier.size(40.dp).testTag("github_button")
-                        ) {
-                            androidx.compose.foundation.Image(
-                                painter = androidx.compose.ui.res.painterResource(com.example.R.drawable.ic_github),
-                                contentDescription = "GitHub repositories",
-                                colorFilter = androidx.compose.ui.graphics.ColorFilter.tint(AppColors.textSecondary),
-                                modifier = Modifier.size(20.dp)
-                            )
-                        }
-
-                        Spacer(modifier = Modifier.weight(1f))
-
-                        // Model selector, right next to the send button
-                        Row(
+                            placeholder = {
+                                Text(
+                                    text = "Type a message...",
+                                    fontSize = 15.sp
+                                )
+                            },
+                            maxLines = 5,
+                            colors = TextFieldDefaults.colors(
+                                focusedContainerColor = Color.Transparent,
+                                unfocusedContainerColor = Color.Transparent,
+                                disabledContainerColor = Color.Transparent,
+                                focusedIndicatorColor = Color.Transparent,
+                                unfocusedIndicatorColor = Color.Transparent,
+                                disabledIndicatorColor = Color.Transparent,
+                                cursorColor = AppColors.accent,
+                                focusedTextColor = AppColors.textPrimary,
+                                unfocusedTextColor = AppColors.textPrimary,
+                                focusedPlaceholderColor = AppColors.textMuted,
+                                unfocusedPlaceholderColor = AppColors.textMuted
+                            ),
                             modifier = Modifier
-                                .clip(RoundedCornerShape(16.dp))
-                                .clickable { showModelPicker = true }
-                                .padding(horizontal = 8.dp, vertical = 6.dp)
-                                .testTag("model_chip"),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            ProviderIcon(
-                                providerId = activeProvider?.id,
-                                model = activeProvider?.selectedModel,
-                                size = 16.dp,
-                                providerName = activeProvider?.name
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = modelLabel,
-                                fontSize = 12.sp,
-                                fontFamily = FontFamily.Monospace,
-                                color = if (modelReady) AppColors.textSecondary else AppColors.warn,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.widthIn(max = 170.dp)
-                            )
-                            Icon(
-                                Icons.Default.KeyboardArrowDown,
-                                contentDescription = "Change model",
-                                tint = AppColors.textMuted,
-                                modifier = Modifier.size(16.dp)
-                            )
-                        }
-
-                        Spacer(modifier = Modifier.width(6.dp))
+                                .weight(1f)
+                                .testTag("chat_input_field")
+                        )
 
                         val canSend = (inputText.isNotBlank() || uiState.pendingAttachments.isNotEmpty()) && !uiState.isPreparing
                         if (uiState.isAgentRunning) {
-                            IconButton(
-                                onClick = { viewModel.stopAgent() },
+                            // Stop Button: Dark circle with Red Rounded Square inside (matches video at 0:13)
+                            Box(
                                 modifier = Modifier
-                                    .size(38.dp)
+                                    .size(44.dp)
                                     .clip(CircleShape)
-                                    .background(AppColors.error)
-                                    .testTag("stop_agent_button")
+                                    .background(Color(0xFF1E222A))
+                                    .border(1.5.dp, Color(0xFF3A3F4B), CircleShape)
+                                    .clickable { viewModel.stopAgent() }
+                                    .testTag("stop_agent_button"),
+                                contentAlignment = Alignment.Center
                             ) {
-                                Icon(Icons.Default.Stop, contentDescription = "Stop", tint = Color.White, modifier = Modifier.size(18.dp))
+                                Box(
+                                    modifier = Modifier
+                                        .size(16.dp)
+                                        .clip(RoundedCornerShape(4.dp))
+                                        .background(Color(0xFFFF4D4D))
+                                )
                             }
                         } else {
-                            IconButton(
-                                onClick = {
-                                    val text = inputText
-                                    inputText = ""
-                                    viewModel.sendMessage(text)
-                                },
-                                enabled = canSend,
+                            // Send Button: Blue circle with paper-plane Send icon (matches screenshot)
+                            val sendBg = if (canSend) Color(0xFF1868DB) else Color(0xFF1868DB).copy(alpha = 0.42f)
+                            Box(
                                 modifier = Modifier
-                                    .size(38.dp)
+                                    .size(44.dp)
                                     .clip(CircleShape)
-                                    .background(if (canSend) AppColors.accent else AppColors.surfaceAlt)
-                                    .testTag("send_message_button")
+                                    .background(sendBg)
+                                    .border(1.5.dp, Color.White.copy(alpha = 0.28f), CircleShape)
+                                    .clickable(enabled = canSend) {
+                                        val text = inputText
+                                        inputText = ""
+                                        viewModel.sendMessage(text)
+                                    }
+                                    .testTag("send_message_button"),
+                                contentAlignment = Alignment.Center
                             ) {
                                 if (uiState.isPreparing) {
-                                    SendSpinner(modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = AppColors.textSecondary)
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(18.dp),
+                                        strokeWidth = 2.dp,
+                                        color = Color.White
+                                    )
                                 } else {
                                     Icon(
                                         Icons.Default.Send,
                                         contentDescription = "Send",
-                                        tint = if (canSend) AppColors.onAccent else AppColors.textMuted,
-                                        modifier = Modifier.size(18.dp)
+                                        tint = Color.White,
+                                        modifier = Modifier.size(19.dp)
                                     )
                                 }
                             }
@@ -533,6 +812,356 @@ fun ChatScreen(
                     }
                 }
             }
+        }
+    }
+}
+
+/**
+ * "Choose agent" Modal Bottom Sheet matching the screen recording (0:02 & 0:10):
+ * - Search bar at top
+ * - Build: "Full access agent for development work"
+ * - Plan: "Read-only agent for exploring the codebase and planning..."
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ChooseAgentBottomSheet(
+    currentMode: AgentMode,
+    onSelectMode: (AgentMode) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var search by remember { mutableStateOf("") }
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        containerColor = AppColors.surface,
+        contentColor = AppColors.textPrimary
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .padding(horizontal = 20.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Text(
+                text = "Choose agent",
+                fontSize = 20.sp,
+                fontWeight = FontWeight.Bold,
+                color = AppColors.textPrimary
+            )
+
+            OutlinedTextField(
+                value = search,
+                onValueChange = { search = it },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, tint = AppColors.textMuted) },
+                placeholder = { Text("Search", fontSize = 14.sp) },
+                shape = RoundedCornerShape(14.dp),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = AppColors.accent,
+                    unfocusedBorderColor = AppColors.border
+                )
+            )
+
+            val agents = listOf(
+                Triple(
+                    AgentMode.BUILD,
+                    "Build",
+                    "Full access agent for development work, editing files, running Termux shell commands, and triggering GitHub Actions builds."
+                ),
+                Triple(
+                    AgentMode.CHAT,
+                    "Plan",
+                    "Read-only agent for exploring the codebase, inspecting files, and planning architecture before making changes."
+                )
+            ).filter {
+                search.isBlank() ||
+                    it.second.contains(search, ignoreCase = true) ||
+                    it.third.contains(search, ignoreCase = true)
+            }
+
+            for ((mode, title, desc) in agents) {
+                val isSelected = currentMode == mode
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = if (isSelected) AppColors.surfaceAlt else Color.Transparent,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .border(
+                            width = 1.dp,
+                            color = if (isSelected) AppColors.accent else AppColors.border,
+                            shape = RoundedCornerShape(14.dp)
+                        )
+                        .clickable { onSelectMode(mode) }
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = title,
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = AppColors.textPrimary
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = desc,
+                                fontSize = 13.sp,
+                                color = AppColors.textSecondary,
+                                lineHeight = 18.sp
+                            )
+                        }
+                        if (isSelected) {
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Icon(
+                                Icons.Default.Check,
+                                contentDescription = "Selected",
+                                tint = AppColors.accent,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+        }
+    }
+}
+
+@Composable
+private fun CodeForgeAvatarBadge() {
+    Box(
+        modifier = Modifier
+            .size(28.dp)
+            .clip(CircleShape)
+            .background(Color(0xFF1868DB).copy(alpha = 0.16f))
+            .border(1.dp, Color(0xFF1868DB).copy(alpha = 0.55f), CircleShape),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = "</>",
+            fontSize = 10.sp,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Bold,
+            color = Color(0xFF388BFD)
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun WorkingFilesBottomSheet(
+    workingFiles: List<WorkingFileEntry>,
+    onOpenDiff: () -> Unit,
+    onRevertFile: (String) -> Unit,
+    onRevertAll: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        containerColor = AppColors.surface,
+        contentColor = AppColors.textPrimary
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .padding(horizontal = 20.dp, vertical = 8.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text("Working Files", fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = AppColors.textPrimary)
+                    Text("Files read, edited, created, or deleted in this session", fontSize = 12.sp, color = AppColors.textSecondary)
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = onOpenDiff) {
+                        Text("Full Diff", color = AppColors.accent, fontSize = 12.sp)
+                    }
+                    if (workingFiles.any { it.state != WorkingFileState.READING }) {
+                        TextButton(onClick = onRevertAll) {
+                            Text("Revert Run", color = AppColors.error, fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(10.dp))
+            LazyColumn(modifier = Modifier.heightIn(max = 380.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(workingFiles, key = { it.path }) { item ->
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = AppColors.surfaceAlt,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            val badgeColor = when (item.state) {
+                                WorkingFileState.READING -> AppColors.info
+                                WorkingFileState.EDITED -> AppColors.warn
+                                WorkingFileState.CREATED -> AppColors.ok
+                                WorkingFileState.DELETED -> AppColors.error
+                            }
+                            Surface(shape = RoundedCornerShape(6.dp), color = badgeColor.copy(alpha = 0.16f)) {
+                                Text(
+                                    text = item.state.label,
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = badgeColor,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = item.path,
+                                    fontSize = 12.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = AppColors.textPrimary,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                if (!item.diffSummary.isNullOrBlank()) {
+                                    Text(item.diffSummary, fontSize = 11.sp, fontFamily = FontFamily.Monospace, color = AppColors.ok)
+                                }
+                            }
+                            if (item.state != WorkingFileState.READING) {
+                                IconButton(onClick = { onRevertFile(item.path) }, modifier = Modifier.size(30.dp)) {
+                                    Icon(Icons.Default.Restore, contentDescription = "Revert file", tint = AppColors.textSecondary, modifier = Modifier.size(16.dp))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(16.dp))
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TerminalDrawerBottomSheet(
+    output: String,
+    engineConnected: Boolean,
+    onRunCommand: (String) -> Unit,
+    onClear: () -> Unit,
+    onRepairEngine: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    var cmdInput by remember { mutableStateOf("") }
+    val context = LocalContext.current
+    val app = context.applicationContext as com.example.CodeForgeApp
+    val bridgeStatus by app.termuxBridge.healthState.collectAsState()
+    val scope = rememberCoroutineScope()
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        containerColor = AppColors.surface,
+        contentColor = AppColors.textPrimary
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp, vertical = 8.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Terminal, contentDescription = null, tint = AppColors.accent, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Forge Terminal", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = AppColors.textPrimary)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Surface(
+                        shape = RoundedCornerShape(999.dp),
+                        color = if (engineConnected) AppColors.ok.copy(alpha = 0.16f) else AppColors.warn.copy(alpha = 0.16f)
+                    ) {
+                        Text(
+                            text = if (engineConnected) "Termux Connected" else "Local Shell",
+                            fontSize = 10.sp,
+                            color = if (engineConnected) AppColors.ok else AppColors.warn,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                        )
+                    }
+                }
+                TextButton(onClick = onClear) {
+                    Text("Clear", fontSize = 11.sp, color = AppColors.textMuted)
+                }
+            }
+            Spacer(modifier = Modifier.height(6.dp))
+            // Clean "Termux Connection" option row (opens dialog when tapped)
+            com.example.ui.components.TermuxQuickConnectPanel(
+                bridge = app.termuxBridge,
+                status = bridgeStatus,
+                onAutoConnectClick = onRepairEngine,
+                onRefreshHealthClick = {
+                    scope.launch { app.termuxBridge.refreshHealth() }
+                },
+                compactDefault = true
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(250.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(AppColors.codeBg)
+                    .border(1.dp, AppColors.border, RoundedCornerShape(12.dp))
+                    .padding(10.dp)
+                    .verticalScroll(rememberScrollState())
+            ) {
+                Text(
+                    text = output.ifBlank { "$ Ready in ~/forge/projects workspace. Type a shell command below…" },
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = AppColors.textPrimary
+                )
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                OutlinedTextField(
+                    value = cmdInput,
+                    onValueChange = { cmdInput = it },
+                    modifier = Modifier.weight(1f),
+                    singleLine = true,
+                    placeholder = { Text("e.g. git status, ls -la, python3 --version", fontSize = 12.sp) }
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                IconButton(
+                    onClick = {
+                        val c = cmdInput.trim()
+                        if (c.isNotEmpty()) {
+                            onRunCommand(c)
+                            cmdInput = ""
+                        }
+                    },
+                    modifier = Modifier
+                        .size(42.dp)
+                        .clip(CircleShape)
+                        .background(AppColors.accent)
+                ) {
+                    Icon(Icons.Default.PlayArrow, contentDescription = "Run command", tint = AppColors.onAccent)
+                }
+            }
+            Spacer(modifier = Modifier.height(12.dp))
         }
     }
 }
@@ -562,15 +1191,6 @@ private fun AttachmentChip(name: String, isImage: Boolean, onRemove: (() -> Unit
 }
 
 @Composable
-private fun StatusLine(text: String) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp, color = AppColors.accent)
-        Spacer(modifier = Modifier.width(10.dp))
-        Text(text, fontSize = 13.sp, color = AppColors.textSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
-    }
-}
-
-@Composable
 private fun ChatMessage(
     message: MessageEntity,
     toolSteps: List<ToolStepEntity>,
@@ -579,16 +1199,22 @@ private fun ChatMessage(
     liveContent: String,
     liveReasoning: String,
     fallbackTitle: String,
+    activeModelShortLabel: String,
     isChatMode: Boolean,
     onRetry: () -> Unit,
-    onSwitchToBuild: () -> Unit
+    onSwitchToBuild: () -> Unit,
+    onOpenWorkingFiles: () -> Unit
 ) {
     val clipboard = LocalClipboardManager.current
     if (message.sender == "USER") {
         val lines = message.content.lines()
         val attachNames = lines.filter { it.startsWith("📎 ") }.map { it.removePrefix("📎 ").trim() }
         val text = lines.filter { !it.startsWith("📎 ") }.joinToString("\n").trim()
-        Column(modifier = Modifier.fillMaxWidth(), horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalAlignment = Alignment.End,
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
             if (attachNames.isNotEmpty()) {
                 Row(
                     modifier = Modifier.horizontalScroll(rememberScrollState()),
@@ -601,23 +1227,23 @@ private fun ChatMessage(
                 }
             }
             if (text.isNotEmpty()) {
+                // Blue user message bubble matching screenshot (#1868DB)
                 Surface(
-                    shape = RoundedCornerShape(18.dp),
-                    color = AppColors.surfaceAlt,
+                    shape = RoundedCornerShape(20.dp),
+                    color = Color(0xFF1868DB),
                     modifier = Modifier
-                        .widthIn(max = 320.dp)
+                        .widthIn(max = 330.dp)
                         .testTag("user_message_bubble")
                 ) {
                     Text(
                         text = text,
                         fontSize = 15.sp,
                         lineHeight = 21.sp,
-                        color = AppColors.textPrimary,
-                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
+                        color = Color.White,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)
                     )
                 }
             }
-            // delivery state, like other chat apps: circle while sending, red note when it failed
             val sendingNow = message.status == "SENDING" && System.currentTimeMillis() - message.timestamp < 120_000L
             val sendFailed = message.status == "ERROR" || (message.status == "SENDING" && !sendingNow)
             if (sendingNow) {
@@ -641,124 +1267,165 @@ private fun ChatMessage(
         return
     }
 
-    Column(
+    val isInterrupted = !live && (
+        message.content.contains("Interrupted", ignoreCase = true) ||
+            message.content.contains("Stopped by user", ignoreCase = true)
+        )
+    val cleanAssistantContent = message.content
+        .replace("*(Stopped by user)*", "")
+        .replace("(Stopped by user)", "")
+        .trim()
+
+    Row(
         modifier = Modifier
             .fillMaxWidth()
             .testTag("assistant_message_bubble"),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
+        verticalAlignment = Alignment.Top
     ) {
-        if (toolSteps.isNotEmpty()) {
-            AgentSummaryBar(steps = toolSteps, running = live, fallbackTitle = fallbackTitle)
-        }
+        CodeForgeAvatarBadge()
+        Spacer(modifier = Modifier.width(10.dp))
 
-        val reasoning = if (live && liveReasoning.isNotBlank()) liveReasoning else message.reasoning
-        if (!reasoning.isNullOrBlank()) {
-            ThinkingBlockView(reasoning = reasoning)
-        }
-
-        // While working, short streamed text is only a progress note (shown in the Summary), so hide it.
-        val text = if (live) (if (liveContent.length > 220) liveContent else "") else message.content
-        if (text.isNotBlank()) {
-            MarkdownContentView(content = text, textColor = AppColors.textPrimary)
-        }
-
-        if (live && toolSteps.isEmpty()) {
-            ThinkingRow(liveStatus)
-        }
-
-        // Chat mode answered "please switch to Build mode": one tap to do it
-        if (!live && isChatMode && message.content.contains("build mode", ignoreCase = true)) {
-            Surface(
-                shape = RoundedCornerShape(12.dp),
-                color = AppColors.accentSoft,
-                modifier = Modifier
-                    .clip(RoundedCornerShape(12.dp))
-                    .clickable { onSwitchToBuild() }
-            ) {
-                Text(
-                    text = "Switch to Build mode",
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = AppColors.accent,
-                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            if (toolSteps.isNotEmpty()) {
+                AgentSummaryBar(
+                    steps = toolSteps,
+                    running = live,
+                    fallbackTitle = fallbackTitle
                 )
             }
-        }
 
-        // Files this run changed (for a quick overview next to the "work done" report)
-        if (!live) {
-            val changed = remember(toolSteps) {
-                val out = LinkedHashSet<String>()
-                for (st in toolSteps) {
-                    if (st.toolName == "edit_file" || st.toolName == "write_file" || st.toolName == "delete_file") {
-                        val path = try { org.json.JSONObject(st.argumentsJson).optString("path") } catch (e: Exception) { "" }
-                        if (path.isNotBlank() && !st.isError) out.add(path.substringAfterLast('/'))
-                    }
-                }
-                out.toList()
+            val reasoning = if (live && liveReasoning.isNotBlank()) liveReasoning else message.reasoning
+            if (!reasoning.isNullOrBlank()) {
+                ThinkingBlockView(reasoning = reasoning)
             }
-            if (changed.isNotEmpty()) {
-                Row(
-                    modifier = Modifier.horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalAlignment = Alignment.CenterVertically
+
+            val text = if (live) (if (liveContent.length > 120) liveContent else "") else cleanAssistantContent
+            if (text.isNotBlank()) {
+                MarkdownContentView(content = text, textColor = AppColors.textPrimary)
+            }
+
+            if (live) {
+                ThinkingRow(liveStatus)
+            }
+
+            // Red `[ ⚠ Interrupted ]` pill badge when stopped (matches video at 0:15)
+            if (isInterrupted) {
+                Surface(
+                    shape = RoundedCornerShape(999.dp),
+                    color = AppColors.error.copy(alpha = 0.14f),
+                    modifier = Modifier.border(
+                        width = 1.dp,
+                        color = AppColors.error.copy(alpha = 0.45f),
+                        shape = RoundedCornerShape(999.dp)
+                    )
                 ) {
-                    Icon(Icons.Default.Check, contentDescription = null, tint = AppColors.ok, modifier = Modifier.size(14.dp))
-                    Text("Changed", fontSize = 12.sp, color = AppColors.textSecondary)
-                    for (name in changed.take(8)) {
-                        Surface(shape = RoundedCornerShape(8.dp), color = AppColors.surfaceAlt) {
-                            Text(
-                                text = name,
-                                fontSize = 11.sp,
-                                fontFamily = FontFamily.Monospace,
-                                color = AppColors.textPrimary,
-                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
-                            )
-                        }
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 5.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            Icons.Default.Warning,
+                            contentDescription = "Interrupted",
+                            tint = AppColors.error,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "Interrupted",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = AppColors.error
+                        )
                     }
-                    if (changed.size > 8) Text("+${changed.size - 8}", fontSize = 11.sp, color = AppColors.textMuted)
                 }
             }
-        }
 
-        if (!live) {
-            val model = message.modelUsed
-            val provider = message.providerUsed
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                if (message.content.isNotBlank()) {
+            if (!live && isChatMode && message.content.contains("switch me to a different agent", ignoreCase = true) ||
+                (!live && isChatMode && message.content.contains("build mode", ignoreCase = true))
+            ) {
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = AppColors.accentSoft,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable { onSwitchToBuild() }
+                ) {
                     Text(
-                        text = "Copy",
-                        fontSize = 12.sp,
-                        color = AppColors.textMuted,
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(6.dp))
-                            .clickable { clipboard.setText(AnnotatedString(message.content)) }
-                            .padding(vertical = 2.dp, horizontal = 2.dp)
+                        text = "Switch to Build agent",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = AppColors.accent,
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
                     )
                 }
-                if (!model.isNullOrBlank() || !provider.isNullOrBlank()) {
-                    Spacer(modifier = Modifier.width(10.dp))
-                    ProviderIcon(providerId = provider, model = model.orEmpty(), size = 14.dp)
-                    val attribution = listOfNotNull(
-                        provider?.takeIf { it.isNotBlank() }?.let { id ->
-                            id.replace('-', ' ').replace('_', ' ')
-                                .split(' ').joinToString(" ") { part ->
-                                    part.replaceFirstChar { ch -> ch.uppercase() }
-                                }
-                        },
-                        model?.takeIf { it.isNotBlank() }
-                    ).distinct().joinToString(" · ")
+            }
+
+            if (!live) {
+                val changed = remember(toolSteps) {
+                    val out = LinkedHashSet<String>()
+                    for (st in toolSteps) {
+                        if (st.toolName in setOf("edit_file", "write_file", "insert_after_line", "replace_line_range", "delete_file")) {
+                            val path = st.filePath ?: try { org.json.JSONObject(st.argumentsJson).optString("path") } catch (_: Exception) { "" }
+                            if (path.isNotBlank() && !st.isError) out.add(path.substringAfterLast('/'))
+                        }
+                    }
+                    out.toList()
+                }
+                if (changed.isNotEmpty()) {
+                    Row(
+                        modifier = Modifier
+                            .horizontalScroll(rememberScrollState())
+                            .clickable { onOpenWorkingFiles() },
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Default.Check, contentDescription = null, tint = AppColors.ok, modifier = Modifier.size(14.dp))
+                        Text("Changed", fontSize = 12.sp, color = AppColors.textSecondary)
+                        for (name in changed.take(8)) {
+                            Surface(shape = RoundedCornerShape(8.dp), color = AppColors.surfaceAlt) {
+                                Text(
+                                    text = name,
+                                    fontSize = 11.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = AppColors.textPrimary,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                )
+                            }
+                        }
+                        if (changed.size > 8) Text("+${changed.size - 8}", fontSize = 11.sp, color = AppColors.textMuted)
+                    }
+                }
+            }
+
+            if (!live) {
+                val model = message.modelUsed?.substringAfterLast('/')?.ifBlank { activeModelShortLabel } ?: activeModelShortLabel
+                Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        text = "  $attribution",
-                        fontSize = 11.sp,
-                        fontFamily = FontFamily.Monospace,
+                        text = model,
+                        fontSize = 12.sp,
                         color = AppColors.textMuted,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
-                }
-                if (message.status == "ERROR") {
-                    Text("   failed", fontSize = 11.sp, color = AppColors.error)
+                    if (cleanAssistantContent.isNotBlank()) {
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Text(
+                            text = "Copy",
+                            fontSize = 12.sp,
+                            color = AppColors.textMuted,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .clickable { clipboard.setText(AnnotatedString(cleanAssistantContent)) }
+                                .padding(vertical = 2.dp, horizontal = 2.dp)
+                        )
+                    }
+                    if (message.status == "ERROR" && !isInterrupted) {
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("failed", fontSize = 11.sp, color = AppColors.error)
+                    }
                 }
             }
         }
@@ -770,37 +1437,41 @@ private fun EmptyChat(projectName: String?, onPrompt: (String) -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(top = 48.dp),
+            .padding(top = 36.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Text(
-            text = "What should we work on?",
+            text = "What should we build or fix?",
             fontSize = 20.sp,
             fontWeight = FontWeight.SemiBold,
             color = AppColors.textPrimary
         )
         Spacer(modifier = Modifier.height(6.dp))
         Text(
-            text = if (projectName != null) "Project: $projectName" else "Attach a .zip with + to load a project",
+            text = if (projectName != null) {
+                "Active project: $projectName (~/forge/projects)"
+            } else {
+                "Pick a project above, attach a ZIP/APK with +, or clone a GitHub repository"
+            },
             fontSize = 13.sp,
             color = AppColors.textMuted
         )
-        Spacer(modifier = Modifier.height(24.dp))
+        Spacer(modifier = Modifier.height(22.dp))
         val prompts = listOf(
-            "Find and fix bugs in this project",
-            "Explain the project structure",
-            "Build a new app: a simple notes app with dark mode",
-            "Review the code for performance problems"
+            "is code me kya kya hai",
+            "Find and fix bugs in this project and trigger GitHub Actions build",
+            "Inspect all project files and explain the architecture",
+            "Add a new feature and push changes to GitHub"
         )
         for (p in prompts) {
             Surface(
-                shape = RoundedCornerShape(12.dp),
+                shape = RoundedCornerShape(14.dp),
                 color = AppColors.surface,
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(vertical = 4.dp)
-                    .border(1.dp, AppColors.border, RoundedCornerShape(12.dp))
-                    .clip(RoundedCornerShape(12.dp))
+                    .border(1.dp, AppColors.border, RoundedCornerShape(14.dp))
+                    .clip(RoundedCornerShape(14.dp))
                     .clickable { onPrompt(p) }
             ) {
                 Text(
@@ -812,35 +1483,6 @@ private fun EmptyChat(projectName: String?, onPrompt: (String) -> Unit) {
             }
         }
     }
-}
-
-
-@Composable
-private fun ModePill(mode: AgentMode, onChange: (AgentMode) -> Unit) {
-    Row(
-        modifier = Modifier
-            .clip(RoundedCornerShape(14.dp))
-            .background(AppColors.surfaceAlt)
-            .padding(2.dp)
-    ) {
-        ModeSegment("Chat", mode == AgentMode.CHAT) { onChange(AgentMode.CHAT) }
-        ModeSegment("Build", mode == AgentMode.BUILD) { onChange(AgentMode.BUILD) }
-    }
-}
-
-@Composable
-private fun ModeSegment(label: String, selected: Boolean, onClick: () -> Unit) {
-    Text(
-        text = label,
-        fontSize = 12.sp,
-        fontWeight = FontWeight.SemiBold,
-        color = if (selected) AppColors.onAccent else AppColors.textSecondary,
-        modifier = Modifier
-            .clip(RoundedCornerShape(12.dp))
-            .background(if (selected) AppColors.accent else Color.Transparent)
-            .clickable(onClick = onClick)
-            .padding(horizontal = 14.dp, vertical = 5.dp)
-    )
 }
 
 @Composable
@@ -862,7 +1504,7 @@ private fun ProjectPickerDialog(
                     modifier = Modifier.padding(horizontal = 20.dp)
                 )
                 Text(
-                    "New chats start clean. Pick a project to work on, or attach a ZIP with the + button.",
+                    "Each project is synced inside ~/forge/projects/<slug> and connected to GitHub Actions.",
                     fontSize = 12.sp,
                     color = AppColors.textSecondary,
                     modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 2.dp, bottom = 8.dp)
@@ -901,7 +1543,12 @@ private fun ProjectPickerDialog(
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
-                                Text("${p.fileCount} files", fontSize = 11.sp, color = AppColors.textMuted)
+                                Text(
+                                    "~/forge/projects/${p.slug.ifBlank { p.name.lowercase() }} · ${p.fileCount} files",
+                                    fontSize = 11.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = AppColors.textMuted
+                                )
                             }
                             if (p.id == activeProjectId) Icon(Icons.Default.Check, null, tint = AppColors.accent, modifier = Modifier.size(18.dp))
                         }

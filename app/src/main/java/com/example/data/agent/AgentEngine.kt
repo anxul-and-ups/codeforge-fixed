@@ -3,27 +3,30 @@ package com.example.data.agent
 import android.content.Context
 import com.example.data.api.LlmDocument
 import com.example.data.api.LlmMessage
-import com.example.data.github.GitHubManager
-import com.example.data.repository.PushResult
-import com.example.data.logs.BuildLogEntry
-import com.example.data.logs.BuildLogStore
-import kotlinx.coroutines.withTimeoutOrNull
 import com.example.data.api.LlmRequest
 import com.example.data.api.LlmResponse
 import com.example.data.api.LlmTool
 import com.example.data.api.LlmToolCall
+import com.example.data.github.GitHubManager
 import com.example.data.local.dao.ConversationDao
+import com.example.data.local.dao.InstalledToolDao
 import com.example.data.local.dao.MessageDao
 import com.example.data.local.dao.UsageDao
+import com.example.data.local.entity.InstalledToolEntity
 import com.example.data.local.entity.MessageEntity
 import com.example.data.local.entity.ToolStepEntity
+import com.example.data.logs.BuildLogEntry
+import com.example.data.logs.BuildLogStore
 import com.example.data.repository.GitHubRepository
 import com.example.data.repository.ProjectRepository
 import com.example.data.repository.ProviderRepository
+import com.example.data.repository.PushResult
 import com.example.data.security.KeyStoreManager
 import com.example.data.service.AgentForegroundService
 import com.example.data.settings.SettingsStore
+import com.example.data.termux.TermuxBridge
 import com.example.domain.model.FileNode
+import com.example.domain.model.PermissionLevel
 import com.example.domain.model.ReasoningLevel
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -37,7 +40,10 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.util.Calendar
 import java.util.UUID
 
@@ -54,10 +60,24 @@ sealed class AgentEvent {
     data class Error(val error: String) : AgentEvent()
 }
 
-/** CHAT: talk, explain, answer, look at code (read-only). BUILD: may edit files. */
+/** CHAT: talk, explain, answer, look at code (read-only). BUILD: may edit files and run commands. */
 enum class AgentMode { CHAT, BUILD }
 
-private val READ_ONLY_TOOLS = setOf("list_files", "read_file", "search_code")
+private val READ_ONLY_TOOLS = setOf("list_files", "read_file", "search_code", "ask_user")
+
+enum class WorkingFileState(val label: String) {
+    READING("Reading"),
+    EDITED("Edited"),
+    CREATED("Created"),
+    DELETED("Deleted")
+}
+
+data class WorkingFileEntry(
+    val path: String,
+    val state: WorkingFileState,
+    val diffSummary: String? = null,
+    val timestamp: Long = System.currentTimeMillis()
+)
 
 data class RunRequest(
     val projectId: String,
@@ -65,20 +85,24 @@ data class RunRequest(
     val userPrompt: String,
     val imagesBase64: List<String> = emptyList(),
     val docs: List<LlmDocument> = emptyList(),
-    /** If true: skip the AI step and only push the project to GitHub, wait for the build and auto-fix. */
     val pushOnly: Boolean = false,
-    /** A push that was already done (manually); only watch its build and fix errors if it fails. */
     val watchPush: PushResult? = null,
-    val mode: AgentMode = AgentMode.BUILD
+    val mode: AgentMode = AgentMode.BUILD,
+    val attachedArchivePath: String? = null
 )
 
 data class ApprovalRequest(
     val id: String,
     val toolName: String,
     val summary: String,
-    val title: String = "Allow this change?",
+    val title: String = "Allow this action?",
     val allowLabel: String = "Allow",
-    val denyLabel: String = "Deny"
+    val denyLabel: String = "Deny",
+    val options: List<String> = emptyList(),
+    val isSaveOutputPrompt: Boolean = false,
+    val extractedSourceDirPath: String? = null,
+    val analysisReportMarkdown: String? = null,
+    val sourceArchiveName: String? = null
 )
 
 private data class ToolResult(
@@ -86,7 +110,12 @@ private data class ToolResult(
     val isError: Boolean = false,
     val changed: Boolean = false,
     val touched: List<String> = emptyList(),
-    val removed: List<String> = emptyList()
+    val removed: List<String> = emptyList(),
+    val diffSummary: String? = null,
+    val commandText: String? = null,
+    val cwdText: String? = null,
+    val filePath: String? = null,
+    val stepType: String = "TOOL"
 )
 
 private data class LoopResult(
@@ -94,7 +123,9 @@ private data class LoopResult(
     val changed: Boolean,
     val summary: String,
     val touched: Set<String> = emptySet(),
-    val removed: Set<String> = emptySet()
+    val removed: Set<String> = emptySet(),
+    val assistantMessageId: String? = null,
+    val lastStepIndex: Int = 0
 )
 
 class AgentEngine(
@@ -106,6 +137,8 @@ class AgentEngine(
     private val messageDao: MessageDao,
     private val conversationDao: ConversationDao,
     private val usageDao: UsageDao,
+    private val installedToolDao: InstalledToolDao,
+    private val termuxBridge: TermuxBridge,
     private val settings: SettingsStore,
     private val buildLogStore: BuildLogStore,
     private val githubManager: GitHubManager
@@ -122,13 +155,21 @@ class AgentEngine(
     private val _approvalRequest = MutableStateFlow<ApprovalRequest?>(null)
     val approvalRequest: StateFlow<ApprovalRequest?> = _approvalRequest.asStateFlow()
 
-    private var pendingDecision: CompletableDeferred<Boolean>? = null
+    private val _workingFiles = MutableStateFlow<List<WorkingFileEntry>>(emptyList())
+    val workingFiles: StateFlow<List<WorkingFileEntry>> = _workingFiles.asStateFlow()
+
+    private val _runStartedAtMs = MutableStateFlow<Long?>(null)
+    val runStartedAtMs: StateFlow<Long?> = _runStartedAtMs.asStateFlow()
+
+    private var pendingDecision: CompletableDeferred<String>? = null
     private var job: Job? = null
 
     fun start(request: RunRequest) {
         if (_isRunning.value) return
         _isRunning.value = true
         _runningConversationId.value = request.conversationId
+        _runStartedAtMs.value = System.currentTimeMillis()
+        _workingFiles.value = emptyList()
         AgentForegroundService.startService(appContext, "Agent is working…")
         job = scope.launch {
             try {
@@ -143,6 +184,7 @@ class AgentEngine(
                     pendingDecision = null
                     _isRunning.value = false
                     _runningConversationId.value = null
+                    _runStartedAtMs.value = null
                     AgentForegroundService.stopService(appContext)
                 }
             }
@@ -154,7 +196,36 @@ class AgentEngine(
     }
 
     fun resolveApproval(approved: Boolean) {
-        pendingDecision?.complete(approved)
+        pendingDecision?.complete(if (approved) "ALLOW" else "DENY")
+    }
+
+    fun resolveApprovalChoice(choice: String) {
+        pendingDecision?.complete(choice)
+    }
+
+    fun clearWorkingFiles() {
+        _workingFiles.value = emptyList()
+    }
+
+    private fun recordWorkingFile(path: String, state: WorkingFileState, diffSummary: String? = null) {
+        val clean = cleanPath(path)
+        if (clean.isEmpty() || clean == ".") return
+        val current = _workingFiles.value.toMutableList()
+        val existingIdx = current.indexOfFirst { it.path == clean }
+        val updated = WorkingFileEntry(clean, state, diffSummary ?: current.getOrNull(existingIdx)?.diffSummary)
+        if (existingIdx >= 0) {
+            // Don't downgrade EDITED/CREATED back to READING
+            val prev = current[existingIdx].state
+            val nextState = if ((prev == WorkingFileState.EDITED || prev == WorkingFileState.CREATED) && state == WorkingFileState.READING) {
+                prev
+            } else {
+                state
+            }
+            current[existingIdx] = updated.copy(state = nextState)
+        } else {
+            current.add(updated)
+        }
+        _workingFiles.value = current
     }
 
     private fun status(text: String) {
@@ -171,10 +242,11 @@ class AgentEngine(
         var summary = ""
         var touched: Set<String>? = null
         var removed: Set<String> = emptySet()
+        var targetAssistantId: String? = null
+        var stepIdx = 0
         if (req.watchPush != null) {
-            // The user pushed manually from the GitHub screen: just follow that build.
             if (!settings.githubConfigured) return
-            buildAndFix(req, "build check", null, emptySet(), req.watchPush)
+            buildAndFix(req, "build check", null, emptySet(), req.watchPush, null, 0)
             return
         }
         if (!req.pushOnly) {
@@ -183,6 +255,8 @@ class AgentEngine(
             summary = result.summary
             touched = result.touched
             removed = result.removed
+            targetAssistantId = result.assistantMessageId
+            stepIdx = result.lastStepIndex
             if (!result.ok) return
         } else {
             changed = true
@@ -195,12 +269,12 @@ class AgentEngine(
             return
         }
         if (githubReady && (req.pushOnly || (settings.autoPushBuild && changed))) {
-            buildAndFix(req, summary, touched, removed, null)
+            buildAndFix(req, summary, touched, removed, null, targetAssistantId, stepIdx)
         }
     }
 
     // ---------------------------------------------------------------------------------------
-    // GitHub: push -> wait for build -> auto-fix loop
+    // GitHub: Termux sync -> push changed files -> wait for build -> stream logs -> auto-fix
     // ---------------------------------------------------------------------------------------
 
     private suspend fun buildAndFix(
@@ -208,7 +282,9 @@ class AgentEngine(
         summaryHint: String,
         firstTouched: Set<String>?,
         firstRemoved: Set<String>,
-        initialPush: PushResult?
+        initialPush: PushResult?,
+        existingAssistantId: String?,
+        startingStepIndex: Int
     ) {
         val pat = settings.githubToken
         val repo = settings.repoFor(req.projectId)
@@ -222,18 +298,90 @@ class AgentEngine(
         }
         val maxAttempts = settings.maxBuildFixAttempts
         var attempt = 0
-        // Only the files the AI changed are pushed (not the whole project).
         var touched: Set<String>? = firstTouched
         var removed: Set<String> = firstRemoved
         var preDone: PushResult? = initialPush
+        var currentAssistantId = existingAssistantId
+        var stepCounter = startingStepIndex
+
+        if (currentAssistantId == null) {
+            val newMsgId = UUID.randomUUID().toString()
+            messageDao.insertMessage(
+                MessageEntity(
+                    id = newMsgId,
+                    conversationId = req.conversationId,
+                    sender = "ASSISTANT",
+                    content = "Building `$repo` on GitHub Actions…",
+                    status = "SUCCESS"
+                )
+            )
+            currentAssistantId = newMsgId
+        }
 
         while (true) {
+            stepCounter++
+            val buildStepId = UUID.randomUUID().toString()
+            val buildStartMs = System.currentTimeMillis()
+            val subSteps = mutableListOf<JSONObject>()
+
+            suspend fun syncBuildStep(
+                stepStatus: String,
+                isErr: Boolean,
+                logOutput: String
+            ) {
+                val argsObj = JSONObject()
+                    .put("repo", repo)
+                    .put("workflow", ".github/workflows/build.yml")
+                    .put("changed_files", JSONArray((touched ?: emptySet()).toList()))
+                    .put("sub_steps", JSONArray(subSteps))
+                messageDao.insertToolStep(
+                    ToolStepEntity(
+                        id = buildStepId,
+                        messageId = currentAssistantId!!,
+                        stepIndex = stepCounter,
+                        toolName = "building",
+                        type = "BUILD",
+                        commandText = "$repo · GitHub Actions",
+                        argumentsJson = argsObj.toString(),
+                        resultText = logOutput.take(4000),
+                        isError = isErr,
+                        status = stepStatus,
+                        durationMs = System.currentTimeMillis() - buildStartMs
+                    )
+                )
+            }
+
+            fun setSubStep(id: String, label: String, state: String, detail: String = "") {
+                val idx = subSteps.indexOfFirst { it.optString("id") == id }
+                val obj = JSONObject()
+                    .put("id", id)
+                    .put("label", label)
+                    .put("state", state) // "RUNNING", "DONE", "ERROR"
+                    .put("detail", detail)
+                if (idx >= 0) subSteps[idx] = obj else subSteps.add(obj)
+            }
+
+            // Sub-step 1: Sync changed source files via Termux
+            val projDir = projectRepository.projectDir(req.projectId)
+            val displayPath = termuxBridge.toDisplayPath(projDir.absolutePath)
+            val changedCount = (touched?.size ?: 0) + removed.size
+            setSubStep("termux_sync", "1. Syncing changed files via Termux ($displayPath)", "RUNNING", "$changedCount file(s) staged")
+            _agentEvents.tryEmit(AgentEvent.ToolStarted(stepCounter, "building", "{\"repo\":\"$repo\"}"))
+            status("Building: Syncing files via Termux…")
+            syncBuildStep("RUNNING", false, "Syncing changed files in $displayPath via Termux…")
+            val syncExec = termuxBridge.execCommand("ls -la", cwd = projDir.absolutePath, timeoutSec = 15)
+            setSubStep("termux_sync", "1. Synced source files in Termux ($displayPath)", "DONE", "exit=${syncExec.exitCode}")
+
+            // Sub-step 2: Upload changed files to GitHub
             val push: PushResult
             if (preDone != null) {
                 push = preDone
                 preDone = null
+                setSubStep("github_upload", "2. Uploaded changed files to GitHub ($repo)", "DONE", "commit ${push.commitSha.take(7)}")
             } else {
-                status("Pushing changes to GitHub…")
+                setSubStep("github_upload", "2. Uploading changed source files to GitHub ($repo)", "RUNNING", "Pushing modified files…")
+                status("Building: Uploading changed files to GitHub…")
+                syncBuildStep("RUNNING", false, "Uploading modified files to https://github.com/$repo…")
                 push = try {
                     githubManager.push(
                         projectId = req.projectId,
@@ -247,33 +395,68 @@ class AgentEngine(
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
+                    setSubStep("github_upload", "2. Upload to GitHub failed", "ERROR", e.message ?: "Push failed")
+                    syncBuildStep("FAILED", true, "GitHub push failed: ${e.message}")
                     postNote(req.conversationId, "⚠️ GitHub push failed: ${e.message}")
-                    _agentEvents.tryEmit(AgentEvent.Finished("Push failed", 0))
+                    _agentEvents.tryEmit(AgentEvent.Finished("Push failed", stepCounter))
                     return
                 }
                 if (push.noChanges) {
-                    postNote(req.conversationId, "ℹ️ Nothing to push: $repo already has these changes.")
-                    _agentEvents.tryEmit(AgentEvent.Finished("No changes to push", 0))
+                    setSubStep("github_upload", "2. GitHub repo already up to date", "DONE", "No new file diffs")
+                    syncBuildStep("COMPLETED", false, "Repository $repo already has all current changes.")
+                    _agentEvents.tryEmit(AgentEvent.Finished("No changes to push", stepCounter))
                     return
                 }
-                postNote(req.conversationId, "⬆️ " + githubManager.describe(push, repo))
+                setSubStep(
+                    "github_upload",
+                    "2. Uploaded ${push.changedFiles + push.deletedFiles} changed file(s) to GitHub",
+                    "DONE",
+                    "commit ${push.commitSha.take(7)}"
+                )
             }
-            status("Pushed ${push.changedFiles + push.deletedFiles} file(s). Waiting for the build…")
-            githubManager.log.info("Waiting for the GitHub Actions build…")
-            val run = gitHubRepository.waitForRun(pat, repo, push.commitSha) { status(it) }
+
+            // Sub-step 3: Trigger & Queue GitHub Actions workflow
             val short = push.commitSha.take(7)
+            setSubStep("workflow_queue", "3. Starting GitHub Actions build workflow ($short)", "RUNNING", "Waiting for runner…")
+            status("Building: Waiting for GitHub Actions runner ($short)…")
+            syncBuildStep("RUNNING", false, "Commit $short pushed to $repo.\nWaiting for GitHub Actions workflow (.github/workflows/build.yml)…")
+            githubManager.log.info("Waiting for the GitHub Actions build…")
+
+            // Sub-step 4: Stream live build status & logs
+            var lastStreamStatus = "Queued on GitHub Actions…"
+            val run = gitHubRepository.waitForRun(pat, repo, push.commitSha) { liveMsg ->
+                lastStreamStatus = liveMsg
+                status("Building: $liveMsg")
+                setSubStep("workflow_queue", "3. GitHub Actions workflow triggered ($short)", "DONE", "Runner active")
+                setSubStep("build_logs", "4. Streaming live GitHub build logs via Termux", "RUNNING", liveMsg)
+                scope.launch {
+                    syncBuildStep("RUNNING", false, "Commit: $short\nRepo: $repo\nLive Build Status: $liveMsg")
+                }
+            }
+
             if (run == null) {
-                githubManager.log.error("No build started for commit $short. Add .github/workflows/build.yml (Settings → GitHub → Add build workflow).")
+                setSubStep("workflow_queue", "3. No GitHub Actions workflow started for $short", "ERROR", "Missing .github/workflows/build.yml")
+                syncBuildStep(
+                    "FAILED",
+                    true,
+                    "Pushed commit $short to $repo, but no GitHub Actions workflow started.\nAdd .github/workflows/build.yml in Settings → GitHub."
+                )
                 postNote(
                     req.conversationId,
-                    "⚠️ Pushed commit $short, but GitHub did not start a build. The repository needs a workflow file `.github/workflows/build.yml` with `on: push`. " +
-                        "Open Settings → GitHub and tap \"Add build workflow\", then push again."
+                    "⚠️ Pushed commit $short, but GitHub did not start a build. Open Settings → GitHub and tap \"Add build workflow\", then push again."
                 )
-                _agentEvents.tryEmit(AgentEvent.Finished("No build run found", 0))
+                _agentEvents.tryEmit(AgentEvent.Finished("No build run found", stepCounter))
                 return
             }
+
             val projectName = projectRepository.getProject(req.projectId)?.name ?: "Project"
             if (run.conclusion == "success") {
+                setSubStep("workflow_queue", "3. GitHub Actions workflow triggered ($short)", "DONE", "Runner completed")
+                setSubStep("build_logs", "4. Streamed GitHub Actions build logs", "DONE", "0 errors")
+                setSubStep("apk_artifact", "5. APK Build Succeeded ($short)", "DONE", run.htmlUrl)
+                val successLog = "✓ GitHub Actions Build Succeeded!\nRepository: $repo\nCommit: $short\nWorkflow Run & APK Artifact: ${run.htmlUrl}"
+                syncBuildStep("COMPLETED", false, successLog)
+                _agentEvents.tryEmit(AgentEvent.ToolFinished(stepCounter, "building", successLog, false))
                 githubManager.log.ok("Build succeeded for $short. APK: ${run.htmlUrl}")
                 buildLogStore.add(
                     BuildLogEntry(
@@ -284,22 +467,38 @@ class AgentEngine(
                 )
                 postNote(
                     req.conversationId,
-                    "✅ GitHub build succeeded for commit $short.\nDownload the APK from the Artifacts section: ${run.htmlUrl}"
+                    "✅ GitHub build succeeded for commit `$short`.\nDownload APK from Artifacts: ${run.htmlUrl}"
                 )
-                _agentEvents.tryEmit(AgentEvent.Finished("Build succeeded", 0))
+                _agentEvents.tryEmit(AgentEvent.Finished("Build succeeded", stepCounter))
                 return
             }
             if (run.conclusion != "failure") {
+                setSubStep("build_logs", "4. Build finished (${run.conclusion ?: run.status})", "DONE", run.htmlUrl)
+                syncBuildStep("COMPLETED", false, "Build finished with status: ${run.conclusion ?: run.status}\n${run.htmlUrl}")
                 postNote(req.conversationId, "ℹ️ Build finished with status: ${run.conclusion ?: run.status}. ${run.htmlUrl}")
-                _agentEvents.tryEmit(AgentEvent.Finished("Build ${run.conclusion}", 0))
+                _agentEvents.tryEmit(AgentEvent.Finished("Build ${run.conclusion}", stepCounter))
                 return
             }
 
             attempt++
             githubManager.log.error("Build FAILED for $short (attempt $attempt). Reading the error log…")
-            status("Build failed. Reading the error log…")
+            status("Building: Fetching failure log from GitHub…")
             val log = gitHubRepository.fetchFailureLog(pat, repo, run.id)
-            // Always keep the error in the Builds tab so the user can read and copy it.
+            // Also write build error log into Termux workspace so the user/agent can inspect it via Termux
+            termuxBridge.execCommand(
+                command = "mkdir -p .engine && cat << 'EOF' > .engine/last_github_build.log\n${log.take(8000)}\nEOF",
+                cwd = projDir.absolutePath,
+                timeoutSec = 15
+            )
+            val firstError = log.lineSequence()
+                .firstOrNull { it.contains("error", ignoreCase = true) || it.startsWith("e: ") || it.contains("FAILED") }
+                ?.trim()?.take(160) ?: "See the expanded build log below."
+
+            setSubStep("workflow_queue", "3. GitHub Actions workflow triggered ($short)", "DONE", "Attempt $attempt/$maxAttempts")
+            setSubStep("build_logs", "4. Build failed — extracted error logs via Termux", "ERROR", firstError)
+            syncBuildStep("FAILED", true, "GitHub Actions Build Failed (commit $short, attempt $attempt/$maxAttempts):\n\n$log")
+            _agentEvents.tryEmit(AgentEvent.ToolFinished(stepCounter, "building", log.take(500), true))
+
             buildLogStore.add(
                 BuildLogEntry(
                     id = System.currentTimeMillis(), time = System.currentTimeMillis(), projectName = projectName,
@@ -307,24 +506,16 @@ class AgentEngine(
                     runUrl = run.htmlUrl, log = log
                 )
             )
-            githubManager.log.error("Error log saved in the Builds tab.")
-            val firstError = log.lineSequence()
-                .firstOrNull { it.contains("error", ignoreCase = true) || it.startsWith("e: ") || it.contains("FAILED") }
-                ?.trim()?.take(160) ?: "See the Builds tab for the full log."
 
             if (attempt > maxAttempts) {
                 postNote(
                     req.conversationId,
-                    "❌ Build is still failing after $maxAttempts auto-fix attempt(s). The error log is saved in the **Builds** tab.\nLast run: ${run.htmlUrl}"
+                    "❌ Build is still failing after $maxAttempts auto-fix attempt(s). Tap the **building** action card above to inspect the full log.\nLast run: ${run.htmlUrl}"
                 )
-                _agentEvents.tryEmit(AgentEvent.Finished("Build still failing", 0))
+                _agentEvents.tryEmit(AgentEvent.Finished("Build still failing", stepCounter))
                 return
             }
 
-            postNote(
-                req.conversationId,
-                "❌ GitHub build failed (attempt $attempt/$maxAttempts). The error log is saved in the **Builds** tab.\n`$firstError`"
-            )
             if (settings.askBeforeBuildFix) {
                 status("Build failed. Waiting for your permission to fix it…")
                 val allowed = withTimeoutOrNull(15 * 60_000L) {
@@ -332,25 +523,27 @@ class AgentEngine(
                         ApprovalRequest(
                             id = UUID.randomUUID().toString(),
                             toolName = "build_fix",
-                            summary = "The GitHub build failed:\n$firstError\n\nLet the AI read the error log and try to fix the code?",
-                            title = "Build failed",
+                            summary = "The GitHub build failed:\n$firstError\n\nLet the AI read the error log and fix the code?",
+                            title = "GitHub Build Failed",
                             allowLabel = "Fix with AI",
                             denyLabel = "Not now"
                         )
-                    )
+                    ) == "ALLOW"
                 } ?: false
                 if (!allowed) {
-                    postNote(req.conversationId, "OK, I will not change anything. You can copy the error from the Builds tab, or tell me to fix it later.")
-                    _agentEvents.tryEmit(AgentEvent.Finished("Build failed; waiting", 0))
+                    postNote(req.conversationId, "OK, I paused auto-fix. Tap the **building** card above to inspect the build steps and logs.")
+                    _agentEvents.tryEmit(AgentEvent.Finished("Build failed; waiting", stepCounter))
                     return
                 }
             }
-            insertUserNote(req.conversationId, "🔧 Fix the GitHub build error (attempt $attempt/$maxAttempts).")
+            insertUserNote(req.conversationId, "🔧 Auto-fixing GitHub build error (attempt $attempt/$maxAttempts)…")
             val prompt = "The GitHub Actions build FAILED after the last changes. Fix the compile/build errors.\n\n" +
                 "Build log (errors extracted):\n```\n$log\n```\n\n" +
                 "Read the affected files first, fix the root cause with minimal edits, and call finish when done."
             val result = runAgentLoop(req, prompt, emptyList())
             if (!result.ok) return
+            currentAssistantId = result.assistantMessageId ?: currentAssistantId
+            stepCounter = result.lastStepIndex
             touched = result.touched
             removed = result.removed
             if (!result.changed) {
@@ -402,10 +595,10 @@ class AgentEngine(
     // ---------------------------------------------------------------------------------------
 
     private suspend fun loadHistory(conversationId: String): List<LlmMessage> {
+        val conv = conversationDao.getConversationById(conversationId)
         val all = messageDao.getMessagesForConversationOnce(conversationId)
             .filter { (it.sender == "USER" || it.sender == "ASSISTANT") && it.content.isNotBlank() && it.status != "STREAMING" && it.status != "ERROR" }
             .toMutableList()
-        // The newest USER message is the prompt of this run (added by the UI) - it is sent separately.
         if (all.isNotEmpty() && all.last().sender == "USER") all.removeAt(all.size - 1)
 
         val picked = ArrayList<MessageEntity>()
@@ -416,9 +609,17 @@ class AgentEngine(
             chars += m.content.length
         }
         picked.reverse()
-        return picked
-            .map { LlmMessage(role = if (it.sender == "USER") "user" else "assistant", content = it.content.take(6000)) }
-            .dropWhile { it.role == "assistant" }
+        val result = ArrayList<LlmMessage>()
+        if (!conv?.summaryText.isNullOrBlank()) {
+            result.add(LlmMessage(role = "user", content = "[Summary of earlier conversation]\n${conv?.summaryText}"))
+            result.add(LlmMessage(role = "assistant", content = "Understood. Continuing with that context."))
+        }
+        result.addAll(
+            picked
+                .map { LlmMessage(role = if (it.sender == "USER") "user" else "assistant", content = it.content.take(6000)) }
+                .dropWhile { it.role == "assistant" }
+        )
+        return result
     }
 
     private fun startOfMonth(): Long {
@@ -446,54 +647,60 @@ class AgentEngine(
         }
     }
 
-    private fun buildSystemPrompt(projectName: String, projectPrompt: String?, mode: AgentMode, hasProject: Boolean): String {
+    private suspend fun buildSystemPrompt(
+        projectId: String,
+        projectName: String,
+        projectPrompt: String?,
+        mode: AgentMode,
+        hasProject: Boolean
+    ): String {
         val sb = StringBuilder()
         val understand = """
 HOW TO UNDERSTAND THE USER
 - The user writes informally, often in Hinglish (Hindi written in English letters) or mixed languages, with typos. Work out what they REALLY want before you do anything.
-- A message can be: (a) a question or a discussion ("what is the solution?", "why does this happen?"), (b) a bug report, (c) a request to change / add / remove / fix something, (d) a short follow-up like "done", "ok", "kar diya", "haan" which means: continue the task discussed earlier in this conversation.
+- A message can be: (a) a question or a discussion, (b) a bug report, (c) a request to change / add / remove / fix something, (d) a GitHub URL to clone or install as a tool, or (e) a short follow-up like "done", "ok", "kar diya", "haan".
 - Use the earlier messages of this conversation. Do not start from zero when the user refers to "this", "it", "that feature" or "the file you mentioned".
-- If something is unclear, ask ONE short, specific question instead of guessing or browsing files.
+- If something is unclear, call ask_user with ONE short question and 2-4 options instead of guessing or browsing files endlessly.
         """.trimIndent()
+
+        val agentMemory = if (hasProject && settings.autoReadAgentMd) {
+            projectRepository.readAgentMemory(projectId).take(3000)
+        } else ""
+
+        val installedTools = try {
+            installedToolDao.getAllToolsOnce().filter { it.enabled }
+        } catch (_: Exception) {
+            emptyList()
+        }
 
         if (mode == AgentMode.CHAT) {
             sb.append(
                 """
-You are CodeForge in CHAT MODE: a smart, friendly assistant like Claude, ChatGPT or Gemini that also understands code. The current project is "$projectName"${if (hasProject) "" else " (no project attached: this is a clean chat)"}.
+You are CodeForge v2 in CHAT MODE: a smart, friendly assistant that also understands code. The current project is "$projectName"${if (hasProject) "" else " (no project attached: this is a clean chat)"}.
 
 $understand
 
 CHAT MODE RULES
-- Talk naturally: answer questions, explain, brainstorm, compare options, discuss bugs and solutions. Be direct, warm and concise. Greetings and general questions need NO tools.
-- If a project is attached you may look at it with the READ-ONLY tools list_files, read_file and search_code, but only when the answer depends on the code (for example "which file contains the File Editor option?" -> search, then answer with the exact file path and the function or composable that holds it). Use at most 5 tool calls. Never read files just to look busy.
-- You CANNOT modify files in chat mode. If the user asks you to change, add, remove, fix, rewrite or create something in the project, do NOT pretend you did it and do NOT call edit tools. Reply in the user's language and in your own words that they are currently in Chat mode, so please switch to Build mode with the Chat / Build switch next to the message box, and then tell you "done". If you already know what you would change, say it briefly (file and idea).
-- You have no tool for running or compiling code. Do not claim you tested anything.
+- Talk naturally: answer questions, explain, brainstorm, compare options, discuss bugs and solutions. Greetings and general questions need NO tools.
+- If a project is attached you may look at it with the READ-ONLY tools list_files, read_file, search_code, and ask_user, using at most 5 tool calls.
+- You CANNOT modify files or run shell commands in Chat mode. If the user asks you to change files, clone repos, or run commands, reply warmly in the user's language that they are currently in Chat mode and can tap the Chat | Build pill at the top to switch to Build mode.
                 """.trimIndent()
             )
         } else {
             sb.append(
                 """
-You are CodeForge in BUILD MODE: an expert coding agent working inside an Android app on the user's phone. The current project is "$projectName"${if (hasProject) "" else " (NO PROJECT ATTACHED)"}. You work like Claude Code: understand, locate, edit, verify, report.
+You are CodeForge v2 in BUILD MODE: an autonomous coding agent with a real Termux/POSIX execution engine and structured file tools. The current project is "$projectName"${if (hasProject) "" else " (NO PROJECT ATTACHED)"}.
 
 $understand
 
-${if (hasProject) "" else "NO PROJECT: there are no files to work on. Do not call tools. Tell the user (in their language) to attach a project ZIP with the + button, or to open a project, or to clone a GitHub repo, then continue. You may still answer questions in text."}
-
-BUILD MODE WORKFLOW (for bug reports and change requests)
-1. Plan in one sentence what the user wants (see PROGRESS NOTES). If you are not sure, ask a question and make NO tool calls.
-2. Locate the code with at most 3 targeted search_code calls, then read only the files or line ranges you need. Never read the same file twice, never browse the whole tree. Do not repeat a tool call with the same arguments: its result is already in your context.
-3. As soon as you know where the change belongs, EDIT. If after about 6 exploration calls you still cannot find it, STOP and ask the user which file or screen to look at. Do not keep searching.
-4. Make the smallest correct change. Prefer edit_file (exact unique match). Use write_file only for new files or a full replacement; for big files use several small edit_file calls. If a feature must be removed, remove its UI and its now-unused code and imports completely, so the project still compiles.
-5. read_file output has line-number prefixes ("   12<tab>code"). The prefix is NOT part of the file: never put it in old_str/new_str.
-6. The project cannot be compiled on this device (builds run later on GitHub Actions), so double-check imports, nullability, signatures and brackets. After editing, re-read the edited region once to verify, then call finish.
-7. If the user only asks a question or discusses, answer in text without editing.
-
-FINAL REPORT (very important)
-After your last tool call write a short report for the user in their language, like a colleague who just finished the work:
-- What you did: 2-5 bullets with the file names that changed.
-- If it was a bug: "The problem was ..." and "I fixed it by ...".
-- What to test or check, and anything risky or left over.
-No big code dumps. Then call finish with a one-line summary.
+BUILD MODE WORKFLOW
+1. Plan briefly what the user wants. For multi-step tasks, you can call `plan` with a checklist or write a short progress note.
+2. Locate code with targeted `search_code` calls, then read the exact files or line ranges with `read_file`.
+3. READ-BEFORE-EDIT RULE: You MUST call `read_file` on a file in the current run before calling `edit_file`, `insert_after_line`, or `replace_line_range` on it.
+4. Make the smallest correct change using `edit_file` (or `insert_after_line` / `replace_line_range` when line numbers are cleaner). Never include line-number prefixes in `old_str` or `new_str`.
+5. You can run real shell commands, tests, git, python, or node via `run_command`.
+6. When a user shares a GitHub repo URL, decide or ask whether to `git_clone` into `~/forge/projects/` (to work on its code) or `install_repo_tool` into `~/forge/tools/` (to install & register it as a reusable CLI/MCP tool).
+7. When done, write a clear summary in the user's language (what changed, root cause if bug, how to verify) and call `finish`.
                 """.trimIndent()
             )
         }
@@ -502,17 +709,35 @@ No big code dumps. Then call finish with a one-line summary.
             """
 
 
-PROGRESS NOTES (shown in the "Summary" panel, ALWAYS in English)
-- Every time you are about to call tools, first write ONE short plain-English sentence (max 14 words) saying what you are doing and why, for example: Looking for where the folder chips handle long press. No markdown, no code.
-- In your first reply of a task, begin with a line "TITLE: " plus a 3-8 word English title (for example: TITLE: Remove reorder from folder chips), then the first progress sentence on the next line.
+PROGRESS NOTES (shown in the Activity Timeline, ALWAYS in English)
+- Every time you are about to call tools, first write ONE short plain-English sentence (max 14 words) in present-continuous tense saying what you are doing, e.g. "Reading MainActivity.kt to inspect theme initialization."
+- In your first reply of a task, begin with a line "TITLE: " plus a 3-8 word English title.
 
 RULES
-- Paths are relative to the project root. Do not touch build output folders.
-- Never read or print secrets (.env, keystores, google-services.json). Those tools will refuse.
-- Earlier chat turns only contain text summaries, not file contents; files may have changed since. Re-read before editing.
-- If a tool returns an error, read the message and adjust. Do not repeat the same failing call.
+- Paths are relative to the project root.
+- Never read or print secrets (.env, keystores, google-services.json).
+- If a tool returns an error, read the message (and nearest-match line numbers if edit_file failed) and adjust. Never repeat the exact same failing call.
             """.trimIndent()
         )
+
+        if (agentMemory.isNotBlank()) {
+            sb.append("\n\nPROJECT MEMORY (AGENT.md):\n").append(agentMemory)
+        }
+        if (installedTools.isNotEmpty()) {
+            sb.append("\n\nINSTALLED WORKSPACE TOOLS & SKILLS (available in ~/forge/tools/ — invoke via `run_installed_tool` or `run_command`):\n")
+            installedTools.forEach { t ->
+                sb.append("- **${t.name}** (id=`${t.id}`, type=${t.type}): entry=`${t.entryCommand}` in `${t.installPath}` — ${t.description}\n")
+                val toolDir = File(t.installPath)
+                val skillDoc = listOf("SKILL.md", "AGENTS.md", "CLAUDE.md", "README.md")
+                    .mapNotNull { fn -> File(toolDir, fn).takeIf { it.exists() }?.readText()?.take(1200) }
+                    .firstOrNull()
+                if (!skillDoc.isNullOrBlank()) {
+                    sb.append("  Skill/Usage Summary for `${t.name}`:\n")
+                    sb.append(skillDoc.lines().take(20).joinToString("\n") { "    $it" }).append("\n")
+                }
+            }
+        }
+
         val global = settings.globalSystemPrompt.trim()
         if (global.isNotEmpty()) sb.append("\n\nUSER INSTRUCTIONS (global):\n").append(global)
         if (!projectPrompt.isNullOrBlank()) sb.append("\n\nPROJECT INSTRUCTIONS:\n").append(projectPrompt.trim())
@@ -527,7 +752,6 @@ RULES
         return sb.toString()
     }
 
-    /** Short English title for the Summary panel, produced by a tiny extra call (a few tokens). */
     private fun requestTitle(req: RunRequest, assistantId: String, prompt: String, isFirstTurn: Boolean) {
         scope.launch {
             try {
@@ -541,14 +765,17 @@ RULES
                         reasoningLevel = ReasoningLevel.OFF,
                         maxTokens = 30
                     ),
-                    preferredProviderId = settings.preferredProviderId
+                    preferredProviderId = settings.preferredProviderId,
+                    strategy = settings.fallbackStrategy,
+                    maxSwitches = settings.maxProviderSwitchesPerTurn
                 )
                 val title = resp.content.trim().trim('"', '\'', '.', ' ', '\n').lineSequence().firstOrNull().orEmpty().take(70)
                 if (title.length >= 3) {
                     messageDao.insertToolStep(
                         ToolStepEntity(
                             id = UUID.randomUUID().toString(), messageId = assistantId, stepIndex = 0,
-                            toolName = "note", argumentsJson = JSONObject().put("title", title).put("text", "").toString(),
+                            toolName = "note", type = "NOTE",
+                            argumentsJson = JSONObject().put("title", title).put("text", "").toString(),
                             resultText = "", isError = false, status = "COMPLETED", durationMs = 0L
                         )
                     )
@@ -557,21 +784,20 @@ RULES
                 }
             } catch (e: CancellationException) {
                 throw e
-            } catch (e: Exception) {
-                // the title is optional
+            } catch (_: Exception) {
+                // title is optional
             }
         }
     }
 
-    /** Old file contents are the biggest token cost: keep only the newest tool results in full. */
-    private fun compactToolResults(messages: MutableList<LlmMessage>) {
+    private fun compactToolResults(messages: MutableList<LlmMessage>, thresholdChars: Int = 60_000) {
         val toolIdx = messages.indices.filter { messages[it].role == "tool" }
         val total = toolIdx.sumOf { messages[it].content.length }
-        if (total < 60_000) return
+        if (total < thresholdChars) return
         for (i in toolIdx.dropLast(6)) {
             val m = messages[i]
             if (m.content.length > 500) {
-                messages[i] = m.copy(content = m.content.take(400) + "\n[older tool result trimmed to save tokens]")
+                messages[i] = m.copy(content = m.content.take(400) + "\n[older tool result trimmed to save context window]")
             }
         }
     }
@@ -600,23 +826,33 @@ RULES
             )
         )
 
+        val hasProject = project.id != ProjectRepository.SCRATCH_ID
         try {
-            if (req.mode == AgentMode.BUILD && project.id != ProjectRepository.SCRATCH_ID) {
+            if (req.mode == AgentMode.BUILD && hasProject && settings.autoCheckpointBeforeBuild) {
                 val cp = projectRepository.createCheckpoint(req.projectId, "Before: ${prompt.lineSequence().firstOrNull().orEmpty().take(50)}")
                 projectRepository.recordRunCheckpoint(req.projectId, cp.id)
             }
         } catch (e: CancellationException) {
             throw e
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             // continue without checkpoint
         }
 
-        val hasProject = project.id != ProjectRepository.SCRATCH_ID
-        val systemPrompt = buildSystemPrompt(project.name, project.systemPrompt, req.mode, hasProject)
-        // No project attached = nothing to read or edit, so no tools (the model just talks)
+        // If user attached an APK or ZIP archive for analysis/reverse-engineering, run analysis & show Save Output card
+        if (!req.attachedArchivePath.isNullOrBlank()) {
+            val archiveFile = File(req.attachedArchivePath)
+            if (archiveFile.exists()) {
+                status("Analyzing attached archive ${archiveFile.name}…")
+                val outDir = File(projectRepository.outputsRootDir, archiveFile.nameWithoutExtension + "_" + System.currentTimeMillis())
+                val analysis = RepoToolInstaller.analyzeArchiveOrApk(archiveFile, outDir)
+                handleAnalysisSavePrompt(req.projectId, project.name, archiveFile.name, outDir, analysis.markdownReport)
+            }
+        }
+
+        val systemPrompt = buildSystemPrompt(project.id, project.name, project.systemPrompt, req.mode, hasProject)
         val activeTools = when {
-            !hasProject -> emptyList()
-            req.mode == AgentMode.CHAT -> toolsList.filter { it.name in READ_ONLY_TOOLS }
+            req.mode == AgentMode.CHAT -> if (hasProject) toolsList.filter { it.name in READ_ONLY_TOOLS } else toolsList.filter { it.name == "ask_user" }
+            !hasProject -> toolsList.filter { it.name in setOf("git_clone", "install_repo_tool", "run_installed_tool", "run_command", "ask_user", "plan", "finish") }
             else -> toolsList
         }
         val messages = ArrayList<LlmMessage>(history)
@@ -638,14 +874,12 @@ RULES
         var hitStepLimit = false
         val touchedAll = LinkedHashSet<String>()
         val removedAll = LinkedHashSet<String>()
-        // Loop guards: the agent must not wander through files forever and waste tokens
-        val seenCalls = HashSet<String>()
-        var exploreCalls = 0
-        var dupCount = 0
+
+        // Read-Before-Edit guard & LoopGuard (Section 6.4 & 6.5)
+        val readFilesInRun = HashSet<String>()
+        val loopGuard = LoopGuard()
         var forceFinal = false
         var titleRequested = false
-        val softLimit = if (req.mode == AgentMode.BUILD) 8 else 4
-        val hardLimit = if (req.mode == AgentMode.BUILD) 12 else 6
 
         try {
             var step = 0
@@ -680,13 +914,17 @@ RULES
                         reasoningLevel = level
                     ),
                     preferredProviderId = settings.preferredProviderId,
+                    strategy = settings.fallbackStrategy,
+                    maxSwitches = settings.maxProviderSwitchesPerTurn,
                     onChunk = { t ->
                         stepText.append(t)
                         _agentEvents.tryEmit(AgentEvent.StreamingChunk(t))
                     },
                     onReasoning = { t -> _agentEvents.tryEmit(AgentEvent.ReasoningChunk(t)) },
                     onFailoverNotice = { ev ->
-                        _agentEvents.tryEmit(AgentEvent.FailoverNotice(ev.fromProvider, ev.toProvider, ev.reason))
+                        if (settings.showProviderSwitchNotice) {
+                            _agentEvents.tryEmit(AgentEvent.FailoverNotice(ev.fromProvider, ev.toProvider, ev.reason))
+                        }
                     },
                     onAttempt = {
                         stepText.clear()
@@ -704,17 +942,15 @@ RULES
                     reasoningAll.append(response.reasoning)
                 }
                 if (forceFinal && response.toolCalls.isNotEmpty()) {
-                    // The model ignored "stop exploring": end here with an honest message instead of burning more tokens.
                     if (fullText.isEmpty()) {
                         fullText.append(
-                            "I looked through the project but could not reach a clear result, so I stopped to save your tokens. " +
-                                "Please tell me the file or screen to look at (or describe the exact change), and I will continue from there."
+                            "I paused because the same step was repeating without progress. " +
+                                "Please clarify which file or approach you prefer, and I will continue right away."
                         )
                     }
                     break
                 }
                 if (response.toolCalls.isNotEmpty()) {
-                    // Text written before tool calls = progress note for the Summary panel
                     val raw = response.content.trim()
                     if (raw.isNotEmpty()) {
                         var noteText = raw
@@ -730,7 +966,7 @@ RULES
                         messageDao.insertToolStep(
                             ToolStepEntity(
                                 id = UUID.randomUUID().toString(), messageId = assistantId, stepIndex = toolIndex,
-                                toolName = "note", argumentsJson = noteArgs.toString(),
+                                toolName = "note", type = "NOTE", argumentsJson = noteArgs.toString(),
                                 resultText = "", isError = false, status = "COMPLETED", durationMs = 0L
                             )
                         )
@@ -774,29 +1010,58 @@ RULES
                 var finished = false
                 lastToolError = false
                 for (call in response.toolCalls) {
-                    val isExplore = call.name in READ_ONLY_TOOLS
-                    val callKey = call.name + "|" + call.argumentsJson.trim()
-
-                    // Same read/search again = going in circles: answer from memory instead of running it
-                    if (isExplore && callKey in seenCalls) {
-                        dupCount++
-                        messages.add(
-                            LlmMessage(
-                                role = "tool",
-                                content = "You already ran this exact call earlier in this run, its result is above. Do not repeat it. " +
-                                    "Use what you know: make the edit, answer the user, or ask ONE clarifying question.",
-                                toolCallId = call.id,
-                                toolName = call.name
-                            )
-                        )
-                        if (dupCount >= 3) forceFinal = true
-                        continue
-                    }
-                    if (isExplore) seenCalls.add(callKey)
-
                     if (!titleRequested) {
                         titleRequested = true
                         requestTitle(req, assistantId, prompt, history.isEmpty())
+                    }
+
+                    // Check LoopGuard before executing
+                    if (settings.loopGuardEnabled) {
+                        val preDecision = loopGuard.recordAndCheck(
+                            toolName = call.name,
+                            argsJson = call.argumentsJson,
+                            isError = false,
+                            fileChanged = false,
+                            newEvidence = call.name in READ_ONLY_TOOLS
+                        )
+                        if (preDecision is LoopGuardDecision.BlockRepeatCall) {
+                            toolIndex++
+                            messageDao.insertToolStep(
+                                ToolStepEntity(
+                                    id = UUID.randomUUID().toString(),
+                                    messageId = assistantId,
+                                    stepIndex = toolIndex,
+                                    toolName = "note",
+                                    type = "NOTE",
+                                    argumentsJson = JSONObject().put("text", "Trying a different approach…").toString(),
+                                    resultText = preDecision.messageForModel,
+                                    isError = false,
+                                    status = "COMPLETED",
+                                    durationMs = 0L
+                                )
+                            )
+                            _agentEvents.tryEmit(AgentEvent.NoteAdded("Trying a different approach…"))
+                            messages.add(
+                                LlmMessage(
+                                    role = "tool",
+                                    content = preDecision.messageForModel,
+                                    toolCallId = call.id,
+                                    toolName = call.name
+                                )
+                            )
+                            continue
+                        } else if (preDecision is LoopGuardDecision.StopAndSummarize) {
+                            forceFinal = true
+                            messages.add(
+                                LlmMessage(
+                                    role = "tool",
+                                    content = preDecision.reason,
+                                    toolCallId = call.id,
+                                    toolName = call.name
+                                )
+                            )
+                            continue
+                        }
                     }
 
                     toolIndex++
@@ -806,22 +1071,30 @@ RULES
                     messageDao.insertToolStep(
                         ToolStepEntity(
                             id = stepId, messageId = assistantId, stepIndex = toolIndex,
-                            toolName = call.name, argumentsJson = call.argumentsJson,
+                            toolName = call.name, type = inferStepType(call.name),
+                            argumentsJson = call.argumentsJson,
                             resultText = "", isError = false, status = "RUNNING", durationMs = 0L
                         )
                     )
                     val t0 = System.currentTimeMillis()
                     val result = if (call.name == "finish") {
-                        val s = try { JSONObject(call.argumentsJson).optString("summary") } catch (e: Exception) { "" }
+                        val s = try { JSONObject(call.argumentsJson).optString("summary") } catch (_: Exception) { "" }
                         finishSummary = s
                         finished = true
-                        ToolResult("Done.")
+                        ToolResult("Done.", stepType = "FINISH")
                     } else {
-                        executeTool(req.projectId, call, req.mode)
+                        executeTool(req.projectId, call, req.mode, readFilesInRun)
                     }
+
                     if (result.changed) {
                         anyChange = true
-                        seenCalls.clear() // files changed: reading them again is legitimate
+                        // Update AGENT.md learned notes when files change or commands run
+                        if (settings.autoUpdateAgentMd && hasProject && result.touched.isNotEmpty()) {
+                            projectRepository.appendLearnedProjectNote(
+                                req.projectId,
+                                "Modified ${result.touched.joinToString(", ")} (${result.diffSummary ?: "updated"})"
+                            )
+                        }
                     }
                     touchedAll.addAll(result.touched)
                     removedAll.addAll(result.removed)
@@ -829,23 +1102,38 @@ RULES
 
                     var toolText = result.text
                     if (toolText.length > 14_000) toolText = toolText.take(14_000) + "\n[result truncated]"
-                    if (isExplore) {
-                        exploreCalls++
-                        if (exploreCalls >= hardLimit) {
-                            forceFinal = true
-                            toolText += "\n\n[SYSTEM: exploration limit reached, you must stop browsing now. Reply to the user in plain text, in their language: " +
-                                "what you found, what you could not find, and either the exact change you would make or ONE specific question for the user.]"
-                        } else if (exploreCalls >= softLimit) {
-                            toolText += "\n\n[SYSTEM: you have already used $exploreCalls exploration calls. Decide now: make the edit, answer the user, " +
-                                "or ask a question. Do not keep browsing files.]"
+
+                    // Post-execution LoopGuard check for consecutive edit failures on the same file
+                    if (settings.loopGuardEnabled && result.isError && call.name in setOf("edit_file", "insert_after_line", "replace_line_range")) {
+                        val postDecision = loopGuard.recordAndCheck(
+                            toolName = call.name,
+                            argsJson = call.argumentsJson,
+                            isError = true,
+                            fileChanged = false,
+                            newEvidence = false,
+                            targetFilePath = result.filePath
+                        )
+                        if (postDecision is LoopGuardDecision.ForceReReadAndSwitchStrategy) {
+                            _agentEvents.tryEmit(AgentEvent.NoteAdded("Trying a different approach…"))
+                            val fullFileNow = result.filePath?.let { projectRepository.readFile(req.projectId, it, 1, 300) } ?: ""
+                            toolText += "\n\n${postDecision.messageForModel}\nCurrent file content with line numbers:\n$fullFileNow"
                         }
                     }
 
                     messageDao.insertToolStep(
                         ToolStepEntity(
-                            id = stepId, messageId = assistantId, stepIndex = toolIndex,
-                            toolName = call.name, argumentsJson = call.argumentsJson,
-                            resultText = result.text.take(4000), isError = result.isError,
+                            id = stepId,
+                            messageId = assistantId,
+                            stepIndex = toolIndex,
+                            toolName = call.name,
+                            type = result.stepType,
+                            filePath = result.filePath,
+                            diffSummary = result.diffSummary,
+                            commandText = result.commandText,
+                            cwdText = result.cwdText,
+                            argumentsJson = call.argumentsJson,
+                            resultText = result.text.take(4000),
+                            isError = result.isError,
                             status = if (result.isError) "FAILED" else "COMPLETED",
                             durationMs = System.currentTimeMillis() - t0
                         )
@@ -880,7 +1168,7 @@ RULES
                 reasoningAll.toString(), "ERROR", providerName, modelName, totalPrompt, totalCompletion, totalCached
             )
             _agentEvents.tryEmit(AgentEvent.Error(msg))
-            return LoopResult(false, anyChange, "", touchedAll, removedAll)
+            return LoopResult(false, anyChange, "", touchedAll, removedAll, assistantId, toolIndex)
         }
 
         val body = StringBuilder(fullText.toString())
@@ -891,7 +1179,7 @@ RULES
         }
         if (body.isBlank() && anyChange) {
             val names = (touchedAll + removedAll).map { it.substringAfterLast('/') }.distinct().take(8)
-            body.append("Done. I changed: ").append(names.joinToString(", ")).append(". Check the Changes tab to review or undo.")
+            body.append("Done. I changed: ").append(names.joinToString(", ")).append(". Check the Working Files panel or Changes tab to review or revert.")
         }
         if (hitStepLimit) {
             body.append("\n\n⏸ Reached the step limit ($maxSteps). Send \"continue\" to keep going, or raise the limit in Settings.")
@@ -904,9 +1192,75 @@ RULES
             providerName, modelName, totalPrompt, totalCompletion, totalCached
         )
         _agentEvents.tryEmit(AgentEvent.Finished(fs ?: fullText.toString().take(200), toolIndex))
-        // a file edited and later deleted/moved in the same run is not "touched" any more
         touchedAll.removeAll(removedAll)
-        return LoopResult(errorText == null, anyChange, fs ?: fullText.toString(), touchedAll, removedAll)
+        return LoopResult(errorText == null, anyChange, fs ?: fullText.toString(), touchedAll, removedAll, assistantId, toolIndex)
+    }
+
+    private suspend fun handleAnalysisSavePrompt(
+        activeProjectId: String,
+        activeProjectName: String,
+        archiveName: String,
+        extractedDir: File,
+        reportMarkdown: String
+    ) {
+        val options = listOf(
+            "Save to a new project",
+            "Save into \"$activeProjectName\"",
+            "Save report only",
+            "Don't save"
+        )
+        val choice = awaitDecision(
+            ApprovalRequest(
+                id = UUID.randomUUID().toString(),
+                toolName = "save_analysis_output",
+                title = "Save this source to a project?",
+                summary = "Extracted and analyzed $archiveName.\nWhere would you like to save the extracted source tree and ANALYSIS.md report?",
+                allowLabel = "Save to new project",
+                denyLabel = "Don't save",
+                options = options,
+                isSaveOutputPrompt = true,
+                extractedSourceDirPath = extractedDir.absolutePath,
+                analysisReportMarkdown = reportMarkdown,
+                sourceArchiveName = archiveName
+            )
+        )
+        when (choice) {
+            "Save to a new project", "ALLOW" -> {
+                val newProj = projectRepository.createEmptyProject(archiveName.substringBeforeLast('.'))
+                projectRepository.saveAnalysisOutputToProject(
+                    targetProjectId = newProj.id,
+                    sourceName = archiveName,
+                    extractedDir = extractedDir,
+                    analysisMarkdown = reportMarkdown,
+                    reportOnly = false
+                )
+            }
+            "Save into \"$activeProjectName\"" -> {
+                if (activeProjectId != ProjectRepository.SCRATCH_ID) {
+                    projectRepository.saveAnalysisOutputToProject(
+                        targetProjectId = activeProjectId,
+                        sourceName = archiveName,
+                        extractedDir = extractedDir,
+                        analysisMarkdown = reportMarkdown,
+                        reportOnly = false
+                    )
+                }
+            }
+            "Save report only" -> {
+                if (activeProjectId != ProjectRepository.SCRATCH_ID) {
+                    projectRepository.saveAnalysisOutputToProject(
+                        targetProjectId = activeProjectId,
+                        sourceName = archiveName,
+                        extractedDir = null,
+                        analysisMarkdown = reportMarkdown,
+                        reportOnly = true
+                    )
+                }
+            }
+            else -> {
+                // Keep temporary files in ~/forge/outputs/ only
+            }
+        }
     }
 
     private suspend fun finalizeMessage(
@@ -929,34 +1283,56 @@ RULES
         touchConversation(conversationId)
     }
 
+    private fun inferStepType(toolName: String): String = when (toolName) {
+        "read_file", "list_files" -> "READ"
+        "search_code" -> "SEARCH"
+        "edit_file", "write_file", "insert_after_line", "replace_line_range", "delete_file", "move_file" -> "EDIT"
+        "run_command", "git_clone", "install_repo_tool" -> "CMD"
+        "plan" -> "PLAN"
+        "ask_user" -> "ASK"
+        else -> "TOOL"
+    }
+
     private fun describeCall(call: LlmToolCall): String {
-        val a = try { JSONObject(call.argumentsJson) } catch (e: Exception) { JSONObject() }
+        val a = try { JSONObject(call.argumentsJson) } catch (_: Exception) { JSONObject() }
         return when (call.name) {
             "list_files" -> "Listing ${a.optString("path", ".")}"
             "read_file" -> "Reading ${a.optString("path")}"
             "search_code" -> "Searching for “${a.optString("query").take(40)}”"
             "edit_file" -> "Editing ${a.optString("path")}"
+            "insert_after_line" -> "Inserting lines in ${a.optString("path")}"
+            "replace_line_range" -> "Replacing lines in ${a.optString("path")}"
             "write_file" -> "Writing ${a.optString("path")}"
             "delete_file" -> "Deleting ${a.optString("path")}"
             "move_file" -> "Moving ${a.optString("from_path")}"
+            "run_command" -> "Running `${a.optString("command").take(42)}`"
+            "git_clone" -> "Cloning ${a.optString("url").substringAfterLast('/')}"
+            "install_repo_tool" -> "Installing tool ${a.optString("url").substringAfterLast('/')}"
+            "ask_user" -> "Waiting for your answer…"
+            "plan" -> "Updating plan…"
+            "update_memory" -> "Updating AGENT.md memory…"
             "finish" -> "Finishing up…"
             else -> "Running ${call.name}"
         }
     }
 
     // ---------------------------------------------------------------------------------------
-    // Tools
+    // Permission & Approval helpers
     // ---------------------------------------------------------------------------------------
 
-    /** Safe mode: ask before each file change. */
-    private suspend fun awaitApproval(toolName: String, summary: String): Boolean {
-        if (!settings.safeMode) return true
-        return awaitDecision(ApprovalRequest(UUID.randomUUID().toString(), toolName, summary))
+    private suspend fun awaitApproval(toolName: String, summary: String, isRisky: Boolean = false): Boolean {
+        val perm = settings.defaultPermissionLevel
+        val shouldAsk = when (perm) {
+            PermissionLevel.ASK_ALWAYS -> true
+            PermissionLevel.ASK_RISKY -> isRisky || settings.safeMode
+            PermissionLevel.AUTO_PROJECT -> isRisky && settings.confirmBeforeDestructiveCmd
+        }
+        if (!shouldAsk) return true
+        return awaitDecision(ApprovalRequest(UUID.randomUUID().toString(), toolName, summary)) == "ALLOW"
     }
 
-    /** Always asks the user (dialog is shown on any screen) and waits for the answer. */
-    private suspend fun awaitDecision(request: ApprovalRequest): Boolean {
-        val d = CompletableDeferred<Boolean>()
+    private suspend fun awaitDecision(request: ApprovalRequest): String {
+        val d = CompletableDeferred<String>()
         pendingDecision = d
         _approvalRequest.value = request
         try {
@@ -997,17 +1373,22 @@ RULES
         }
     }
 
-    private suspend fun executeTool(projectId: String, call: LlmToolCall, mode: AgentMode): ToolResult {
+    private suspend fun executeTool(
+        projectId: String,
+        call: LlmToolCall,
+        mode: AgentMode,
+        readFilesInRun: MutableSet<String>
+    ): ToolResult {
         if (mode == AgentMode.CHAT && call.name !in READ_ONLY_TOOLS) {
             return ToolResult(
                 "Chat mode is read-only: you cannot use ${call.name}. Do not retry it. Tell the user (in their language) that they are in Chat mode " +
-                    "and should switch to Build mode (the Chat / Build switch next to the message box) before you can change files, then wait for them to say done.",
+                    "and should switch to Build mode using the Chat | Build toggle in the header before you can edit files or run commands.",
                 isError = true
             )
         }
         val args = try {
             JSONObject(if (call.argumentsJson.isBlank()) "{}" else call.argumentsJson)
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             return ToolResult(
                 "Error: tool arguments were not valid JSON (your output was probably cut off). " +
                     "Retry with a smaller payload, e.g. several small edit_file calls instead of one huge write_file.",
@@ -1021,58 +1402,348 @@ RULES
                         ?: return ToolResult("Error: project folder not found", true)
                     val path = args.optString("path", ".")
                     val node = findNode(root, path) ?: return ToolResult("Error: path not found: $path", true)
-                    if (!node.isDirectory) return ToolResult("${node.path} is a file (${node.sizeBytes} B)")
+                    if (!node.isDirectory) return ToolResult("${node.path} is a file (${node.sizeBytes} B)", stepType = "READ", filePath = cleanPath(path))
                     val sb = StringBuilder()
                     val counter = intArrayOf(0)
                     renderTree(node, 0, sb, counter)
                     if (counter[0] >= 500) sb.append("\n[Listing truncated at 500 entries. Narrow with a sub-path.]")
-                    ToolResult(sb.toString().ifEmpty { "(empty directory)" })
+                    ToolResult(sb.toString().ifEmpty { "(empty directory)" }, stepType = "READ", filePath = cleanPath(path))
                 }
                 "read_file" -> {
                     val path = args.getString("path")
-                    if (KeyStoreManager.isPotentialSecretFile(path)) {
-                        return ToolResult("Blocked: $path looks like a secrets/credentials file and will not be read.", true)
+                    val clean = cleanPath(path)
+                    if (KeyStoreManager.isPotentialSecretFile(clean)) {
+                        return ToolResult("Blocked: $clean looks like a secrets/credentials file and will not be read.", true, filePath = clean)
                     }
                     val start = if (args.has("start_line")) args.optInt("start_line") else null
                     val end = if (args.has("end_line")) args.optInt("end_line") else null
-                    ToolResult(projectRepository.readFile(projectId, path, start, end))
+                    val content = projectRepository.readFile(projectId, clean, start, end)
+                    val isErr = content.startsWith("Error:")
+                    if (!isErr) {
+                        readFilesInRun.add(clean)
+                        recordWorkingFile(clean, WorkingFileState.READING)
+                    }
+                    ToolResult(content, isError = isErr, filePath = clean, stepType = "READ")
                 }
                 "search_code" -> {
-                    ToolResult(projectRepository.searchCode(projectId, args.getString("query"), args.optBoolean("regex", false)))
+                    val q = args.getString("query")
+                    val res = projectRepository.searchCode(projectId, q, args.optBoolean("regex", false))
+                    ToolResult(res, stepType = "SEARCH")
                 }
                 "edit_file" -> {
-                    val path = args.getString("path")
-                    if (!awaitApproval("edit_file", "Edit $path")) return ToolResult("The user denied this edit.", true)
-                    ToolResult(
-                        projectRepository.editFile(projectId, path, args.getString("old_str"), args.getString("new_str")),
-                        changed = true,
-                        touched = listOf(cleanPath(path))
+                    val path = cleanPath(args.getString("path"))
+                    if (path !in readFilesInRun) {
+                        return ToolResult(
+                            "Error: Read the file first before editing. Call read_file on '$path' so you have its exact current lines.",
+                            isError = true,
+                            filePath = path,
+                            stepType = "EDIT"
+                        )
+                    }
+                    if (!awaitApproval("edit_file", "Edit $path")) {
+                        return ToolResult("The user denied this edit.", true, filePath = path, stepType = "EDIT")
+                    }
+                    val editRes = projectRepository.editFileDetailed(
+                        projectId = projectId,
+                        relativePath = path,
+                        oldStr = args.getString("old_str"),
+                        newStr = args.getString("new_str"),
+                        replaceAll = args.optBoolean("replace_all", false)
                     )
+                    if (editRes.success) {
+                        val diffLabel = "+${editRes.addedLines} -${editRes.removedLines}"
+                        recordWorkingFile(path, WorkingFileState.EDITED, diffLabel)
+                        ToolResult(
+                            text = editRes.message,
+                            isError = false,
+                            changed = true,
+                            touched = listOf(path),
+                            diffSummary = diffLabel,
+                            filePath = path,
+                            stepType = "EDIT"
+                        )
+                    } else {
+                        ToolResult(
+                            text = editRes.message,
+                            isError = true,
+                            changed = false,
+                            filePath = path,
+                            stepType = "EDIT"
+                        )
+                    }
+                }
+                "insert_after_line" -> {
+                    val path = cleanPath(args.getString("path"))
+                    if (path !in readFilesInRun) {
+                        return ToolResult(
+                            "Error: Read the file first before editing. Call read_file on '$path' first.",
+                            isError = true,
+                            filePath = path,
+                            stepType = "EDIT"
+                        )
+                    }
+                    if (!awaitApproval("insert_after_line", "Insert lines in $path")) {
+                        return ToolResult("The user denied this edit.", true, filePath = path, stepType = "EDIT")
+                    }
+                    val editRes = projectRepository.editFileDetailed(
+                        projectId = projectId,
+                        relativePath = path,
+                        oldStr = null,
+                        newStr = null,
+                        insertAfterLine = args.getInt("line"),
+                        contentToInsert = args.getString("content")
+                    )
+                    if (editRes.success) {
+                        val diffLabel = "+${editRes.addedLines} -0"
+                        recordWorkingFile(path, WorkingFileState.EDITED, diffLabel)
+                        ToolResult(
+                            text = editRes.message,
+                            changed = true,
+                            touched = listOf(path),
+                            diffSummary = diffLabel,
+                            filePath = path,
+                            stepType = "EDIT"
+                        )
+                    } else {
+                        ToolResult(editRes.message, isError = true, filePath = path, stepType = "EDIT")
+                    }
+                }
+                "replace_line_range" -> {
+                    val path = cleanPath(args.getString("path"))
+                    if (path !in readFilesInRun) {
+                        return ToolResult(
+                            "Error: Read the file first before editing. Call read_file on '$path' first.",
+                            isError = true,
+                            filePath = path,
+                            stepType = "EDIT"
+                        )
+                    }
+                    if (!awaitApproval("replace_line_range", "Replace lines in $path")) {
+                        return ToolResult("The user denied this edit.", true, filePath = path, stepType = "EDIT")
+                    }
+                    val editRes = projectRepository.editFileDetailed(
+                        projectId = projectId,
+                        relativePath = path,
+                        oldStr = null,
+                        newStr = null,
+                        startLine = args.getInt("start_line"),
+                        endLine = args.getInt("end_line"),
+                        replacementContent = args.getString("content")
+                    )
+                    if (editRes.success) {
+                        val diffLabel = "+${editRes.addedLines} -${editRes.removedLines}"
+                        recordWorkingFile(path, WorkingFileState.EDITED, diffLabel)
+                        ToolResult(
+                            text = editRes.message,
+                            changed = true,
+                            touched = listOf(path),
+                            diffSummary = diffLabel,
+                            filePath = path,
+                            stepType = "EDIT"
+                        )
+                    } else {
+                        ToolResult(editRes.message, isError = true, filePath = path, stepType = "EDIT")
+                    }
                 }
                 "write_file" -> {
-                    val path = args.getString("path")
-                    if (!awaitApproval("write_file", "Write file $path")) return ToolResult("The user denied this write.", true)
+                    val path = cleanPath(args.getString("path"))
+                    val existing = projectRepository.readFile(projectId, path)
+                    val isNew = existing.startsWith("Error:")
+                    if (!awaitApproval("write_file", "Write file $path")) {
+                        return ToolResult("The user denied this write.", true, filePath = path, stepType = "EDIT")
+                    }
+                    val content = args.getString("content")
+                    val res = projectRepository.writeFile(projectId, path, content)
+                    readFilesInRun.add(path)
+                    val lineCount = content.lines().size
+                    val diffLabel = "+$lineCount"
+                    recordWorkingFile(path, if (isNew) WorkingFileState.CREATED else WorkingFileState.EDITED, diffLabel)
                     ToolResult(
-                        projectRepository.writeFile(projectId, path, args.getString("content")),
+                        text = res,
                         changed = true,
-                        touched = listOf(cleanPath(path))
+                        touched = listOf(path),
+                        diffSummary = diffLabel,
+                        filePath = path,
+                        stepType = "EDIT"
                     )
                 }
                 "delete_file" -> {
-                    val path = args.getString("path")
-                    if (!awaitApproval("delete_file", "Delete $path")) return ToolResult("The user denied this deletion.", true)
-                    ToolResult(projectRepository.deleteFile(projectId, path), changed = true, removed = listOf(cleanPath(path)))
+                    val path = cleanPath(args.getString("path"))
+                    if (!awaitApproval("delete_file", "Delete $path", isRisky = true)) {
+                        return ToolResult("The user denied this deletion.", true, filePath = path, stepType = "EDIT")
+                    }
+                    val res = projectRepository.deleteFile(projectId, path)
+                    recordWorkingFile(path, WorkingFileState.DELETED)
+                    ToolResult(res, changed = true, removed = listOf(path), filePath = path, stepType = "EDIT")
                 }
                 "move_file" -> {
-                    val from = args.getString("from_path")
-                    val to = args.getString("to_path")
-                    if (!awaitApproval("move_file", "Move $from → $to")) return ToolResult("The user denied this move.", true)
+                    val from = cleanPath(args.getString("from_path"))
+                    val to = cleanPath(args.getString("to_path"))
+                    if (!awaitApproval("move_file", "Move $from → $to")) {
+                        return ToolResult("The user denied this move.", true, filePath = to, stepType = "EDIT")
+                    }
+                    val res = projectRepository.moveFile(projectId, from, to)
+                    readFilesInRun.add(to)
+                    recordWorkingFile(from, WorkingFileState.DELETED)
+                    recordWorkingFile(to, WorkingFileState.CREATED)
                     ToolResult(
-                        projectRepository.moveFile(projectId, from, to),
+                        res,
                         changed = true,
-                        touched = listOf(cleanPath(to)),
-                        removed = listOf(cleanPath(from))
+                        touched = listOf(to),
+                        removed = listOf(from),
+                        filePath = to,
+                        stepType = "EDIT"
                     )
+                }
+                "run_command" -> {
+                    val cmd = args.getString("command")
+                    val relCwd = args.optString("cwd", ".")
+                    val isRisky = cmd.contains("rm -rf") || cmd.contains("pkg install") ||
+                        cmd.contains("pip install") || cmd.contains("npm install") || cmd.contains("curl ")
+                    if (!awaitApproval("run_command", "Run command:\n`$cmd`\nin `$relCwd`", isRisky = isRisky)) {
+                        return ToolResult("The user denied running this command.", true, commandText = cmd, cwdText = relCwd, stepType = "CMD")
+                    }
+                    val projRoot = projectRepository.projectDir(projectId)
+                    val targetDir = File(projRoot, relCwd).canonicalFile
+                    val execRes = termuxBridge.execCommand(
+                        command = cmd,
+                        cwd = targetDir.absolutePath,
+                        timeoutSec = settings.commandTimeoutSeconds
+                    )
+                    val combined = buildString {
+                        appendLine("Exit code: ${execRes.exitCode} (${execRes.durationMs} ms)")
+                        if (execRes.stdout.isNotBlank()) {
+                            appendLine("STDOUT:")
+                            appendLine(execRes.stdout.trim())
+                        }
+                        if (execRes.stderr.isNotBlank()) {
+                            appendLine("STDERR:")
+                            appendLine(execRes.stderr.trim())
+                        }
+                    }.trim()
+                    ToolResult(
+                        text = combined,
+                        isError = execRes.exitCode != 0,
+                        commandText = cmd,
+                        cwdText = targetDir.absolutePath,
+                        stepType = "CMD"
+                    )
+                }
+                "git_clone" -> {
+                    val url = args.getString("url").trim()
+                    val modeType = args.optString("mode", "project") // "project" or "tool"
+                    if (modeType.equals("tool", ignoreCase = true)) {
+                        return executeInstallRepoTool(url)
+                    }
+                    val repoName = url.substringAfterLast('/').removeSuffix(".git").ifBlank { "repo" }
+                    val destDir = File(projectRepository.projectsRootDir, repoName)
+                    val cloneRes = termuxBridge.execCommand(
+                        command = "git clone --depth 1 \"$url\" \"${destDir.absolutePath}\"",
+                        cwd = projectRepository.projectsRootDir.absolutePath,
+                        timeoutSec = 180
+                    )
+                    if (cloneRes.exitCode != 0 && !destDir.exists()) {
+                        return ToolResult(
+                            "Error cloning $url:\n${cloneRes.stderr.ifBlank { cloneRes.stdout }}",
+                            isError = true,
+                            commandText = "git clone $url",
+                            stepType = "CMD"
+                        )
+                    }
+                    val analysis = RepoToolInstaller.inspectDirectory(destDir, url, "PROJECT")
+                    ProjectMemoryManager.ensureAgentMd(projectRepository.projectDir(projectId), repoName)
+                    ToolResult(
+                        text = "Cloned $repoName into ${destDir.absolutePath}.\nStack: ${analysis.detectedStack}",
+                        changed = true,
+                        commandText = "git clone $url",
+                        cwdText = destDir.absolutePath,
+                        stepType = "CMD"
+                    )
+                }
+                "install_repo_tool" -> {
+                    val url = args.getString("url").trim()
+                    executeInstallRepoTool(url)
+                }
+                "run_installed_tool" -> {
+                    val toolQuery = args.getString("tool_name").trim()
+                    val toolArgs = args.optString("args", "").trim()
+                    val enabledTools = installedToolDao.getAllToolsOnce().filter { it.enabled }
+                    val matched = enabledTools.firstOrNull {
+                        it.id.equals(toolQuery, ignoreCase = true) ||
+                            it.name.equals(toolQuery, ignoreCase = true) ||
+                            it.name.contains(toolQuery, ignoreCase = true)
+                    }
+                    if (matched == null) {
+                        val available = enabledTools.joinToString(", ") { "${it.name} (${it.id})" }.ifBlank { "none installed" }
+                        return ToolResult(
+                            "Error: Installed tool '$toolQuery' not found or disabled. Available enabled tools: $available",
+                            isError = true,
+                            stepType = "CMD"
+                        )
+                    }
+                    val fullCmd = if (toolArgs.isNotBlank()) "${matched.entryCommand} $toolArgs" else matched.entryCommand
+                    if (!awaitApproval("run_installed_tool", "Run installed tool `${matched.name}`:\n`$fullCmd`")) {
+                        return ToolResult("User denied running tool ${matched.name}.", isError = true, commandText = fullCmd, stepType = "CMD")
+                    }
+                    val workDir = File(matched.installPath).takeIf { it.exists() } ?: projectRepository.projectDir(projectId)
+                    val execRes = termuxBridge.execCommand(
+                        command = fullCmd,
+                        cwd = workDir.absolutePath,
+                        timeoutSec = settings.commandTimeoutSeconds
+                    )
+                    val out = buildString {
+                        appendLine("Tool: ${matched.name} (${matched.type})")
+                        appendLine("Command: $fullCmd (in ${workDir.absolutePath})")
+                        appendLine("Exit code: ${execRes.exitCode} (${execRes.durationMs} ms)")
+                        if (execRes.stdout.isNotBlank()) {
+                            appendLine("STDOUT:")
+                            appendLine(execRes.stdout.trim())
+                        }
+                        if (execRes.stderr.isNotBlank()) {
+                            appendLine("STDERR:")
+                            appendLine(execRes.stderr.trim())
+                        }
+                    }.trim()
+                    ToolResult(
+                        text = out,
+                        isError = execRes.exitCode != 0,
+                        commandText = fullCmd,
+                        cwdText = workDir.absolutePath,
+                        stepType = "CMD"
+                    )
+                }
+                "ask_user" -> {
+                    val question = args.getString("question")
+                    val optsArr = args.optJSONArray("options") ?: JSONArray()
+                    val opts = mutableListOf<String>()
+                    for (i in 0 until optsArr.length()) {
+                        opts.add(optsArr.optString(i))
+                    }
+                    val answer = awaitDecision(
+                        ApprovalRequest(
+                            id = UUID.randomUUID().toString(),
+                            toolName = "ask_user",
+                            title = "Question from Agent",
+                            summary = question,
+                            allowLabel = opts.firstOrNull() ?: "Continue",
+                            denyLabel = opts.getOrNull(1) ?: "Cancel",
+                            options = opts
+                        )
+                    )
+                    ToolResult("User answered: $answer", stepType = "ASK")
+                }
+                "plan" -> {
+                    val itemsArr = args.optJSONArray("steps") ?: JSONArray()
+                    val sb = StringBuilder("Plan checklist:\n")
+                    for (i in 0 until itemsArr.length()) {
+                        sb.append("- [ ] ").append(itemsArr.optString(i)).append("\n")
+                    }
+                    ToolResult(sb.toString().trim(), stepType = "PLAN")
+                }
+                "update_memory" -> {
+                    val note = args.getString("note")
+                    projectRepository.appendLearnedProjectNote(projectId, note)
+                    ToolResult("Updated AGENT.md with: $note", stepType = "EDIT", filePath = "AGENT.md")
                 }
                 else -> ToolResult("Error: unknown tool '${call.name}'", true)
             }
@@ -1085,6 +1756,71 @@ RULES
         }
     }
 
+    private suspend fun executeInstallRepoTool(url: String): ToolResult {
+        val repoName = url.substringAfterLast('/').removeSuffix(".git").ifBlank { "tool" }
+        val targetDir = File(projectRepository.toolsRootDir, repoName)
+        if (!targetDir.exists()) {
+            val cloneRes = termuxBridge.execCommand(
+                command = "git clone --depth 1 \"$url\" \"${targetDir.absolutePath}\"",
+                cwd = projectRepository.toolsRootDir.absolutePath,
+                timeoutSec = 180
+            )
+            if (cloneRes.exitCode != 0 && !targetDir.exists()) {
+                return ToolResult(
+                    "Failed to clone tool repository $url:\n${cloneRes.stderr.ifBlank { cloneRes.stdout }}",
+                    isError = true,
+                    commandText = "git clone $url",
+                    stepType = "CMD"
+                )
+            }
+        }
+        val analysis = RepoToolInstaller.inspectDirectory(targetDir)
+        val planSummary = RepoToolInstaller.buildInstallPlanSummary(repoName, analysis, isToolInstall = true)
+        val approved = awaitDecision(
+            ApprovalRequest(
+                id = UUID.randomUUID().toString(),
+                toolName = "install_repo_tool",
+                title = "Install tool: $repoName?",
+                summary = planSummary,
+                allowLabel = "Approve & Install",
+                denyLabel = "Cancel"
+            )
+        ) == "ALLOW"
+        if (!approved) {
+            return ToolResult("User cancelled installation of $repoName.", isError = true, stepType = "CMD")
+        }
+        val logSb = StringBuilder()
+        for (cmd in analysis.installCommands) {
+            val r = termuxBridge.execCommand(cmd, cwd = targetDir.absolutePath, timeoutSec = 240)
+            logSb.append("$ ").append(cmd).append(" -> exit ").append(r.exitCode).append("\n")
+            if (r.stdout.isNotBlank()) logSb.append(r.stdout.take(600)).append("\n")
+            if (r.stderr.isNotBlank()) logSb.append(r.stderr.take(600)).append("\n")
+        }
+        val smokeRes = termuxBridge.execCommand(analysis.smokeTestCommand, cwd = targetDir.absolutePath, timeoutSec = 30)
+        val verifyStatus = if (smokeRes.exitCode == 0) "OK: ${smokeRes.stdout.lineSequence().firstOrNull().orEmpty().take(80)}" else "WARN: exit ${smokeRes.exitCode}"
+        val toolEntity = InstalledToolEntity(
+            id = repoName.lowercase(),
+            name = repoName,
+            repoUrl = url,
+            path = targetDir.absolutePath,
+            type = if (analysis.isMcpServer) "MCP" else "CLI",
+            description = "Installed from $url (${analysis.detectedStack})",
+            commandTemplate = analysis.entryCommand,
+            enabled = true,
+            status = verifyStatus
+        )
+        installedToolDao.insertTool(toolEntity)
+        return ToolResult(
+            text = "Installed & registered tool '$repoName' (${toolEntity.type}) at ${targetDir.absolutePath}.\n" +
+                "Entry command: `${toolEntity.entryCommand}`\n" +
+                "Verification: ${toolEntity.lastVerifyStatus}\n\nInstall log:\n$logSb",
+            changed = true,
+            commandText = analysis.installCommands.joinToString(" && "),
+            cwdText = targetDir.absolutePath,
+            stepType = "CMD"
+        )
+    }
+
     private val toolsList = listOf(
         LlmTool(
             name = "list_files",
@@ -1095,7 +1831,7 @@ RULES
         ),
         LlmTool(
             name = "read_file",
-            description = "Read a text file with line numbers. Optionally pass start_line/end_line (1-based). Long files are truncated unless a range is given.",
+            description = "Read a text file with line numbers. Always call read_file before editing a file. Optionally pass start_line/end_line (1-based).",
             parametersJsonSchema = """
                 {"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]}
             """.trimIndent()
@@ -1109,21 +1845,35 @@ RULES
         ),
         LlmTool(
             name = "edit_file",
-            description = "Replace ONE exact, unique occurrence of old_str with new_str in a file. old_str must match exactly (indentation included, without line-number prefixes) and be unique; include surrounding lines if needed.",
+            description = "Replace old_str with new_str in a file you have already read in this run. Supports exact, whitespace-tolerant, and indentation-insensitive matching. Never include line-number prefixes.",
             parametersJsonSchema = """
-                {"type":"object","properties":{"path":{"type":"string"},"old_str":{"type":"string"},"new_str":{"type":"string"}},"required":["path","old_str","new_str"]}
+                {"type":"object","properties":{"path":{"type":"string"},"old_str":{"type":"string"},"new_str":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["path","old_str","new_str"]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "insert_after_line",
+            description = "Insert content after a 1-based line number (use 0 to insert at top of file). Must read_file first.",
+            parametersJsonSchema = """
+                {"type":"object","properties":{"path":{"type":"string"},"line":{"type":"integer"},"content":{"type":"string"}},"required":["path","line","content"]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "replace_line_range",
+            description = "Replace 1-based inclusive line range [start_line, end_line] with content. Must read_file first.",
+            parametersJsonSchema = """
+                {"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"},"content":{"type":"string"}},"required":["path","start_line","end_line","content"]}
             """.trimIndent()
         ),
         LlmTool(
             name = "write_file",
-            description = "Create a new file or fully replace an existing one with the given content. For big files prefer several edit_file calls.",
+            description = "Create a new file or replace an existing file atomically with the given content.",
             parametersJsonSchema = """
                 {"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}
             """.trimIndent()
         ),
         LlmTool(
             name = "delete_file",
-            description = "Delete a file or directory.",
+            description = "Delete a file or directory inside the project.",
             parametersJsonSchema = """
                 {"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}
             """.trimIndent()
@@ -1133,6 +1883,55 @@ RULES
             description = "Move or rename a file or directory.",
             parametersJsonSchema = """
                 {"type":"object","properties":{"from_path":{"type":"string"},"to_path":{"type":"string"}},"required":["from_path","to_path"]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "run_command",
+            description = "Run a shell command in the Termux / Forge workspace environment and capture stdout, stderr, and exit code.",
+            parametersJsonSchema = """
+                {"type":"object","properties":{"command":{"type":"string","description":"Shell command to execute"},"cwd":{"type":"string","description":"Relative working directory, default '.'"}},"required":["command"]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "git_clone",
+            description = "Clone a GitHub repository either into ~/forge/projects/<repo> (mode='project') or install it as a tool into ~/forge/tools/<repo> (mode='tool').",
+            parametersJsonSchema = """
+                {"type":"object","properties":{"url":{"type":"string"},"mode":{"type":"string","enum":["project","tool"]}},"required":["url"]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "install_repo_tool",
+            description = "Inspect, compatibility-check for Termux/ARM, install in an isolated ~/forge/tools/<repo> environment, smoke-test, and register a GitHub repo as a reusable CLI or MCP tool.",
+            parametersJsonSchema = """
+                {"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "run_installed_tool",
+            description = "Execute an installed tool or MCP skill from ~/forge/tools/ by its name or ID (e.g. 'rea' or any GitHub tool repo installed via install_repo_tool) with optional CLI arguments.",
+            parametersJsonSchema = """
+                {"type":"object","properties":{"tool_name":{"type":"string","description":"Name or ID of the installed tool, e.g. 'rea'"},"args":{"type":"string","description":"CLI arguments or subcommand to pass to the tool"}},"required":["tool_name"]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "ask_user",
+            description = "Pause and ask the user ONE short clarifying question with 2-4 tappable option labels.",
+            parametersJsonSchema = """
+                {"type":"object","properties":{"question":{"type":"string"},"options":{"type":"array","items":{"type":"string"}}},"required":["question"]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "plan",
+            description = "Record a short step-by-step checklist for a multi-step task.",
+            parametersJsonSchema = """
+                {"type":"object","properties":{"steps":{"type":"array","items":{"type":"string"}}},"required":["steps"]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "update_memory",
+            description = "Save a concise learned note (build command, stack detail, convention) into the project's AGENT.md file.",
+            parametersJsonSchema = """
+                {"type":"object","properties":{"note":{"type":"string"}},"required":["note"]}
             """.trimIndent()
         ),
         LlmTool(

@@ -1,11 +1,17 @@
 package com.example
 
+import com.example.data.agent.FileEditEngine
+import com.example.data.agent.LoopGuard
+import com.example.data.agent.LoopGuardDecision
+import com.example.data.agent.RepoToolInstaller
 import com.example.data.security.KeyStoreManager
 import com.example.ui.components.parseMarkdownBlocks
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.File
+import java.nio.file.Files
 
 class CodeForgeUnitTest {
 
@@ -51,5 +57,112 @@ class CodeForgeUnitTest {
         assertTrue(masked.startsWith("sk-a"))
         assertTrue(masked.endsWith("cdef"))
         assertTrue(masked.contains("••••••••"))
+    }
+
+    @Test
+    fun testFileEditEngineMultiTierMatching() {
+        val original = """
+            package com.example
+            
+            fun calculateTotal(items: List<Int>): Int {
+                var sum = 0
+                for (i in items) {
+                    sum += i
+                }
+                return sum
+            }
+        """.trimIndent()
+
+        // 1. Line-number prefix stripping + indentation-insensitive match
+        val oldWithLineNumbers = """
+               4	var sum = 0
+               5	for (i in items) {
+               6	    sum += i
+               7	}
+        """.trimIndent()
+        val newBlock = """
+            val sum = items.sum()
+        """.trimIndent()
+
+        val res = FileEditEngine.applyEdit(original, oldWithLineNumbers, newBlock)
+        assertTrue("Expected multi-tier edit to succeed: ${res.message}", res.success)
+        assertTrue(res.newContent?.contains("val sum = items.sum()") == true)
+
+        // 2. Nearest fuzzy region feedback on failure
+        val failRes = FileEditEngine.applyEdit(original, "var sum = 999\nfor (x in items)", "val sum = 0")
+        assertFalse(failRes.success)
+        assertTrue("Expected nearest match snippet with line numbers", failRes.message.contains("Nearest match in file"))
+    }
+
+    @Test
+    fun testFileEditEngineLineRangeAndInsert() {
+        val original = "line1\nline2\nline3\nline4"
+        val inserted = FileEditEngine.insertAfterLine(original, 2, "insertedLine")
+        assertTrue(inserted.success)
+        assertEquals("line1\nline2\ninsertedLine\nline3\nline4", inserted.newContent)
+
+        val replaced = FileEditEngine.replaceLineRange(original, 2, 3, "newMiddle")
+        assertTrue(replaced.success)
+        assertEquals("line1\nnewMiddle\nline4", replaced.newContent)
+    }
+
+    @Test
+    fun testLoopGuardDetectsRepeatsAndEditFailures() {
+        val guard = LoopGuard()
+        val d1 = guard.recordAndCheck("read_file", """{"path":"a.kt"}""", isError = false, fileChanged = false, newEvidence = true)
+        val d2 = guard.recordAndCheck("read_file", """{"path":"a.kt"}""", isError = false, fileChanged = false, newEvidence = true)
+        val d3 = guard.recordAndCheck("read_file", """{"path":"a.kt"}""", isError = false, fileChanged = false, newEvidence = true)
+        assertTrue(d1 is LoopGuardDecision.Continue)
+        assertTrue(d2 is LoopGuardDecision.Continue)
+        assertTrue("3rd identical call must be blocked", d3 is LoopGuardDecision.BlockRepeatCall)
+
+        // 3 consecutive edit failures on the same file
+        val guard2 = LoopGuard()
+        guard2.recordAndCheck("edit_file", """{"path":"b.kt","old":"1"}""", isError = true, fileChanged = false, newEvidence = false, targetFilePath = "b.kt")
+        guard2.recordAndCheck("edit_file", """{"path":"b.kt","old":"2"}""", isError = true, fileChanged = false, newEvidence = false, targetFilePath = "b.kt")
+        val f3 = guard2.recordAndCheck("edit_file", """{"path":"b.kt","old":"3"}""", isError = true, fileChanged = false, newEvidence = false, targetFilePath = "b.kt")
+        assertTrue("3rd edit failure on same file must force re-read and strategy switch", f3 is LoopGuardDecision.ForceReReadAndSwitchStrategy)
+    }
+
+    @Test
+    fun testRepoToolInstallerCompatibilityCheck() {
+        val tmpDir = Files.createTempDirectory("forge_repo_test").toFile()
+        try {
+            File(tmpDir, "package.json").writeText("""{"name":"demo-mcp","dependencies":{"@modelcontextprotocol/sdk":"1.0.0"}}""")
+            File(tmpDir, "Dockerfile").writeText("FROM ubuntu:22.04\nRUN sudo apt-get update")
+            val analysis = RepoToolInstaller.inspectDirectory(tmpDir)
+            assertTrue(analysis.isMcpServer)
+            assertTrue(analysis.compatibilityWarnings.any { it.contains("Docker", ignoreCase = true) })
+        } finally {
+            tmpDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun testReaApkReverseEngineeringReport() {
+        val tmpDir = Files.createTempDirectory("forge_rea_test").toFile()
+        val zipFile = File(tmpDir, "sample-app.apk")
+        val outDir = File(tmpDir, "extracted")
+        try {
+            java.util.zip.ZipOutputStream(zipFile.outputStream()).use { zos ->
+                zos.putNextEntry(java.util.zip.ZipEntry("AndroidManifest.xml"))
+                zos.write("<manifest package=\"com.demo.cloneapp\"><application/></manifest>".toByteArray())
+                zos.closeEntry()
+                zos.putNextEntry(java.util.zip.ZipEntry("res/layout/activity_main.xml"))
+                zos.write("<LinearLayout/>".toByteArray())
+                zos.closeEntry()
+                zos.putNextEntry(java.util.zip.ZipEntry("assets/config.json"))
+                zos.write("{\"api\":\"https://api.tokenharbor.ai/v1/models\"}".toByteArray())
+                zos.closeEntry()
+            }
+            val report = RepoToolInstaller.analyzeApkOrArchive(zipFile, outDir)
+            assertTrue(report.analysisMarkdown.contains("1. Evidence & Binary Profile"))
+            assertTrue(report.analysisMarkdown.contains("2. Recovered Graph & UI Screen Architecture"))
+            assertTrue(report.analysisMarkdown.contains("3. Extracted API Endpoints & Config URLs"))
+            assertTrue(report.analysisMarkdown.contains("https://api.tokenharbor.ai/v1/models"))
+            assertTrue(report.analysisMarkdown.contains("5. Clean-Room App Clone Plan"))
+        } finally {
+            tmpDir.deleteRecursively()
+        }
     }
 }

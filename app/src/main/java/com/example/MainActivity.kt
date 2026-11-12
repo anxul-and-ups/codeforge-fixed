@@ -38,11 +38,12 @@ class MainActivity : ComponentActivity() {
             notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
 
-        // Theme: saved choice (System / Light / Dark); system value read before the first frame
+        // Theme & Accent: saved choice (System / Light / Dark / AMOLED + 5 Accents)
         AppColors.systemDark =
             (resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
                 android.content.res.Configuration.UI_MODE_NIGHT_YES
         AppColors.mode = app.settingsStore.themeMode
+        AppColors.accentPreset = app.settingsStore.accentPreset
 
         val lastCrash = CrashReporter.readLastCrash(this)
         setContent {

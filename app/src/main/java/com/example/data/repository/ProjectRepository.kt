@@ -44,10 +44,51 @@ class ProjectRepository(
     /** All real projects (the hidden "no project" placeholder is not listed). */
     val allProjects: Flow<List<ProjectEntity>> = projectDao.getAllProjects().map { list -> list.filter { it.id != SCRATCH_ID } }
 
+    private val forgeBaseDir: File
+        get() = File(context.filesDir, "forge").apply { mkdirs() }
+
+    val projectsRootDir: File
+        get() = File(forgeBaseDir, "projects").apply { mkdirs() }
+
+    val toolsRootDir: File
+        get() = File(forgeBaseDir, "tools").apply { mkdirs() }
+
+    val outputsRootDir: File
+        get() = File(forgeBaseDir, "outputs").apply { mkdirs() }
+
+    private fun slugify(name: String, fallbackId: String): String {
+        val clean = name.lowercase().replace(Regex("[^a-z0-9_-]+"), "-").trim('-').take(32)
+        return clean.ifBlank { fallbackId.take(8) }
+    }
+
+    suspend fun projectDir(projectId: String): File = withContext(Dispatchers.IO) {
+        projectDao.getProjectById(projectId)?.let { File(it.rootPath).apply { mkdirs() } }
+            ?: File(projectsRootDir, projectId).apply { mkdirs() }
+    }
+
+    suspend fun createEmptyProject(name: String): ProjectEntity = createProject(name, null)
+
+    suspend fun readAgentMemory(projectId: String): String = withContext(Dispatchers.IO) {
+        val proj = projectDao.getProjectById(projectId) ?: return@withContext ""
+        com.example.data.agent.ProjectMemoryManager.readAgentMd(File(proj.rootPath), proj.name)
+    }
+
+    suspend fun saveAgentMemory(projectId: String, content: String) = withContext(Dispatchers.IO) {
+        val proj = projectDao.getProjectById(projectId) ?: return@withContext
+        val dir = File(proj.rootPath).apply { mkdirs() }
+        File(dir, "AGENT.md").writeText(content)
+        updateProjectStats(proj)
+    }
+
+    suspend fun appendLearnedProjectNote(projectId: String, note: String) = withContext(Dispatchers.IO) {
+        val proj = projectDao.getProjectById(projectId) ?: return@withContext
+        com.example.data.agent.ProjectMemoryManager.appendLearningToAgentMd(File(proj.rootPath), proj.name, note)
+    }
+
     /** The empty placeholder project that new chats start in, so they do NOT inherit an old chat's ZIP. */
     suspend fun getOrCreateScratchProject(): ProjectEntity = withContext(Dispatchers.IO) {
         projectDao.getProjectById(SCRATCH_ID)?.let { return@withContext it }
-        val root = File(File(context.filesDir, "projects"), SCRATCH_ID)
+        val root = File(projectsRootDir, SCRATCH_ID)
         root.mkdirs()
         val entity = ProjectEntity(id = SCRATCH_ID, name = "No project", rootPath = root.absolutePath, fileCount = 0)
         projectDao.insertProject(entity)
@@ -71,16 +112,15 @@ class ProjectRepository(
 
     suspend fun createProject(name: String, starterType: String? = null): ProjectEntity = withContext(Dispatchers.IO) {
         val id = UUID.randomUUID().toString()
-        val projectsDir = File(context.filesDir, "projects")
-        if (!projectsDir.exists()) projectsDir.mkdirs()
-
-        val projectRoot = File(projectsDir, id)
+        val slug = slugify(name, id)
+        val projectRoot = File(projectsRootDir, slug).let {
+            if (it.exists() && (it.listFiles()?.isNotEmpty() == true)) File(projectsRootDir, "$slug-${id.take(4)}") else it
+        }
         projectRoot.mkdirs()
 
         if (starterType != null) {
             populateStarterProject(projectRoot, starterType)
         } else {
-            // Default minimal files
             val readme = File(projectRoot, "README.md")
             readme.writeText("# $name\n\nCreated with CodeForge on Android.\n")
         }
@@ -94,7 +134,6 @@ class ProjectRepository(
             updatedAt = System.currentTimeMillis()
         )
         projectDao.insertProject(entity)
-        // Create initial baseline checkpoint
         createCheckpoint(id, "Initial State")
         entity
     }
@@ -112,10 +151,11 @@ class ProjectRepository(
 
     suspend fun importProjectFromZip(name: String, zipUri: Uri): ProjectEntity = withContext(Dispatchers.IO) {
         val id = UUID.randomUUID().toString()
-        val projectsDir = File(context.filesDir, "projects")
-        if (!projectsDir.exists()) projectsDir.mkdirs()
-
-        val projectRoot = File(projectsDir, id)
+        val cleanName = name.trim().ifEmpty { "Imported Project" }.take(60)
+        val slug = slugify(cleanName, id)
+        val projectRoot = File(projectsRootDir, slug).let {
+            if (it.exists() && (it.listFiles()?.isNotEmpty() == true)) File(projectsRootDir, "$slug-${id.take(4)}") else it
+        }
         projectRoot.mkdirs()
 
         try {
@@ -135,7 +175,7 @@ class ProjectRepository(
         }
         val entity = ProjectEntity(
             id = id,
-            name = name.trim().ifEmpty { "Imported Project" }.take(60),
+            name = cleanName,
             rootPath = projectRoot.absolutePath,
             fileCount = fileCount,
             updatedAt = System.currentTimeMillis()
@@ -310,36 +350,129 @@ class ProjectRepository(
         val project = projectDao.getProjectById(projectId) ?: throw IllegalArgumentException("Project not found")
         val targetFile = resolveSafePath(File(project.rootPath), relativePath)
         targetFile.parentFile?.mkdirs()
-        targetFile.writeText(content)
+        // Atomic write: write temp file then rename (Section 5.3 & 6.4)
+        val tmpFile = File(targetFile.parentFile, ".${targetFile.name}.tmp")
+        tmpFile.writeText(content)
+        if (!tmpFile.renameTo(targetFile)) {
+            targetFile.writeText(content)
+            tmpFile.delete()
+        }
         updateProjectStats(project)
-        "Successfully wrote ${content.length} characters to $relativePath"
+        "Successfully wrote ${content.length} characters (${content.lines().size} lines) to $relativePath"
     }
 
-    suspend fun editFile(projectId: String, relativePath: String, oldStr: String, newStr: String): String = withContext(Dispatchers.IO) {
+    suspend fun editFile(
+        projectId: String,
+        relativePath: String,
+        oldStr: String,
+        newStr: String,
+        replaceAll: Boolean = false,
+        insertAfterLine: Int? = null,
+        replaceStartLine: Int? = null,
+        replaceEndLine: Int? = null
+    ): String = withContext(Dispatchers.IO) {
         val project = projectDao.getProjectById(projectId) ?: throw IllegalArgumentException("Project not found")
         val targetFile = resolveSafePath(File(project.rootPath), relativePath)
         if (!targetFile.exists()) throw NoSuchFileException(targetFile, reason = "File does not exist: $relativePath")
 
         val content = targetFile.readText()
-        var oldStr = oldStr
-        var newStr = newStr
-        if (content.contains("\r\n") && !oldStr.contains("\r\n")) {
-            oldStr = oldStr.replace("\n", "\r\n")
-            newStr = newStr.replace("\n", "\r\n")
-        }
-        if (oldStr.isEmpty()) throw IllegalArgumentException("old_str must not be empty")
-        val occurrences = countOccurrences(content, oldStr)
-        if (occurrences == 0) {
-            throw IllegalArgumentException("Target string was not found in $relativePath. Ensure exact indentation and content.")
-        }
-        if (occurrences > 1) {
-            throw IllegalArgumentException("Target string matches $occurrences occurrences in $relativePath. Must match uniquely. Include more surrounding lines.")
+        val (updated, outcome) = com.example.data.agent.FileEditEngine.applyStructuredEdit(
+            content = content,
+            rawOldText = oldStr,
+            rawNewText = newStr,
+            replaceAll = replaceAll,
+            insertAfterLine = insertAfterLine,
+            replaceStartLine = replaceStartLine,
+            replaceEndLine = replaceEndLine
+        )
+        if (!outcome.success) {
+            throw IllegalArgumentException(outcome.message)
         }
 
-        val updated = content.replaceFirst(oldStr, newStr)
-        targetFile.writeText(updated)
+        // Atomic write
+        val tmpFile = File(targetFile.parentFile, ".${targetFile.name}.tmp")
+        tmpFile.writeText(updated)
+        if (!tmpFile.renameTo(targetFile)) {
+            targetFile.writeText(updated)
+            tmpFile.delete()
+        }
         updateProjectStats(project)
-        "Successfully edited $relativePath (replaced unique match of ${oldStr.lines().size} lines)"
+        "Successfully edited $relativePath (${outcome.diffPreview}, strategy=${outcome.matchStrategyUsed})"
+    }
+
+    suspend fun editFileDetailed(
+        projectId: String,
+        relativePath: String,
+        oldStr: String? = null,
+        newStr: String? = null,
+        replaceAll: Boolean = false,
+        insertAfterLine: Int? = null,
+        contentToInsert: String? = null,
+        startLine: Int? = null,
+        endLine: Int? = null,
+        replacementContent: String? = null
+    ): com.example.data.agent.EditOutcome = withContext(Dispatchers.IO) {
+        val project = projectDao.getProjectById(projectId)
+            ?: return@withContext com.example.data.agent.EditOutcome(false, "Project not found")
+        val targetFile = resolveSafePath(File(project.rootPath), relativePath)
+        if (!targetFile.exists()) {
+            return@withContext com.example.data.agent.EditOutcome(false, "File does not exist: $relativePath")
+        }
+        val content = targetFile.readText()
+        val (updated, outcome) = com.example.data.agent.FileEditEngine.applyStructuredEdit(
+            content = content,
+            rawOldText = oldStr ?: "",
+            rawNewText = newStr ?: contentToInsert ?: replacementContent ?: "",
+            replaceAll = replaceAll,
+            insertAfterLine = insertAfterLine,
+            replaceStartLine = startLine,
+            replaceEndLine = endLine
+        )
+        if (outcome.success) {
+            val tmpFile = File(targetFile.parentFile, ".${targetFile.name}.tmp")
+            tmpFile.writeText(updated)
+            if (!tmpFile.renameTo(targetFile)) {
+                targetFile.writeText(updated)
+                tmpFile.delete()
+            }
+            updateProjectStats(project)
+        }
+        outcome
+    }
+
+    /** Saves extracted analysis/decompiled artifacts into a project's `reference/<name>/` subfolder (Section 12.4). */
+    suspend fun saveAnalysisOutputToProject(
+        sourceOutputDirPath: String,
+        targetProjectId: String,
+        subfolderPath: String = "reference/analysis"
+    ): String = withContext(Dispatchers.IO) {
+        val project = projectDao.getProjectById(targetProjectId) ?: throw IllegalArgumentException("Target project not found")
+        val srcDir = File(sourceOutputDirPath)
+        if (!srcDir.exists()) throw IllegalStateException("Analysis output directory no longer exists")
+        val destDir = resolveSafePath(File(project.rootPath), subfolderPath)
+        destDir.mkdirs()
+        copyDirectoryFiltered(srcDir, destDir)
+        updateProjectStats(project)
+        "Saved analysis files into ${project.name}/$subfolderPath"
+    }
+
+    suspend fun saveAnalysisOutputToProject(
+        targetProjectId: String,
+        sourceName: String,
+        extractedDir: File?,
+        analysisMarkdown: String,
+        reportOnly: Boolean
+    ): String = withContext(Dispatchers.IO) {
+        val project = projectDao.getProjectById(targetProjectId) ?: throw IllegalArgumentException("Target project not found")
+        val slug = sourceName.substringBeforeLast('.').replace(Regex("[^a-zA-Z0-9_-]"), "_").ifBlank { "analysis" }
+        val destDir = resolveSafePath(File(project.rootPath), "reference/$slug")
+        destDir.mkdirs()
+        if (!reportOnly && extractedDir != null && extractedDir.exists()) {
+            copyDirectoryFiltered(extractedDir, destDir)
+        }
+        File(destDir, "ANALYSIS.md").writeText(analysisMarkdown)
+        updateProjectStats(project)
+        "Saved analysis into ${project.name}/reference/$slug"
     }
 
     suspend fun deleteFile(projectId: String, relativePath: String): String = withContext(Dispatchers.IO) {
@@ -733,6 +866,11 @@ class ProjectRepository(
             if (currentFile.exists()) currentFile.delete()
         }
         updateProjectStats(project)
+    }
+
+    suspend fun revertSingleFileFromLastCheckpoint(projectId: String, relativePath: String): Boolean {
+        revertFileToLastCheckpoint(projectId, relativePath)
+        return true
     }
 
     suspend fun exportProjectZip(projectId: String): File = withContext(Dispatchers.IO) {

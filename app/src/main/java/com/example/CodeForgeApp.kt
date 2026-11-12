@@ -8,6 +8,7 @@ import com.example.data.repository.GitHubRepository
 import com.example.data.repository.ProjectRepository
 import com.example.data.repository.ProviderRepository
 import com.example.data.settings.SettingsStore
+import com.example.data.termux.TermuxBridge
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -20,6 +21,13 @@ class CodeForgeApp : Application() {
 
     val settingsStore by lazy { SettingsStore(this) }
     val database by lazy { AppDatabase.getInstance(this) }
+    val termuxBridge by lazy {
+        TermuxBridge(
+            context = this,
+            settings = settingsStore,
+            scope = agentScope
+        )
+    }
     val projectRepository by lazy {
         ProjectRepository(
             context = this,
@@ -63,6 +71,8 @@ class CodeForgeApp : Application() {
             messageDao = database.messageDao(),
             conversationDao = database.conversationDao(),
             usageDao = database.usageDao(),
+            installedToolDao = database.installedToolDao(),
+            termuxBridge = termuxBridge,
             settings = settingsStore,
             buildLogStore = buildLogStore,
             githubManager = githubManager
@@ -75,8 +85,9 @@ class CodeForgeApp : Application() {
         agentScope.launch(Dispatchers.IO) {
             try {
                 providerRepository.initializeDefaultPresets(settingsStore)
+                termuxBridge.refreshHealth()
             } catch (e: Exception) {
-                android.util.Log.e("CodeForge", "Could not initialise provider presets", e)
+                android.util.Log.e("CodeForge", "Could not initialise presets or engine health", e)
             }
         }
     }
