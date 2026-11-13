@@ -316,61 +316,74 @@ object FileEditEngine {
 }
 
 /**
- * Loop Guard (Section 6.5):
- * - Tracks rolling window of tool calls (name + normalized args + result hash).
- * - Blocks same call repeated 3 times with the same result.
- * - Forces re-read or `ask_user` if the same file edit fails 3 times.
- * - Stops after 8 steps with no progress.
- * - Escalates after 2 consecutive tool errors of the same type.
+ * Loop Guard (Section 6.5) — rewritten.
+ *
+ * Old bugs: the guard was called BEFORE every tool with "no progress" and never with the real result,
+ * so after 5 tool calls the agent always stopped itself, identical-call detection compared the
+ * arguments instead of the result (a legit repeated `git status` was blocked on the 2nd call), and
+ * blocked calls were never unblocked even after files changed.
+ *
+ * Now: [shouldBlock] only READS state before a call, [recordStep] is called once AFTER the call with the real result.
  */
 class LoopGuard {
-    data class CallRecord(
-        val toolName: String,
-        val normalizedArgs: String,
-        val resultHash: Int,
-        val isError: Boolean,
-        val filePath: String?
-    )
-
-    private val history = ArrayList<CallRecord>()
+    private val history = ArrayList<Pair<String, Int>>() // signature -> result hash
+    private val seenResultHashes = HashSet<Int>()
     private val editFailuresByFile = HashMap<String, Int>()
     private val forbiddenSignatures = HashSet<String>()
     private var stepsWithoutProgress = 0
     private var consecutiveErrorCount = 0
     private var lastErrorTool: String? = null
 
+    companion object {
+        const val MAX_STEPS_WITHOUT_PROGRESS = 14
+    }
+
     fun signature(toolName: String, argsJson: String): String {
         val norm = argsJson.trim().replace(Regex("\\s+"), " ")
         return "$toolName::$norm"
     }
 
-    fun isForbidden(toolName: String, argsJson: String): Boolean {
-        return signature(toolName, argsJson) in forbiddenSignatures
+    /** Pre-call check (read only). Returns a message for the model if this exact call is currently blocked. */
+    fun shouldBlock(toolName: String, argsJson: String): String? {
+        return if (signature(toolName, argsJson) in forbiddenSignatures) {
+            "[LOOP GUARD]: `$toolName` with these exact arguments already returned the same result 3 times. " +
+                "It is blocked until something changes (edit a file, or use different arguments). Try another approach or call `ask_user`."
+        } else null
     }
 
+    fun isForbidden(toolName: String, argsJson: String): Boolean =
+        signature(toolName, argsJson) in forbiddenSignatures
+
+    /** Post-call check, called once per executed tool with its real result. */
     fun recordStep(
         toolName: String,
         argsJson: String,
         resultText: String,
         isError: Boolean,
-        madeProgress: Boolean,
+        fileChanged: Boolean,
         filePath: String? = null
     ): GuardDecision {
         val sig = signature(toolName, argsJson)
-        val rHash = resultText.take(600).hashCode()
-        val rec = CallRecord(toolName, sig, rHash, isError, filePath)
-        history.add(rec)
+        val rHash = resultText.take(1500).hashCode()
+        history.add(sig to rHash)
+        if (history.size > 40) history.removeAt(0)
 
-        if (madeProgress) {
+        // Progress = files changed, or a successful call that produced output we have not seen before.
+        val newEvidence = !isError && seenResultHashes.add(rHash)
+        if (fileChanged) {
+            // The world changed: previously blocked calls (e.g. re-running the build) are valid again.
+            forbiddenSignatures.clear()
+            history.clear()
+            seenResultHashes.clear()
+            stepsWithoutProgress = 0
+        } else if (newEvidence) {
             stepsWithoutProgress = 0
         } else {
             stepsWithoutProgress++
         }
 
         if (isError) {
-            if (lastErrorTool == toolName) {
-                consecutiveErrorCount++
-            } else {
+            if (lastErrorTool == toolName) consecutiveErrorCount++ else {
                 lastErrorTool = toolName
                 consecutiveErrorCount = 1
             }
@@ -379,39 +392,36 @@ class LoopGuard {
             lastErrorTool = null
         }
 
-        // Check 1: Same call repeated 3 times with same result
-        val identicalCount = history.takeLast(8).count { it.normalizedArgs == sig && it.resultHash == rHash }
-        if (identicalCount >= 2) {
+        // Check 1: same call with the SAME result 3 times in the recent window
+        val identical = history.takeLast(8).count { it.first == sig && it.second == rHash }
+        if (identical >= 3) {
             forbiddenSignatures.add(sig)
             return GuardDecision(
                 triggered = true,
-                shouldStop = false,
                 activityNote = "Trying a different approach…",
-                systemInjection = "[LOOP GUARD]: You have repeated `$toolName` 3 times with the exact same result. " +
-                    "This exact call is now temporarily blocked. Try a different approach or call `ask_user`."
+                systemInjection = "[LOOP GUARD]: You called `$toolName` 3 times with the same arguments and got the same result. " +
+                    "Do not repeat it. Use the result you already have, try a different approach, or call `ask_user`."
             )
         }
 
-        // Check 2: Same file edit failing 3 times
-        if ((toolName == "edit_file" || toolName == "fs_edit") && filePath != null) {
+        // Check 2: same file edit failing repeatedly
+        if (toolName in setOf("edit_file", "insert_after_line", "replace_line_range") && filePath != null) {
             if (isError) {
                 val fails = (editFailuresByFile[filePath] ?: 0) + 1
                 editFailuresByFile[filePath] = fails
                 if (fails == 3) {
                     return GuardDecision(
                         triggered = true,
-                        shouldStop = false,
                         forceReadFile = filePath,
-                        activityNote = "Re-reading $filePath to align line numbers…",
-                        systemInjection = "[LOOP GUARD]: Editing `$filePath` has failed 3 times. " +
-                            "You MUST call `read_file` on `$filePath` first to see its latest content, then try once more."
+                        activityNote = "Re-reading $filePath…",
+                        systemInjection = "[LOOP GUARD]: Editing `$filePath` failed 3 times. Call `read_file` on it first to see its latest content, then try once more."
                     )
-                } else if (fails >= 4) {
+                } else if (fails >= 5) {
                     return GuardDecision(
                         triggered = true,
                         shouldStop = true,
                         activityNote = "Waiting for your guidance on $filePath",
-                        systemInjection = "[LOOP GUARD]: Editing `$filePath` failed after re-reading. Stopping to ask the user."
+                        systemInjection = "[LOOP GUARD]: Editing `$filePath` keeps failing. Stop, explain the problem briefly and ask the user."
                     )
                 }
             } else {
@@ -419,52 +429,29 @@ class LoopGuard {
             }
         }
 
-        // Check 3: 2 consecutive errors of the same type
-        if (consecutiveErrorCount >= 2) {
+        // Check 3: repeated errors of the same tool
+        if (consecutiveErrorCount >= 3) {
             return GuardDecision(
                 triggered = true,
-                shouldStop = false,
                 activityNote = "Changing strategy after tool error…",
                 systemInjection = "[LOOP GUARD]: `$toolName` failed $consecutiveErrorCount times in a row. " +
                     "Explain the error briefly and change strategy instead of repeating the failing call."
             )
         }
 
-        // Check 4: No progress for 8 steps
-        if (stepsWithoutProgress >= 5) {
+        // Check 4: long stretch with neither file changes nor new information
+        if (stepsWithoutProgress >= MAX_STEPS_WITHOUT_PROGRESS) {
+            stepsWithoutProgress = 0
             return GuardDecision(
                 triggered = true,
                 shouldStop = true,
-                activityNote = "Paused after 5 steps without new progress",
-                systemInjection = "[LOOP GUARD]: No new files changed or new information discovered in 8 steps. Summarize where you got to and ask the user."
+                activityNote = "Paused: no new progress",
+                systemInjection = "[LOOP GUARD]: No file changed and nothing new was learned for $MAX_STEPS_WITHOUT_PROGRESS steps. " +
+                    "Summarize where you got to and ask the user how to continue."
             )
         }
 
         return GuardDecision(triggered = false)
-    }
-
-    fun recordAndCheck(
-        toolName: String,
-        argsJson: String,
-        isError: Boolean,
-        fileChanged: Boolean,
-        newEvidence: Boolean,
-        targetFilePath: String? = null
-    ): LoopGuardDecision {
-        val d = recordStep(
-            toolName = toolName,
-            argsJson = argsJson,
-            resultText = argsJson,
-            isError = isError,
-            madeProgress = fileChanged || newEvidence,
-            filePath = targetFilePath
-        )
-        return when {
-            !d.triggered -> LoopGuardDecision.Continue
-            d.forceReadFile != null -> LoopGuardDecision.ForceReReadAndSwitchStrategy(d.systemInjection)
-            d.shouldStop -> LoopGuardDecision.StopAndSummarize(d.systemInjection)
-            else -> LoopGuardDecision.BlockRepeatCall(d.systemInjection)
-        }
     }
 }
 

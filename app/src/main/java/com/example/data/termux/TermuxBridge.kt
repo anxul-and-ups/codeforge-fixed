@@ -9,9 +9,11 @@ import android.os.PowerManager
 import android.provider.Settings
 import androidx.core.content.ContextCompat
 import com.example.data.settings.SettingsStore
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -20,6 +22,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.Call
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -29,6 +32,9 @@ import java.io.File
 import java.net.ConnectException
 import java.net.SocketTimeoutException
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.TimeUnit
 
 enum class TermuxBuildType {
@@ -98,7 +104,9 @@ data class ExecResult(
     val stdout: String,
     val stderr: String,
     val exitCode: Int,
-    val durationMs: Long
+    val durationMs: Long,
+    /** true only when the Termux bridge itself failed (refused / 401 / 404 / 5xx), NOT when the user's command failed or timed out. */
+    val bridgeError: Boolean = false
 ) {
     fun toJsonSummary(): String = JSONObject()
         .put("command", command)
@@ -144,9 +152,9 @@ class TermuxBridge(
 
     /** Fast HTTP client for 5-second `/health` heartbeat probes. */
     private val healthHttp = OkHttpClient.Builder()
-        .connectTimeout(4000, TimeUnit.MILLISECONDS)
-        .readTimeout(4000, TimeUnit.MILLISECONDS)
-        .writeTimeout(2500, TimeUnit.MILLISECONDS)
+        .connectTimeout(5000, TimeUnit.MILLISECONDS)
+        .readTimeout(8000, TimeUnit.MILLISECONDS)
+        .writeTimeout(4000, TimeUnit.MILLISECONDS)
         .build()
 
     /** HTTP client for `/exec` commands on `http://127.0.0.1:47831/exec`. */
@@ -171,6 +179,11 @@ class TermuxBridge(
     val terminalOutput: StateFlow<String> = _terminalOutput.asStateFlow()
 
     private var heartbeatJob: Job? = null
+
+    /** In-flight /exec calls, so Stop can cancel them immediately. */
+    private val activeExecs = ConcurrentHashMap<String, Call>()
+    private val consecutiveHealthFailures = AtomicInteger(0)
+    @Volatile private var lastAutoRestartMs = 0L
 
     /** Used only for local app metadata/checkpoints; NEVER used as a shell command fallback. */
     val localForgeRoot: File by lazy {
@@ -262,27 +275,55 @@ class TermuxBridge(
     }
 
     /**
-     * Background heartbeat polling `GET http://127.0.0.1:47831/health` every 5 seconds.
-     * Never uses cached or fake connection states.
+     * Background heartbeat polling `GET http://127.0.0.1:47831/health`.
+     * A single missed beat no longer flips the UI to DISCONNECTED (that caused the constant
+     * "Termux disconnected" flicker while Termux was busy). If the bridge really stays down,
+     * it is auto-restarted (rate limited).
      */
     private fun startHeartbeat() {
         heartbeatJob?.cancel()
         heartbeatJob = scope.launch(Dispatchers.IO) {
             while (isActive) {
-                checkEngineHealthOnce()
-                delay(10_000L)
+                try {
+                    val ok = checkEngineHealthOnce()
+                    if (!ok) maybeAutoRestart()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    // never let the heartbeat loop die
+                }
+                delay(8_000L)
             }
+        }
+    }
+
+    private fun maybeAutoRestart() {
+        if (activeExecs.isNotEmpty()) return
+        if (consecutiveHealthFailures.get() < 5) return
+        val now = System.currentTimeMillis()
+        if (now - lastAutoRestartMs < 90_000L) return
+        lastAutoRestartMs = now
+        tryLaunchTermuxDaemon(DEFAULT_PORT, DEFAULT_BEARER_TOKEN)
+    }
+
+    private fun registerHealthFailure(message: String) {
+        val n = consecutiveHealthFailures.incrementAndGet()
+        val wasConnected = _status.value.connectionState == EngineConnectionState.CONNECTED_TERMUX
+        // While connected tolerate short blips (3 beats idle, 6 beats while a command is running).
+        val threshold = if (activeExecs.isNotEmpty()) 6 else 3
+        if (wasConnected && n < threshold) return
+        _status.update {
+            it.copy(connectionState = EngineConnectionState.DISCONNECTED, lastError = message)
         }
     }
 
     suspend fun checkEngineHealthOnce(): Boolean = withContext(Dispatchers.IO) {
         refreshEnvironmentStatus()
-        val token = DEFAULT_BEARER_TOKEN
         val t0 = System.currentTimeMillis()
         try {
             val req = Request.Builder()
                 .url("http://127.0.0.1:$DEFAULT_PORT/health")
-                .header("Authorization", "Bearer $token")
+                .header("Authorization", "Bearer $DEFAULT_BEARER_TOKEN")
                 .get()
                 .build()
             healthHttp.newCall(req).execute().use { resp ->
@@ -290,6 +331,7 @@ class TermuxBridge(
                 if (resp.isSuccessful) {
                     val bodyStr = resp.body?.string().orEmpty()
                     val obj = try { JSONObject(bodyStr) } catch (_: Exception) { JSONObject() }
+                    consecutiveHealthFailures.set(0)
                     _status.update {
                         it.copy(
                             connectionState = EngineConnectionState.CONNECTED_TERMUX,
@@ -306,25 +348,26 @@ class TermuxBridge(
                     }
                     return@withContext true
                 } else {
-                    _status.update {
-                        it.copy(
-                            connectionState = EngineConnectionState.DISCONNECTED,
-                            lastError = "Termux Bridge HTTP ${resp.code} on http://127.0.0.1:$DEFAULT_PORT/health"
-                        )
-                    }
+                    registerHealthFailure("Termux Bridge HTTP ${resp.code} on http://127.0.0.1:$DEFAULT_PORT/health")
                     return@withContext false
                 }
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            // ECONNREFUSED or timeout -> immediately mark DISCONNECTED (Red)
-            _status.update {
-                it.copy(
-                    connectionState = EngineConnectionState.DISCONNECTED,
-                    lastError = "Disconnected: http://127.0.0.1:$DEFAULT_PORT/health unreachable (${e.javaClass.simpleName})"
-                )
-            }
+            registerHealthFailure("Disconnected: http://127.0.0.1:$DEFAULT_PORT/health unreachable (${e.javaClass.simpleName})")
             return@withContext false
         }
+    }
+
+    /** Polls /health until the bridge answers or [maxMs] elapsed (server needs 1-3s to boot). */
+    private suspend fun waitUntilAlive(maxMs: Long = 9_000L): Boolean {
+        val end = System.currentTimeMillis() + maxMs
+        while (System.currentTimeMillis() < end) {
+            if (checkEngineHealthOnce()) return true
+            delay(1_000L)
+        }
+        return false
     }
 
     /**
@@ -340,8 +383,7 @@ class TermuxBridge(
                 )
             }
             tryLaunchTermuxDaemon(DEFAULT_PORT, DEFAULT_BEARER_TOKEN)
-            delay(800L)
-            val alive = checkEngineHealthOnce()
+            val alive = waitUntilAlive()
             onComplete?.invoke(alive)
         }
     }
@@ -353,7 +395,7 @@ class TermuxBridge(
             return false
         }
         return try {
-            val bootstrap = buildBootstrapShellScript(port, token)
+            val bootstrap = bootCommandLine(port, token)
             val intent = Intent().apply {
                 setClassName(TERMUX_PACKAGE, TERMUX_SERVICE_NAME)
                 action = ACTION_RUN_COMMAND
@@ -402,13 +444,8 @@ class TermuxBridge(
      * Strictly executes shell commands in Termux via HTTP POST to `http://127.0.0.1:47831/exec`.
      * NEVER falls back to local Android `ProcessBuilder`.
      *
-     * Required API Contract:
-     *   URL: `http://127.0.0.1:47831/exec`
-     *   Method: `POST`
-     *   Headers:
-     *     `Authorization: Bearer 9f8ef08845d6751517d97296d40e03216138ac23185e31aa`
-     *     `Content-Type: application/json`
-     *   Body: `{"command": "<BASH_CMD_HERE>", "cwd": "/data/data/com.termux/files/home", "timeout": 120}`
+     * Cancelling the calling coroutine (Stop button) now aborts the HTTP call immediately AND asks the
+     * Termux server to kill the whole process group, so nothing keeps running in the background.
      */
     suspend fun execCommand(
         command: String,
@@ -433,24 +470,55 @@ class TermuxBridge(
         val execId = UUID.randomUUID().toString()
         val startMs = System.currentTimeMillis()
         val termuxCwd = toTermuxPath(cwd)
-        val authBearer = DEFAULT_BEARER_TOKEN
+        val timeoutSec = timeoutSeconds.coerceIn(1L, 3600L)
 
         appendTerminal("\n$ $command  (cwd: $termuxCwd)\n")
 
         val payload = JSONObject()
             .put("command", command)
             .put("cwd", termuxCwd)
-            .put("timeout", timeoutSeconds)
+            .put("timeout", timeoutSec)
+            .put("exec_id", execId)
 
         val request = Request.Builder()
             .url("http://127.0.0.1:$DEFAULT_PORT/exec")
-            .header("Authorization", "Bearer $authBearer")
+            .header("Authorization", "Bearer $DEFAULT_BEARER_TOKEN")
             .header("Content-Type", "application/json")
             .post(payload.toString().toRequestBody(jsonMedia))
             .build()
 
+        // Read timeout must be longer than the server-side command timeout, otherwise long builds
+        // were reported as "timed out" by the client while still running on the server.
+        val call = execHttp.newBuilder()
+            .readTimeout(timeoutSec + 20L, TimeUnit.SECONDS)
+            .build()
+            .newCall(request)
+        activeExecs[execId] = call
+
+        val finished = AtomicBoolean(false)
+        val watcher = launch {
+            try {
+                awaitCancellation()
+            } finally {
+                if (!finished.get()) {
+                    call.cancel()
+                    killRemote(execId)
+                }
+            }
+        }
+
+        fun bridgeFail(code: Int, msg: String, markDisconnected: Boolean): ExecResult {
+            val dur = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
+            if (markDisconnected) {
+                _status.update { it.copy(connectionState = EngineConnectionState.DISCONNECTED, lastError = msg) }
+            }
+            appendTerminal("ERROR: $msg\n")
+            recordAudit(command, termuxCwd, code, dur, msg)
+            return ExecResult(execId, command, termuxCwd, "", msg, code, dur, bridgeError = true)
+        }
+
         try {
-            execHttp.newCall(request).execute().use { resp ->
+            call.execute().use { resp ->
                 val dur = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
                 val rawBody = resp.body?.string().orEmpty()
 
@@ -462,26 +530,15 @@ class TermuxBridge(
                     }
                     if (resp.code == 401 || resp.code >= 500) {
                         _status.update {
-                            it.copy(
-                                connectionState = EngineConnectionState.ERROR,
-                                lastError = errDetail
-                            )
+                            it.copy(connectionState = EngineConnectionState.ERROR, lastError = errDetail)
                         }
                     }
                     appendTerminal("ERROR: $errDetail\n")
                     recordAudit(command, termuxCwd, resp.code, dur, errDetail)
-                    return@withContext ExecResult(
-                        execId = execId,
-                        command = command,
-                        cwd = termuxCwd,
-                        stdout = "",
-                        stderr = errDetail,
-                        exitCode = resp.code,
-                        durationMs = dur
-                    )
+                    return@withContext ExecResult(execId, command, termuxCwd, "", errDetail, resp.code, dur, bridgeError = true)
                 }
 
-                // Mark bridge healthy since /exec responded 200 OK
+                consecutiveHealthFailures.set(0)
                 _status.update {
                     it.copy(
                         connectionState = EngineConnectionState.CONNECTED_TERMUX,
@@ -508,55 +565,64 @@ class TermuxBridge(
                     appendTerminal(combined + "\n")
                 }
                 recordAudit(command, actualCwd, code, dur, combined)
-                return@withContext ExecResult(
-                    execId = execId,
-                    command = command,
-                    cwd = actualCwd,
-                    stdout = out,
-                    stderr = err,
-                    exitCode = code,
-                    durationMs = dur
-                )
+                return@withContext ExecResult(execId, command, actualCwd, out, err, code, dur)
             }
-        } catch (e: ConnectException) {
-            val dur = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
-            val msg = "ECONNREFUSED: Cannot connect to Termux HTTP Bridge at http://127.0.0.1:$DEFAULT_PORT/exec. Make sure Termux is running the bridge server."
-            _status.update {
-                it.copy(
-                    connectionState = EngineConnectionState.DISCONNECTED,
-                    lastError = msg
-                )
-            }
-            appendTerminal("ERROR: $msg\n")
-            recordAudit(command, termuxCwd, 111, dur, msg)
-            return@withContext ExecResult(execId, command, termuxCwd, "", msg, 111, dur)
-        } catch (e: SocketTimeoutException) {
-            val dur = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
-            val msg = "TIMEOUT: Termux command timed out after ${timeoutSeconds}s on http://127.0.0.1:$DEFAULT_PORT/exec (${e.message})."
-            appendTerminal("ERROR: $msg\n")
-            recordAudit(command, termuxCwd, 124, dur, msg)
-            return@withContext ExecResult(execId, command, termuxCwd, "", msg, 124, dur)
         } catch (e: Exception) {
-            val dur = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
-            val msg = "Termux HTTP Bridge error on http://127.0.0.1:$DEFAULT_PORT/exec: ${e.message ?: e.javaClass.simpleName}"
-            _status.update {
-                it.copy(
-                    connectionState = EngineConnectionState.DISCONNECTED,
-                    lastError = msg
+            // Stop pressed: propagate cancellation, do NOT report a fake "disconnected".
+            if (e is CancellationException) throw e
+            if (call.isCanceled() || !isActive) throw CancellationException("Command stopped by user")
+            when (e) {
+                is ConnectException -> bridgeFail(
+                    111,
+                    "ECONNREFUSED: Cannot connect to Termux HTTP Bridge at http://127.0.0.1:$DEFAULT_PORT/exec. Make sure Termux is running the bridge server.",
+                    true
                 )
+                is SocketTimeoutException -> {
+                    killRemote(execId)
+                    val dur = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
+                    val msg = "TIMEOUT: command exceeded ${timeoutSec}s and was killed. For long tasks pass a bigger `timeout` or run it in the background (nohup … &) and poll its log."
+                    appendTerminal("ERROR: $msg\n")
+                    recordAudit(command, termuxCwd, 124, dur, msg)
+                    ExecResult(execId, command, termuxCwd, "", msg, 124, dur)
+                }
+                else -> {
+                    registerHealthFailure("Termux HTTP Bridge error: ${e.message ?: e.javaClass.simpleName}")
+                    bridgeFail(1, "Termux HTTP Bridge error on http://127.0.0.1:$DEFAULT_PORT/exec: ${e.message ?: e.javaClass.simpleName}", false)
+                }
             }
-            appendTerminal("ERROR: $msg\n")
-            recordAudit(command, termuxCwd, 1, dur, msg)
-            return@withContext ExecResult(execId, command, termuxCwd, "", msg, 1, dur)
+        } finally {
+            finished.set(true)
+            watcher.cancel()
+            activeExecs.remove(execId)
+        }
+    }
+
+    /** Asks the Termux server to kill one running command (whole process group). Fire and forget. */
+    private fun killRemote(execId: String?) {
+        scope.launch(Dispatchers.IO) {
+            try {
+                val body = JSONObject().apply { if (execId != null) put("exec_id", execId) }
+                val path = if (execId != null) "/kill" else "/kill_all"
+                val req = Request.Builder()
+                    .url("http://127.0.0.1:$DEFAULT_PORT$path")
+                    .header("Authorization", "Bearer $DEFAULT_BEARER_TOKEN")
+                    .post(body.toString().toRequestBody(jsonMedia))
+                    .build()
+                healthHttp.newCall(req).execute().close()
+            } catch (_: Exception) {
+            }
         }
     }
 
     fun killCommand(execId: String) {
-        // Commands run remotely in Termux via HTTP /exec
+        activeExecs[execId]?.cancel()
+        killRemote(execId)
     }
 
+    /** Called by the Stop button: abort every in-flight call and kill everything on the Termux side. */
     fun killAllRunningCommands() {
-        // No local processes
+        activeExecs.values.forEach { it.cancel() }
+        killRemote(null)
     }
 
     fun clearTerminal() {
@@ -578,8 +644,7 @@ class TermuxBridge(
 
     suspend fun bootstrapAndStartEngine(): Result<String> = withContext(Dispatchers.IO) {
         tryLaunchTermuxDaemon(DEFAULT_PORT, DEFAULT_BEARER_TOKEN)
-        delay(700L)
-        val ok = checkEngineHealthOnce()
+        val ok = waitUntilAlive()
         if (ok) {
             Result.success("Connected to Termux HTTP Bridge on http://127.0.0.1:$DEFAULT_PORT")
         } else {
@@ -673,9 +738,14 @@ class TermuxBridge(
      * with Bearer token `9f8ef08845d6751517d97296d40e03216138ac23185e31aa`.
      */
     fun directStartEngineCommand(): String {
-        val script = buildBootstrapShellScript(DEFAULT_PORT, DEFAULT_BEARER_TOKEN)
+        return "${bootCommandLine(DEFAULT_PORT, DEFAULT_BEARER_TOKEN)} && echo '✓ CodeForge Termux HTTP Bridge listening on http://127.0.0.1:$DEFAULT_PORT'"
+    }
+
+    /** Writes the boot script to ~/.forge_boot.sh (base64, no quoting problems) and runs it from there. */
+    private fun bootCommandLine(port: Int, token: String): String {
+        val script = buildBootstrapShellScript(port, token)
         val b64 = android.util.Base64.encodeToString(script.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
-        return "echo '$b64' | base64 -d > ~/.forge_boot.sh && bash ~/.forge_boot.sh && echo '✓ CodeForge Termux HTTP Bridge listening on http://127.0.0.1:$DEFAULT_PORT'"
+        return "echo '$b64' | base64 -d > ~/.forge_boot.sh && bash ~/.forge_boot.sh"
     }
 
     /**
@@ -714,52 +784,67 @@ class TermuxBridge(
         } catch (_: Exception) {}
     }
 
-    private fun buildBootstrapShellScript(port: Int, token: String): String = """
-        #!/data/data/com.termux/files/usr/bin/bash
-        set -e
-        command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock || true
-        mkdir -p ~/forge/{projects,tools,.engine,checkpoints,outputs}
-        echo -n "$token" > ~/forge/.engine/token
-        chmod 600 ~/forge/.engine/token
-        if ! command -v python3 >/dev/null 2>&1; then
-            pkg update -y && pkg install -y python git curl
-        fi
-        cat << 'EOF' > ~/forge/.engine/forge_server.py
-        ${buildForgeEnginePythonScript()}
-        EOF
-        pkill -f "forge_server.py" >/dev/null 2>&1 || true
-        nohup python3 ~/forge/.engine/forge_server.py --port $port >/data/data/com.termux/files/home/forge/.engine/engine.log 2>&1 &
-        sleep 1
-    """.trimIndent()
+    private fun buildBootstrapShellScript(port: Int, token: String): String {
+        val py = buildForgeEnginePythonScript().replace("__TOKEN__", token)
+        val pyB64 = android.util.Base64.encodeToString(py.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
+        // NOTE: the python server is shipped as base64 (the old heredoc was never terminated because
+        // trimIndent() left "EOF" indented, so the server never actually started).
+        return listOf(
+            "#!/data/data/com.termux/files/usr/bin/bash",
+            "command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock || true",
+            "mkdir -p ~/forge/projects ~/forge/tools ~/forge/.engine/run ~/forge/checkpoints ~/forge/outputs",
+            "echo -n '$token' > ~/forge/.engine/token",
+            "chmod 600 ~/forge/.engine/token",
+            "if ! command -v python3 >/dev/null 2>&1; then pkg update -y && pkg install -y python git curl; fi",
+            "echo '$pyB64' | base64 -d > ~/forge/.engine/forge_server.py",
+            "if [ -f ~/forge/.engine/server.pid ]; then kill \$(cat ~/forge/.engine/server.pid) >/dev/null 2>&1 || true; fi",
+            "pkill -f forge_server.py >/dev/null 2>&1 || true",
+            "sleep 1",
+            "cd ~/forge/.engine",
+            "if command -v setsid >/dev/null 2>&1; then",
+            "  setsid nohup python3 forge_server.py --port $port > engine.log 2>&1 < /dev/null &",
+            "else",
+            "  nohup python3 forge_server.py --port $port > engine.log 2>&1 < /dev/null &",
+            "fi",
+            "echo \$! > server.pid",
+            "sleep 1"
+        ).joinToString("\n") + "\n"
+    }
 
     private fun buildForgeEnginePythonScript(): String = """
-import os, sys, json, time, shutil, subprocess, base64
+import os, sys, json, time, shutil, subprocess, signal, threading, select, socket, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOME_DIR = "/data/data/com.termux/files/home"
-WORKSPACE = os.path.expanduser("~/forge")
+WORKSPACE = os.path.join(HOME_DIR, "forge")
+RUN_DIR = os.path.join(WORKSPACE, ".engine", "run")
 TOKEN_FILE = os.path.join(WORKSPACE, ".engine", "token")
-DEFAULT_TOKEN = "$DEFAULT_BEARER_TOKEN"
+DEFAULT_TOKEN = "__TOKEN__"
+BASH = "/data/data/com.termux/files/usr/bin/bash"
 START_TIME = time.time()
+MAX_OUT = 400000
 
-os.makedirs(WORKSPACE, exist_ok=True)
+os.makedirs(RUN_DIR, exist_ok=True)
+RUNNING = {}
+LOCK = threading.Lock()
+
 
 def load_token():
     try:
-        if os.path.exists(TOKEN_FILE):
-            with open(TOKEN_FILE, "r") as f:
-                t = f.read().strip()
-                if t:
-                    return t
+        with open(TOKEN_FILE, "r") as f:
+            t = f.read().strip()
+            if t:
+                return t
     except Exception:
         pass
     return DEFAULT_TOKEN
 
-def resolve_cwd(raw_cwd):
-    if not raw_cwd:
+
+def resolve_cwd(raw):
+    if not raw:
         return HOME_DIR
-    c = raw_cwd.strip()
-    if c == "." or c == "~" or c == "~/":
+    c = raw.strip()
+    if c in (".", "~", "~/"):
         return HOME_DIR
     if c.startswith("~/"):
         c = os.path.join(HOME_DIR, c[2:])
@@ -767,12 +852,46 @@ def resolve_cwd(raw_cwd):
         c = HOME_DIR
     elif not c.startswith("/"):
         c = os.path.join(HOME_DIR, c)
-    if not os.path.exists(c):
+    if not os.path.isdir(c):
         try:
             os.makedirs(c, exist_ok=True)
         except Exception:
             return HOME_DIR
     return c
+
+
+def kill_group(proc):
+    # The command runs in its own session/process group, so this also kills grandchildren
+    # (gradle, npm, python, sleep ...). The old server only killed the shell and then hung.
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except Exception:
+        pass
+
+    def hard():
+        time.sleep(2)
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+    threading.Thread(target=hard, daemon=True).start()
+
+
+def read_tail(path):
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > MAX_OUT:
+                f.seek(size - MAX_OUT)
+            data = f.read()
+        text = data.decode("utf-8", errors="replace")
+        if size > MAX_OUT:
+            text = "[output truncated, showing last %d bytes]\n" % MAX_OUT + text
+        return text
+    except Exception:
+        return ""
+
 
 class ForgeHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -780,31 +899,43 @@ class ForgeHandler(BaseHTTPRequestHandler):
 
     def _auth(self):
         auth = self.headers.get("Authorization", "")
-        if not auth:
-            return True
-        expected = "Bearer " + load_token()
-        return auth == expected or auth == ("Bearer " + DEFAULT_TOKEN)
+        return auth == "Bearer " + load_token() or auth == "Bearer " + DEFAULT_TOKEN
 
     def _send(self, code, payload):
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception:
+            pass
+
+    def _client_gone(self):
+        try:
+            r, _, _ = select.select([self.connection], [], [], 0)
+            if r:
+                return self.connection.recv(1, socket.MSG_PEEK) == b""
+        except Exception:
+            return True
+        return False
 
     def do_GET(self):
         if not self._auth():
             return self._send(401, {"error": "Unauthorized"})
         if self.path.startswith("/health"):
-            st = shutil.disk_usage(HOME_DIR)
+            try:
+                free = shutil.disk_usage(HOME_DIR).free // (1024 * 1024)
+            except Exception:
+                free = 0
+            with LOCK:
+                running = len(RUNNING)
             self._send(200, {
-                "status": "ok",
-                "version": "2.0.0",
+                "status": "ok", "version": "2.1.0",
                 "uptime": int(time.time() - START_TIME),
                 "python": sys.version.split()[0],
-                "workspace": HOME_DIR,
-                "free_mb": st.free // (1024 * 1024)
+                "workspace": HOME_DIR, "free_mb": free, "running": running
             })
         else:
             self._send(404, {"error": "Not found"})
@@ -812,59 +943,116 @@ class ForgeHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._auth():
             return self._send(401, {"error": "Unauthorized"})
-        length = int(self.headers.get("Content-Length", "0"))
-        raw = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
-        data = json.loads(raw or "{}")
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
+            data = json.loads(raw or "{}")
+        except Exception as ex:
+            return self._send(400, {"error": "Bad request: %s" % ex})
         if self.path == "/exec":
-            cmd = data.get("command", "")
-            cwd = resolve_cwd(data.get("cwd", HOME_DIR))
-            timeout = int(data.get("timeout", 120))
-            try:
-                env = os.environ.copy()
-                env["PATH"] = "/data/data/com.termux/files/usr/bin:" + env.get("PATH", "")
-                env["HOME"] = HOME_DIR
-                p = subprocess.run(
-                    cmd,
-                    shell=True,
-                    executable="/data/data/com.termux/files/usr/bin/bash" if os.path.exists("/data/data/com.termux/files/usr/bin/bash") else None,
-                    cwd=cwd,
-                    env=env,
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True,
-                    text=True,
-                    errors="replace",
-                    timeout=timeout
+            return self._exec(data)
+        if self.path == "/kill":
+            eid = data.get("exec_id", "")
+            with LOCK:
+                ent = RUNNING.get(eid)
+            if ent:
+                ent["killed"] = True
+                kill_group(ent["proc"])
+            return self._send(200, {"killed": bool(ent)})
+        if self.path == "/kill_all":
+            with LOCK:
+                ents = list(RUNNING.values())
+            for ent in ents:
+                ent["killed"] = True
+                kill_group(ent["proc"])
+            return self._send(200, {"killed": len(ents)})
+        self._send(404, {"error": "Unknown route"})
+
+    def _exec(self, data):
+        cmd = data.get("command", "")
+        cwd = resolve_cwd(data.get("cwd", HOME_DIR))
+        try:
+            timeout = max(1, min(int(data.get("timeout", 120)), 3600))
+        except Exception:
+            timeout = 120
+        eid = str(data.get("exec_id") or uuid.uuid4())
+        script = os.path.join(RUN_DIR, eid + ".sh")
+        out_p = os.path.join(RUN_DIR, eid + ".out")
+        err_p = os.path.join(RUN_DIR, eid + ".err")
+        env = os.environ.copy()
+        env["PATH"] = "/data/data/com.termux/files/usr/bin:" + env.get("PATH", "")
+        env["HOME"] = HOME_DIR
+        env["PREFIX"] = "/data/data/com.termux/files/usr"
+        reason = None
+        rc = None
+        try:
+            # script file instead of `bash -c <cmd>`: no 128KB argv limit for big write_file payloads
+            with open(script, "w") as f:
+                f.write(cmd + "\n")
+            with open(out_p, "wb") as fo, open(err_p, "wb") as fe:
+                proc = subprocess.Popen(
+                    [BASH if os.path.exists(BASH) else "bash", script],
+                    cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                    stdout=fo, stderr=fe, start_new_session=True
                 )
-                self._send(200, {
-                    "stdout": p.stdout,
-                    "stderr": p.stderr,
-                    "exit_code": p.returncode,
-                    "cwd": cwd
-                })
-            except subprocess.TimeoutExpired as te:
-                self._send(200, {
-                    "stdout": (te.stdout or "") if isinstance(te.stdout, str) else "",
-                    "stderr": f"Command timed out after {timeout}s",
-                    "exit_code": 124,
-                    "cwd": cwd
-                })
-            except Exception as ex:
-                self._send(200, {
-                    "stdout": "",
-                    "stderr": str(ex),
-                    "exit_code": 1,
-                    "cwd": cwd
-                })
-        else:
-            self._send(404, {"error": "Unknown route"})
+                ent = {"proc": proc, "killed": False}
+                with LOCK:
+                    RUNNING[eid] = ent
+                deadline = time.time() + timeout
+                while True:
+                    rc = proc.poll()
+                    if rc is not None:
+                        break
+                    if ent["killed"]:
+                        reason = "killed"
+                    elif time.time() > deadline:
+                        reason = "timeout"
+                    elif self._client_gone():
+                        reason = "client_gone"
+                    if reason:
+                        kill_group(proc)
+                        try:
+                            proc.wait(timeout=5)
+                        except Exception:
+                            pass
+                        break
+                    time.sleep(0.15)
+            if reason is None and ent["killed"]:
+                reason = "killed"
+            with LOCK:
+                RUNNING.pop(eid, None)
+            stdout = read_tail(out_p)
+            stderr = read_tail(err_p)
+            if reason == "client_gone":
+                return
+            if reason == "timeout":
+                stderr += "\nCommand timed out after %ds and was killed." % timeout
+                rc = 124
+            elif reason == "killed":
+                stderr += "\nCommand was stopped."
+                rc = 137
+            self._send(200, {"stdout": stdout, "stderr": stderr, "exit_code": rc, "cwd": cwd})
+        except Exception as ex:
+            with LOCK:
+                RUNNING.pop(eid, None)
+            self._send(200, {"stdout": "", "stderr": str(ex), "exit_code": 1, "cwd": cwd})
+        finally:
+            for pth in (script, out_p, err_p):
+                try:
+                    os.remove(pth)
+                except Exception:
+                    pass
+
+
+class Server(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
 
 if __name__ == "__main__":
     port = 47831
     if "--port" in sys.argv:
         port = int(sys.argv[sys.argv.index("--port") + 1])
-    class ReusableThreadingServer(ThreadingHTTPServer):
-        allow_reuse_address = True
-        daemon_threads = True
-    ReusableThreadingServer(("127.0.0.1", port), ForgeHandler).serve_forever()
-    """.trimIndent()
+    Server(("127.0.0.1", port), ForgeHandler).serve_forever()
+"""
 }

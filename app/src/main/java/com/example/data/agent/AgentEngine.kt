@@ -195,6 +195,10 @@ class AgentEngine(
 
     fun stop() {
         job?.cancel()
+        // Kill whatever is running inside Termux right now, otherwise the command keeps running
+        // after Stop and the cancelled run waits for the blocking HTTP call to return.
+        termuxBridge.killAllRunningCommands()
+        pendingDecision?.cancel()
     }
 
     fun resolveApproval(approved: Boolean) {
@@ -678,10 +682,10 @@ HOW TO UNDERSTAND THE USER
         val bridgeMandate = """
 CRITICAL EXECUTION ENVIRONMENT MANDATE (TERMUX HTTP BRIDGE)
 - You are running on Android. You have NO local terminal. You MUST use the HTTP Bridge tool (`run_command`) to run commands.
-- Every `run_command` call sends an HTTP POST request to `http://127.0.0.1:47831/exec` with cwd `/data/data/com.termux/files/home` and timeout `120` seconds inside the user's real Termux environment.
+- Every `run_command` call sends an HTTP POST request to `http://127.0.0.1:47831/exec` with cwd `/data/data/com.termux/files/home` inside the user's real Termux environment. Default timeout is 120 seconds; pass the optional `timeout` argument (max 1800) for builds/installs. Never run servers/watchers in the foreground: start them with `nohup ... > log 2>&1 &` and read the log afterwards.
 - NEVER assume or inspect the Android app sandbox (`/data/data/com.aistudio.codeforge...`). All commands, files, Python, Node, Git, packages, and repositories live in Termux (`/data/data/com.termux/files/home`).
 - When the user asks to inspect files, check installed packages, run Python/Node/Git, or control Termux, call `run_command` directly (for example: `ls -la`, `python3 --version`, `git status`, `cat <file>`).
-- If the HTTP Bridge returns an error (401 Unauthorized, 404 Not Found, ECONNREFUSED, or Timeout), report the exact bridge error to the user immediately and STOP. Do NOT retry in a loop and do NOT fall back to local app storage.
+- If the HTTP Bridge itself returns an error (401 Unauthorized, 404 Not Found, ECONNREFUSED), report the exact bridge error to the user immediately and STOP. A command TIMEOUT (exit 124) is not a bridge failure: retry once with a larger `timeout` or run it in the background. Do NOT retry in a loop and do NOT fall back to local app storage.
         """.trimIndent()
 
         if (mode == AgentMode.CHAT) {
@@ -729,7 +733,7 @@ RULES
 - Default working directory in Termux is `/data/data/com.termux/files/home`.
 - For simple checks (like counting files, checking folders, reading a file, or running a command), run ONE single command, read its STDOUT, and immediately give the final answer to the user. NEVER repeat or re-run a command that already succeeded.
 - Never read or print secrets (.env, keystores, google-services.json).
-- If a tool returns an HTTP Bridge error (401, 404, ECONNREFUSED, Timeout), stop immediately and report it clearly to the user. Never repeat the exact same failing call.
+- If a tool returns an HTTP Bridge error (401, 404, ECONNREFUSED), stop immediately and report it clearly to the user. Never repeat the exact same failing call.
             """.trimIndent()
         )
 
@@ -892,6 +896,7 @@ RULES
         val readFilesInRun = HashSet<String>()
         val loopGuard = LoopGuard()
         var forceFinal = false
+        var forcedOnce = false
         var titleRequested = false
 
         try {
@@ -954,7 +959,7 @@ RULES
                     if (reasoningAll.isNotEmpty()) reasoningAll.append("\n\n")
                     reasoningAll.append(response.reasoning)
                 }
-                if (forceFinal && response.toolCalls.isNotEmpty()) {
+                if (forceFinal && response.toolCalls.isNotEmpty() && forcedOnce) {
                     if (fullText.isEmpty()) {
                         fullText.append(
                             "I paused because the same step was repeating without progress. " +
@@ -1020,6 +1025,7 @@ RULES
                     break
                 }
 
+                if (forceFinal) forcedOnce = true
                 var finished = false
                 lastToolError = false
                 for (call in response.toolCalls) {
@@ -1028,16 +1034,10 @@ RULES
                         requestTitle(req, assistantId, prompt, history.isEmpty())
                     }
 
-                    // Check LoopGuard before executing
+                    // Pre-call check (read-only): is this exact call currently blocked by the loop guard?
                     if (settings.loopGuardEnabled) {
-                        val preDecision = loopGuard.recordAndCheck(
-                            toolName = call.name,
-                            argsJson = call.argumentsJson,
-                            isError = false,
-                            fileChanged = false,
-                            newEvidence = false
-                        )
-                        if (preDecision is LoopGuardDecision.BlockRepeatCall) {
+                        val blockMsg = loopGuard.shouldBlock(call.name, call.argumentsJson)
+                        if (blockMsg != null) {
                             toolIndex++
                             messageDao.insertToolStep(
                                 ToolStepEntity(
@@ -1047,32 +1047,14 @@ RULES
                                     toolName = "note",
                                     type = "NOTE",
                                     argumentsJson = JSONObject().put("text", "Trying a different approach…").toString(),
-                                    resultText = preDecision.messageForModel,
+                                    resultText = blockMsg,
                                     isError = false,
                                     status = "COMPLETED",
                                     durationMs = 0L
                                 )
                             )
                             _agentEvents.tryEmit(AgentEvent.NoteAdded("Trying a different approach…"))
-                            messages.add(
-                                LlmMessage(
-                                    role = "tool",
-                                    content = preDecision.messageForModel,
-                                    toolCallId = call.id,
-                                    toolName = call.name
-                                )
-                            )
-                            continue
-                        } else if (preDecision is LoopGuardDecision.StopAndSummarize) {
-                            forceFinal = true
-                            messages.add(
-                                LlmMessage(
-                                    role = "tool",
-                                    content = preDecision.reason,
-                                    toolCallId = call.id,
-                                    toolName = call.name
-                                )
-                            )
+                            messages.add(LlmMessage(role = "tool", content = blockMsg, toolCallId = call.id, toolName = call.name))
                             continue
                         }
                     }
@@ -1116,20 +1098,28 @@ RULES
                     var toolText = result.text
                     if (toolText.length > 14_000) toolText = toolText.take(14_000) + "\n[result truncated]"
 
-                    // Post-execution LoopGuard check for consecutive edit failures on the same file
-                    if (settings.loopGuardEnabled && result.isError && call.name in setOf("edit_file", "insert_after_line", "replace_line_range")) {
-                        val postDecision = loopGuard.recordAndCheck(
+                    // Post-execution LoopGuard check with the REAL result of every tool
+                    if (settings.loopGuardEnabled && call.name != "finish" && call.name != "ask_user" && call.name != "plan") {
+                        val d = loopGuard.recordStep(
                             toolName = call.name,
                             argsJson = call.argumentsJson,
-                            isError = true,
-                            fileChanged = false,
-                            newEvidence = false,
-                            targetFilePath = result.filePath
+                            resultText = result.text,
+                            isError = result.isError,
+                            fileChanged = result.changed && !result.isError,
+                            filePath = result.filePath
                         )
-                        if (postDecision is LoopGuardDecision.ForceReReadAndSwitchStrategy) {
-                            _agentEvents.tryEmit(AgentEvent.NoteAdded("Trying a different approach…"))
-                            val fullFileNow = result.filePath?.let { projectRepository.readFile(req.projectId, it, 1, 300) } ?: ""
-                            toolText += "\n\n${postDecision.messageForModel}\nCurrent file content with line numbers:\n$fullFileNow"
+                        if (d.triggered) {
+                            _agentEvents.tryEmit(AgentEvent.NoteAdded(d.activityNote.ifBlank { "Trying a different approach…" }))
+                            val reread = d.forceReadFile
+                            if (reread != null) {
+                                val fullFileNow = try {
+                                    projectRepository.readFile(req.projectId, reread, 1, 300)
+                                } catch (e: CancellationException) { throw e } catch (_: Exception) { "" }
+                                toolText += "\n\n${d.systemInjection}\nCurrent file content with line numbers:\n$fullFileNow"
+                            } else {
+                                toolText += "\n\n${d.systemInjection}"
+                            }
+                            if (d.shouldStop) forceFinal = true
                         }
                     }
 
@@ -1377,6 +1367,7 @@ RULES
     }
 
     private fun cleanPath(p: String): String = p.trim().removePrefix("./").trim('/').replace('\\', '/')
+        .removePrefix("data/data/com.termux/files/home/").removePrefix("~/")
 
     private fun findNode(root: FileNode, path: String): FileNode? {
         val clean = path.trim().removePrefix("./").trim('/').ifEmpty { "." }
@@ -1422,8 +1413,8 @@ RULES
     private fun shellEscapeSingleQuotes(input: String): String =
         "'" + input.replace("'", "'\"'\"'") + "'"
 
-    private fun isFatalBridgeExit(exitCode: Int): Boolean =
-        exitCode == 111 || exitCode == 401 || exitCode == 404 || exitCode == 124 || exitCode == 500
+    /** Only real bridge failures are fatal. A user command that times out (124) or exits with any code is NOT. */
+    private fun isFatalBridgeExit(res: com.example.data.termux.ExecResult): Boolean = res.bridgeError
 
     private fun formatBridgeToolResult(
         execRes: com.example.data.termux.ExecResult,
@@ -1447,7 +1438,7 @@ RULES
                 appendLine(execRes.stderr.trim())
             }
         }.trim()
-        val fatal = isFatalBridgeExit(execRes.exitCode)
+        val fatal = isFatalBridgeExit(execRes)
         return ToolResult(
             text = combined,
             isError = execRes.exitCode != 0,
@@ -1522,24 +1513,30 @@ RULES
                 }
                 "search_code" -> {
                     val q = args.getString("query")
-                    val cmd = "grep -rnI --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=build ${shellEscapeSingleQuotes(q)} ."
+                    val isRegex = args.optBoolean("regex", false)
+                    val searchRoot = resolveTermuxCwd(args.optString("path", "."))
+                    val flags = "-rnI -i " + (if (isRegex) "-E " else "-F ") +
+                        "--exclude-dir=.git --exclude-dir=node_modules --exclude-dir=build --exclude-dir=.gradle --exclude-dir=.cache --exclude-dir=.npm --exclude-dir=storage --exclude-dir=.m2 "
+                    val rootExpr = if (args.has("path")) shellEscapeSingleQuotes(searchRoot)
+                        else "\$( [ -d ~/forge/projects ] && echo ~/forge/projects || echo ~ )"
+                    val cmd = "grep $flags -e ${shellEscapeSingleQuotes(q)} $rootExpr 2>&1 | head -n 300"
                     val execRes = termuxBridge.execCommand(
                         command = cmd,
                         cwd = TermuxBridge.TERMUX_HOME,
-                        timeoutSec = 120
+                        timeoutSec = 60
                     )
-                    // grep returns exit code 1 when no matches are found; treat exit 1 with empty stderr as non-error
-                    val normalized = if (execRes.exitCode == 1 && execRes.stderr.isBlank()) {
-                        execRes.copy(stdout = "(no matches found for '$q')", exitCode = 0)
+                    val normalized = if (execRes.exitCode == 0 && execRes.stdout.isBlank()) {
+                        execRes.copy(stdout = "(no matches found for '$q')")
                     } else execRes
                     formatBridgeToolResult(normalized, stepType = "CMD")
                 }
                 "edit_file" -> {
-                    val path = cleanPath(args.getString("path"))
+                    val rawPath = args.getString("path")
+                    val path = cleanPath(rawPath)
                     if (!awaitApproval("edit_file", "Edit $path in Termux")) {
                         return ToolResult("The user denied this edit.", true, filePath = path, stepType = "EDIT")
                     }
-                    val targetPath = resolveTermuxCwd(path)
+                    val targetPath = resolveTermuxCwd(rawPath)
                     val oldStr = args.getString("old_str")
                     val newStr = args.getString("new_str")
                     val replaceAll = args.optBoolean("replace_all", false)
@@ -1568,11 +1565,12 @@ RULES
                     )
                 }
                 "insert_after_line" -> {
-                    val path = cleanPath(args.getString("path"))
+                    val rawPath = args.getString("path")
+                    val path = cleanPath(rawPath)
                     if (!awaitApproval("insert_after_line", "Insert lines in $path")) {
                         return ToolResult("The user denied this edit.", true, filePath = path, stepType = "EDIT")
                     }
-                    val targetPath = resolveTermuxCwd(path)
+                    val targetPath = resolveTermuxCwd(rawPath)
                     val lineNum = args.getInt("line").coerceAtLeast(0)
                     val content = args.getString("content")
                     val b64 = android.util.Base64.encodeToString(content.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
@@ -1590,11 +1588,12 @@ RULES
                     formatBridgeToolResult(execRes, stepType = "EDIT", filePath = path, changed = true, touched = listOf(path), diffSummary = diffLabel)
                 }
                 "replace_line_range" -> {
-                    val path = cleanPath(args.getString("path"))
+                    val rawPath = args.getString("path")
+                    val path = cleanPath(rawPath)
                     if (!awaitApproval("replace_line_range", "Replace lines in $path")) {
                         return ToolResult("The user denied this edit.", true, filePath = path, stepType = "EDIT")
                     }
-                    val targetPath = resolveTermuxCwd(path)
+                    val targetPath = resolveTermuxCwd(rawPath)
                     val startLine = args.getInt("start_line").coerceAtLeast(1)
                     val endLine = args.getInt("end_line").coerceAtLeast(startLine)
                     val content = args.getString("content")
@@ -1613,11 +1612,12 @@ RULES
                     formatBridgeToolResult(execRes, stepType = "EDIT", filePath = path, changed = true, touched = listOf(path), diffSummary = diffLabel)
                 }
                 "write_file" -> {
-                    val path = cleanPath(args.getString("path"))
+                    val rawPath = args.getString("path")
+                    val path = cleanPath(rawPath)
                     if (!awaitApproval("write_file", "Write file $path in Termux")) {
                         return ToolResult("The user denied this write.", true, filePath = path, stepType = "EDIT")
                     }
-                    val targetPath = resolveTermuxCwd(path)
+                    val targetPath = resolveTermuxCwd(rawPath)
                     val content = args.getString("content")
                     val b64 = android.util.Base64.encodeToString(content.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
                     val cmd = "mkdir -p \$(dirname ${shellEscapeSingleQuotes(targetPath)}) && printf '%s' '$b64' | base64 -d > ${shellEscapeSingleQuotes(targetPath)} && ls -la ${shellEscapeSingleQuotes(targetPath)}"
@@ -1642,11 +1642,12 @@ RULES
                     )
                 }
                 "delete_file" -> {
-                    val path = cleanPath(args.getString("path"))
+                    val rawPath = args.getString("path")
+                    val path = cleanPath(rawPath)
                     if (!awaitApproval("delete_file", "Delete $path in Termux", isRisky = true)) {
                         return ToolResult("The user denied this deletion.", true, filePath = path, stepType = "EDIT")
                     }
-                    val targetPath = resolveTermuxCwd(path)
+                    val targetPath = resolveTermuxCwd(rawPath)
                     val execRes = termuxBridge.execCommand(
                         command = "rm -rf ${shellEscapeSingleQuotes(targetPath)}",
                         cwd = TermuxBridge.TERMUX_HOME,
@@ -1656,13 +1657,15 @@ RULES
                     formatBridgeToolResult(execRes, stepType = "EDIT", filePath = path, changed = true, removed = listOf(path))
                 }
                 "move_file" -> {
-                    val from = cleanPath(args.getString("from_path"))
-                    val to = cleanPath(args.getString("to_path"))
+                    val rawFrom = args.getString("from_path")
+                    val rawTo = args.getString("to_path")
+                    val from = cleanPath(rawFrom)
+                    val to = cleanPath(rawTo)
                     if (!awaitApproval("move_file", "Move $from → $to in Termux")) {
                         return ToolResult("The user denied this move.", true, filePath = to, stepType = "EDIT")
                     }
-                    val fromTarget = resolveTermuxCwd(from)
-                    val toTarget = resolveTermuxCwd(to)
+                    val fromTarget = resolveTermuxCwd(rawFrom)
+                    val toTarget = resolveTermuxCwd(rawTo)
                     val execRes = termuxBridge.execCommand(
                         command = "mkdir -p \$(dirname ${shellEscapeSingleQuotes(toTarget)}) && mv ${shellEscapeSingleQuotes(fromTarget)} ${shellEscapeSingleQuotes(toTarget)}",
                         cwd = TermuxBridge.TERMUX_HOME,
@@ -1690,10 +1693,11 @@ RULES
                     if (!awaitApproval("run_command", "Run command in Termux:\n`$cmd`\nin `$targetCwd`", isRisky = isRisky)) {
                         return ToolResult("The user denied running this command.", true, commandText = cmd, cwdText = targetCwd, stepType = "CMD")
                     }
+                    val cmdTimeout = args.optInt("timeout", 120).coerceIn(5, 1800)
                     val execRes = termuxBridge.execCommand(
                         command = cmd,
                         cwd = targetCwd,
-                        timeoutSec = 120
+                        timeoutSec = cmdTimeout
                     )
                     formatBridgeToolResult(execRes, stepType = "CMD")
                 }
@@ -1876,9 +1880,9 @@ RULES
         ),
         LlmTool(
             name = "search_code",
-            description = "Search (case-insensitive) for text or a regex across all project text files. Returns path:line: match.",
+            description = "Search (case-insensitive) for text or a regex in text files. Returns path:line: match (max 300 lines).",
             parametersJsonSchema = """
-                {"type":"object","properties":{"query":{"type":"string"},"regex":{"type":"boolean","description":"Treat query as a regex"}},"required":["query"]}
+                {"type":"object","properties":{"query":{"type":"string"},"regex":{"type":"boolean","description":"Treat query as a regex"},"path":{"type":"string","description":"Directory to search (default: ~/forge/projects)"}},"required":["query"]}
             """.trimIndent()
         ),
         LlmTool(
@@ -1927,7 +1931,7 @@ RULES
             name = "run_command",
             description = "Run a shell command in the Termux / Forge workspace environment and capture stdout, stderr, and exit code.",
             parametersJsonSchema = """
-                {"type":"object","properties":{"command":{"type":"string","description":"Shell command to execute"},"cwd":{"type":"string","description":"Relative working directory, default '.'"}},"required":["command"]}
+                {"type":"object","properties":{"command":{"type":"string","description":"Shell command to execute"},"cwd":{"type":"string","description":"Working directory (default: Termux home)"},"timeout":{"type":"integer","description":"Max seconds to wait (default 120, max 1800). Use a larger value for builds/installs. Never run servers or watchers in the foreground; start them with nohup ... & and poll the log."}},"required":["command"]}
             """.trimIndent()
         ),
         LlmTool(
