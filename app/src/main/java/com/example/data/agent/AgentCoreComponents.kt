@@ -315,15 +315,376 @@ object FileEditEngine {
     }
 }
 
+enum class AgentProcessPhase(val label: String) {
+    IDLE("IDLE"),
+    PLANNING("PLANNING"),
+    THINKING("THINKING"),
+    DISCOVERING("DISCOVERING"),
+    EXECUTING_COMMAND("RUNNING CMD"),
+    PATCHING("PATCHING"),
+    WAITING_APPROVAL("WAITING INPUT"),
+    COMPLETED("DONE"),
+    ABORTED("ABORTED"),
+    ERROR("ERROR")
+}
+
+data class AgentProcessState(
+    val phase: AgentProcessPhase = AgentProcessPhase.IDLE,
+    val detail: String = "",
+    val activeCommand: String? = null,
+    val stepIndex: Int = 0,
+    val startedAtMs: Long? = null
+)
+
 /**
- * Loop Guard (Section 6.5) — rewritten.
- *
- * Old bugs: the guard was called BEFORE every tool with "no progress" and never with the real result,
- * so after 5 tool calls the agent always stopped itself, identical-call detection compared the
- * arguments instead of the result (a legit repeated `git status` was blocked on the 2nd call), and
- * blocked calls were never unblocked even after files changed.
- *
- * Now: [shouldBlock] only READS state before a call, [recordStep] is called once AFTER the call with the real result.
+ * Deterministic Surgical Code Patching Engine:
+ * - Generates clean unified diffs (`--- a/...`, `+++ b/...`, `@@ ... @@`) for UI diff previews.
+ * - Applies unified diff hunks (`apply_patch`) with exact + fuzzy line-offset + whitespace-tolerant matching.
+ * - Enforces the No-Full-Rewrite Guard on existing files (> 15 lines).
+ */
+object SurgicalPatchEngine {
+    const val MAX_EXISTING_LINES_FOR_FULL_WRITE = 15
+    private val HUNK_HEADER_REGEX = Regex("""^@@\s*-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s*@@.*$""")
+
+    /**
+     * Prohibits full-file overwrites via `write_file` when a file already exists and has > 15 lines.
+     */
+    fun checkFullRewriteAllowed(existingLineCount: Int, filePath: String): String? {
+        if (existingLineCount > MAX_EXISTING_LINES_FOR_FULL_WRITE) {
+            return "SURGICAL PATCH GUARD: Refusing full-file overwrite on existing file `$filePath` ($existingLineCount lines). " +
+                "Full-file rewrites are prohibited to prevent instability. " +
+                "Call `read_file` on `$filePath` and apply a surgical diff using `apply_patch`, `edit_file`, `replace_line_range`, or `insert_after_line`."
+        }
+        return null
+    }
+
+    /**
+     * Generates a clean unified diff (`--- a/file`, `+++ b/file`, `@@ -s,c +s,c @@`) using LCS.
+     */
+    fun generateUnifiedDiff(
+        filePath: String,
+        oldContent: String,
+        newContent: String,
+        contextLines: Int = 3,
+        maxDiffLines: Int = 180
+    ): String {
+        val oldLines = if (oldContent.isEmpty()) emptyList() else oldContent.replace("\r\n", "\n").lines()
+        val newLines = if (newContent.isEmpty()) emptyList() else newContent.replace("\r\n", "\n").lines()
+        if (oldLines == newLines) return ""
+
+        // For very large files, fall back to focused prefix/suffix trimming before running DP
+        var prefix = 0
+        while (prefix < oldLines.size && prefix < newLines.size && oldLines[prefix] == newLines[prefix]) {
+            prefix++
+        }
+        var suffix = 0
+        while (
+            suffix < (oldLines.size - prefix) &&
+            suffix < (newLines.size - prefix) &&
+            oldLines[oldLines.size - 1 - suffix] == newLines[newLines.size - 1 - suffix]
+        ) {
+            suffix++
+        }
+
+        val midOld = oldLines.subList(prefix, oldLines.size - suffix)
+        val midNew = newLines.subList(prefix, newLines.size - suffix)
+
+        data class DiffOp(val kind: Char, val line: String, val oldIdx: Int, val newIdx: Int)
+        val ops = mutableListOf<DiffOp>()
+
+        // Add leading unchanged lines
+        for (i in 0 until prefix) {
+            ops.add(DiffOp(' ', oldLines[i], i + 1, i + 1))
+        }
+
+        if (midOld.size.toLong() * midNew.size.toLong() <= 250_000L) {
+            // Exact LCS table on the changed middle region
+            val m = midOld.size
+            val n = midNew.size
+            val dp = Array(m + 1) { IntArray(n + 1) }
+            for (i in m - 1 downTo 0) {
+                for (j in n - 1 downTo 0) {
+                    dp[i][j] = if (midOld[i] == midNew[j]) {
+                        dp[i + 1][j + 1] + 1
+                    } else {
+                        max(dp[i + 1][j], dp[i][j + 1])
+                    }
+                }
+            }
+            var i = 0
+            var j = 0
+            while (i < m && j < n) {
+                if (midOld[i] == midNew[j]) {
+                    ops.add(DiffOp(' ', midOld[i], prefix + i + 1, prefix + j + 1))
+                    i++; j++
+                } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+                    ops.add(DiffOp('-', midOld[i], prefix + i + 1, prefix + j + 1))
+                    i++
+                } else {
+                    ops.add(DiffOp('+', midNew[j], prefix + i + 1, prefix + j + 1))
+                    j++
+                }
+            }
+            while (i < m) {
+                ops.add(DiffOp('-', midOld[i], prefix + i + 1, prefix + j + 1))
+                i++
+            }
+            while (j < n) {
+                ops.add(DiffOp('+', midNew[j], prefix + i + 1, prefix + j + 1))
+                j++
+            }
+        } else {
+            // Large middle region: emit deletions followed by additions
+            midOld.forEachIndexed { idx, l -> ops.add(DiffOp('-', l, prefix + idx + 1, prefix + 1)) }
+            midNew.forEachIndexed { idx, l -> ops.add(DiffOp('+', l, prefix + midOld.size + 1, prefix + idx + 1)) }
+        }
+
+        // Add trailing unchanged lines
+        val tailOldStart = oldLines.size - suffix
+        val tailNewStart = newLines.size - suffix
+        for (k in 0 until suffix) {
+            ops.add(DiffOp(' ', oldLines[tailOldStart + k], tailOldStart + k + 1, tailNewStart + k + 1))
+        }
+
+        val changeIndices = ops.indices.filter { ops[it].kind != ' ' }
+        if (changeIndices.isEmpty()) return ""
+
+        // Group nearby changes into hunks with contextLines
+        val hunks = mutableListOf<IntRange>()
+        var hunkStart = max(0, changeIndices.first() - contextLines)
+        var hunkEnd = min(ops.size - 1, changeIndices.first() + contextLines)
+        for (cIdx in changeIndices.drop(1)) {
+            val s = max(0, cIdx - contextLines)
+            val e = min(ops.size - 1, cIdx + contextLines)
+            if (s <= hunkEnd + 1) {
+                hunkEnd = max(hunkEnd, e)
+            } else {
+                hunks.add(hunkStart..hunkEnd)
+                hunkStart = s
+                hunkEnd = e
+            }
+        }
+        hunks.add(hunkStart..hunkEnd)
+
+        val sb = StringBuilder()
+        sb.append("--- a/").append(filePath).append('\n')
+        sb.append("+++ b/").append(filePath).append('\n')
+        var emittedLines = 2
+        for (range in hunks) {
+            val slice = ops.subList(range.first, range.last + 1)
+            val oldStart = slice.firstOrNull { it.kind != '+' }?.oldIdx ?: 1
+            val newStart = slice.firstOrNull { it.kind != '-' }?.newIdx ?: 1
+            val oldCount = slice.count { it.kind != '+' }
+            val newCount = slice.count { it.kind != '-' }
+            sb.append("@@ -$oldStart,$oldCount +$newStart,$newCount @@\n")
+            emittedLines++
+            for (op in slice) {
+                if (emittedLines >= maxDiffLines) {
+                    sb.append("... (diff truncated)\n")
+                    return sb.toString().trimEnd()
+                }
+                sb.append(op.kind).append(op.line).append('\n')
+                emittedLines++
+            }
+        }
+        return sb.toString().trimEnd()
+    }
+
+    private data class ParsedHunk(
+        val oldStart: Int,
+        val expectedOldLines: List<String>,
+        val replacementLines: List<String>
+    )
+
+    /**
+     * Applies a unified diff patch (`@@ -a,b +c,d @@` hunks) to [originalContent].
+     * Uses exact hunk position first, then fuzzy line-offset search (±40 lines),
+     * then trailing-whitespace-tolerant search so small line shifts never break patching.
+     */
+    fun applyUnifiedPatch(
+        originalContent: String,
+        patchText: String,
+        filePath: String = "file"
+    ): Pair<String, EditOutcome> {
+        val usesCrLf = originalContent.contains("\r\n")
+        val normalizedOriginal = originalContent.replace("\r\n", "\n")
+        val currentLines = normalizedOriginal.lines().toMutableList()
+        val rawPatchLines = patchText.replace("\r\n", "\n").lines()
+
+        val hunks = mutableListOf<ParsedHunk>()
+        var i = 0
+        while (i < rawPatchLines.size) {
+            val line = rawPatchLines[i]
+            val match = HUNK_HEADER_REGEX.matchEntire(line)
+            if (match != null) {
+                val oldStart = match.groupValues[1].toIntOrNull()?.coerceAtLeast(1) ?: 1
+                val expectedOld = mutableListOf<String>()
+                val replacement = mutableListOf<String>()
+                i++
+                while (i < rawPatchLines.size && !rawPatchLines[i].startsWith("@@") && !rawPatchLines[i].startsWith("--- ") && !rawPatchLines[i].startsWith("+++ ")) {
+                    val hl = rawPatchLines[i]
+                    when {
+                        hl.startsWith("\\ No newline") -> { /* ignore */ }
+                        hl.startsWith("-") -> expectedOld.add(hl.substring(1))
+                        hl.startsWith("+") -> replacement.add(hl.substring(1))
+                        hl.startsWith(" ") -> {
+                            val text = hl.substring(1)
+                            expectedOld.add(text)
+                            replacement.add(text)
+                        }
+                        hl.isEmpty() -> {
+                            // Some LLMs omit the leading space on blank context lines
+                            expectedOld.add("")
+                            replacement.add("")
+                        }
+                        else -> {
+                            // Treat unprefixed line inside hunk as context
+                            expectedOld.add(hl)
+                            replacement.add(hl)
+                        }
+                    }
+                    i++
+                }
+                if (expectedOld.isNotEmpty() || replacement.isNotEmpty()) {
+                    hunks.add(ParsedHunk(oldStart, expectedOld, replacement))
+                }
+            } else {
+                i++
+            }
+        }
+
+        if (hunks.isEmpty()) {
+            return Pair(
+                originalContent,
+                EditOutcome(
+                    success = false,
+                    message = "Patch error: No valid unified diff hunks (`@@ -start,count +start,count @@`) found. " +
+                        "Provide standard unified diff hunks or use `edit_file` / `replace_line_range`."
+                )
+            )
+        }
+
+        var lineOffset = 0
+        var totalAdded = 0
+        var totalRemoved = 0
+        var strategyUsed = "UNIFIED_EXACT"
+
+        for ((hunkIdx, hunk) in hunks.withIndex()) {
+            val targetIdx = (hunk.oldStart - 1 + lineOffset).coerceIn(0, currentLines.size)
+            val expected = hunk.expectedOldLines
+            val replacement = hunk.replacementLines
+
+            if (expected.isEmpty()) {
+                currentLines.addAll(targetIdx, replacement)
+                lineOffset += replacement.size
+                totalAdded += replacement.size
+                continue
+            }
+
+            fun matchesAt(pos: Int, trimEnd: Boolean): Boolean {
+                if (pos < 0 || pos + expected.size > currentLines.size) return false
+                for (k in expected.indices) {
+                    val a = currentLines[pos + k]
+                    val b = expected[k]
+                    if (trimEnd) {
+                        if (a.trimEnd() != b.trimEnd()) return false
+                    } else {
+                        if (a != b) return false
+                    }
+                }
+                return true
+            }
+
+            var matchedPos: Int? = null
+            if (matchesAt(targetIdx, trimEnd = false)) {
+                matchedPos = targetIdx
+            } else {
+                // Fuzzy search within ±40 lines (exact first, then trimEnd)
+                for (delta in 1..40) {
+                    if (matchesAt(targetIdx - delta, trimEnd = false)) {
+                        matchedPos = targetIdx - delta
+                        strategyUsed = "UNIFIED_FUZZY_OFFSET"
+                        break
+                    }
+                    if (matchesAt(targetIdx + delta, trimEnd = false)) {
+                        matchedPos = targetIdx + delta
+                        strategyUsed = "UNIFIED_FUZZY_OFFSET"
+                        break
+                    }
+                }
+            }
+            if (matchedPos == null) {
+                for (delta in 0..40) {
+                    if (matchesAt(targetIdx - delta, trimEnd = true)) {
+                        matchedPos = targetIdx - delta
+                        strategyUsed = "UNIFIED_WHITESPACE_TOLERANT"
+                        break
+                    }
+                    if (delta > 0 && matchesAt(targetIdx + delta, trimEnd = true)) {
+                        matchedPos = targetIdx + delta
+                        strategyUsed = "UNIFIED_WHITESPACE_TOLERANT"
+                        break
+                    }
+                }
+            }
+
+            if (matchedPos == null) {
+                val previewStart = max(0, targetIdx - 3)
+                val previewEnd = min(currentLines.size, targetIdx + expected.size + 3)
+                val snippet = (previewStart until previewEnd).joinToString("\n") { idx ->
+                    "${idx + 1}: ${currentLines[idx]}"
+                }
+                return Pair(
+                    originalContent,
+                    EditOutcome(
+                        success = false,
+                        message = "Patch failed on hunk #${hunkIdx + 1} (expected around line ${hunk.oldStart}).\n" +
+                            "Current lines ${previewStart + 1}..$previewEnd in `$filePath`:\n```\n$snippet\n```\n" +
+                            "Re-read the file and adjust the hunk context lines."
+                    )
+                )
+            }
+
+            // Apply hunk splice
+            for (k in 0 until expected.size) {
+                currentLines.removeAt(matchedPos)
+            }
+            currentLines.addAll(matchedPos, replacement)
+            lineOffset += (replacement.size - expected.size)
+
+            // Count actual added/removed lines inside hunk
+            val oldSet = expected.groupingBy { it }.eachCount().toMutableMap()
+            var hunkAdded = 0
+            for (r in replacement) {
+                val c = oldSet[r] ?: 0
+                if (c > 0) oldSet[r] = c - 1 else hunkAdded++
+            }
+            val hunkRemoved = oldSet.values.sum()
+            totalAdded += hunkAdded
+            totalRemoved += hunkRemoved
+        }
+
+        val updatedNormalized = currentLines.joinToString("\n")
+        val finalOut = if (usesCrLf) updatedNormalized.replace("\n", "\r\n") else updatedNormalized
+        val diff = generateUnifiedDiff(filePath, normalizedOriginal, updatedNormalized)
+        return Pair(
+            finalOut,
+            EditOutcome(
+                success = true,
+                message = "Applied ${hunks.size} surgical hunk(s) to `$filePath` (+$totalAdded -$totalRemoved, strategy=$strategyUsed).",
+                linesAdded = totalAdded,
+                linesRemoved = totalRemoved,
+                diffPreview = diff,
+                matchStrategyUsed = strategyUsed,
+                newContent = finalOut
+            )
+        )
+    }
+}
+
+/**
+ * Loop Guard (Section 6.5) — deterministic repeat/stall detector.
+ * [shouldBlock] reads state before a call; [recordStep] is called once AFTER the call with the real result.
  */
 class LoopGuard {
     private val history = ArrayList<Pair<String, Int>>() // signature -> result hash
@@ -353,6 +714,32 @@ class LoopGuard {
 
     fun isForbidden(toolName: String, argsJson: String): Boolean =
         signature(toolName, argsJson) in forbiddenSignatures
+
+    /** Compatibility wrapper returning sealed [LoopGuardDecision] for deterministic unit testing. */
+    fun recordAndCheck(
+        toolName: String,
+        argsJson: String,
+        isError: Boolean,
+        fileChanged: Boolean,
+        newEvidence: Boolean = !isError,
+        targetFilePath: String? = null,
+        resultText: String = if (isError) "ERR::$argsJson" else "OK::$argsJson"
+    ): LoopGuardDecision {
+        val d = recordStep(
+            toolName = toolName,
+            argsJson = argsJson,
+            resultText = resultText,
+            isError = isError,
+            fileChanged = fileChanged,
+            filePath = targetFilePath
+        )
+        return when {
+            !d.triggered -> LoopGuardDecision.Continue
+            d.forceReadFile != null -> LoopGuardDecision.ForceReReadAndSwitchStrategy(d.systemInjection)
+            d.shouldStop -> LoopGuardDecision.StopAndSummarize(d.systemInjection)
+            else -> LoopGuardDecision.BlockRepeatCall(d.systemInjection)
+        }
+    }
 
     /** Post-call check, called once per executed tool with its real result. */
     fun recordStep(
@@ -405,7 +792,7 @@ class LoopGuard {
         }
 
         // Check 2: same file edit failing repeatedly
-        if (toolName in setOf("edit_file", "insert_after_line", "replace_line_range") && filePath != null) {
+        if (toolName in setOf("apply_patch", "edit_file", "insert_after_line", "replace_line_range") && filePath != null) {
             if (isError) {
                 val fails = (editFailuresByFile[filePath] ?: 0) + 1
                 editFailuresByFile[filePath] = fails
@@ -414,14 +801,14 @@ class LoopGuard {
                         triggered = true,
                         forceReadFile = filePath,
                         activityNote = "Re-reading $filePath…",
-                        systemInjection = "[LOOP GUARD]: Editing `$filePath` failed 3 times. Call `read_file` on it first to see its latest content, then try once more."
+                        systemInjection = "[LOOP GUARD]: Patching `$filePath` failed 3 times. Call `read_file` on it first to see its latest content, then try once more."
                     )
                 } else if (fails >= 5) {
                     return GuardDecision(
                         triggered = true,
                         shouldStop = true,
                         activityNote = "Waiting for your guidance on $filePath",
-                        systemInjection = "[LOOP GUARD]: Editing `$filePath` keeps failing. Stop, explain the problem briefly and ask the user."
+                        systemInjection = "[LOOP GUARD]: Patching `$filePath` keeps failing. Stop, explain the problem briefly and ask the user."
                     )
                 }
             } else {

@@ -256,8 +256,8 @@ private fun ProviderRow(
         !provider.isEnabled -> Pair("Disabled", AppColors.textMuted)
         !hasKey -> Pair("No API key configured", AppColors.textMuted)
         cooling -> Pair("Cooldown (${(provider.cooldownUntilTimestamp - now) / 1000}s) · ${provider.lastErrorClass ?: "RATE_LIMIT"}", AppColors.warn)
-        provider.lastTestStatus == "ERROR" -> Pair("Error (${provider.lastErrorClass ?: "Check key/URL"})", AppColors.error)
-        provider.lastTestStatus == "OK" -> Pair("Verified · ${provider.lastLatencyMs ?: 0} ms · $modelCount models", AppColors.ok)
+        provider.lastTestStatus in setOf("ERROR", "FAILED", "INVALID") -> Pair("Error (${provider.lastErrorClass ?: "Check key/URL"})", AppColors.error)
+        provider.lastTestStatus in setOf("OK", "WORKING") -> Pair("Verified · ${provider.lastLatencyMs} ms · $modelCount models", AppColors.ok)
         else -> Pair("Key saved · Tap Test to fetch models", AppColors.warn)
     }
 
@@ -675,51 +675,79 @@ private fun ProviderEditor(
                     Text(errorMessage ?: "", fontSize = 12.sp, color = AppColors.error)
                 }
 
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                    TextButton(onClick = onDismiss) { Text("Cancel", color = AppColors.textSecondary) }
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Button(
-                        enabled = !saving,
-                        onClick = {
-                            val u = urlText.trim()
-                            val headersOk = headers.isBlank() || try {
-                                JSONObject(headers)
-                                true
-                            } catch (_: Exception) {
-                                false
+                val isBuiltInPreset = provider.id in setOf(
+                    "openrouter", "openai", "anthropic", "gemini", "groq",
+                    "deepseek", "xai", "kimi", "mistral", "ollama"
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (!isBuiltInPreset) {
+                        TextButton(
+                            enabled = !saving,
+                            onClick = {
+                                scope.launch {
+                                    repo.deleteProvider(provider.id)
+                                    Toast.makeText(context, "Deleted ${provider.name}", Toast.LENGTH_SHORT).show()
+                                    onDismiss()
+                                }
                             }
-                            when {
-                                u.isBlank() || !(u.startsWith("http://") || u.startsWith("https://")) ->
-                                    errorMessage = "Enter a valid base URL starting with http:// or https://"
-                                !headersOk -> errorMessage = "Custom headers must be valid JSON."
-                                else -> {
-                                    errorMessage = null
-                                    saving = true
-                                    scope.launch {
-                                        try {
-                                            val updated = draft()
-                                            repo.updateProvider(updated)
-                                            if (modelText.isNotBlank()) {
-                                                repo.addCustomModelId(provider.id, modelText.trim())
+                        ) {
+                            Icon(Icons.Default.Delete, contentDescription = "Delete provider", tint = AppColors.error, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Delete", color = AppColors.error)
+                        }
+                    } else {
+                        Spacer(modifier = Modifier.width(1.dp))
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        TextButton(onClick = onDismiss) { Text("Cancel", color = AppColors.textSecondary) }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Button(
+                            enabled = !saving,
+                            onClick = {
+                                val u = urlText.trim()
+                                val headersOk = headers.isBlank() || try {
+                                    JSONObject(headers)
+                                    true
+                                } catch (_: Exception) {
+                                    false
+                                }
+                                when {
+                                    u.isBlank() || !(u.startsWith("http://") || u.startsWith("https://")) ->
+                                        errorMessage = "Enter a valid base URL starting with http:// or https://"
+                                    !headersOk -> errorMessage = "Custom headers must be valid JSON."
+                                    else -> {
+                                        errorMessage = null
+                                        saving = true
+                                        scope.launch {
+                                            try {
+                                                val updated = draft()
+                                                repo.updateProvider(updated)
+                                                if (modelText.isNotBlank()) {
+                                                    repo.addCustomModelId(provider.id, modelText.trim())
+                                                }
+                                                Toast.makeText(context, "Provider saved", Toast.LENGTH_SHORT).show()
+                                                onDismiss()
+                                            } catch (e: kotlinx.coroutines.CancellationException) {
+                                                throw e
+                                            } catch (e: Exception) {
+                                                errorMessage = "Could not save: ${e.message ?: e.javaClass.simpleName}"
+                                            } finally {
+                                                saving = false
                                             }
-                                            Toast.makeText(context, "Provider saved", Toast.LENGTH_SHORT).show()
-                                            onDismiss()
-                                        } catch (e: kotlinx.coroutines.CancellationException) {
-                                            throw e
-                                        } catch (e: Exception) {
-                                            errorMessage = "Could not save: ${e.message ?: e.javaClass.simpleName}"
-                                        } finally {
-                                            saving = false
                                         }
                                     }
                                 }
-                            }
-                        },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = AppColors.accent,
-                            contentColor = AppColors.onAccent
-                        )
-                    ) { Text("Save") }
+                            },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = AppColors.accent,
+                                contentColor = AppColors.onAccent
+                            )
+                        ) { Text("Save") }
+                    }
                 }
             }
         }
@@ -732,27 +760,40 @@ fun AddProviderDialog(
     nextPriority: Int = 11,
     onDismiss: () -> Unit
 ) {
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var name by remember { mutableStateOf("") }
     var baseUrl by remember { mutableStateOf("https://") }
     var apiKey by remember { mutableStateOf("") }
     var modelText by remember { mutableStateOf("") }
+    var customHeaders by remember { mutableStateOf("") }
     var apiFormat by remember { mutableStateOf("OPENAI") }
+    var supportsVision by remember { mutableStateOf(false) }
+    var supportsTools by remember { mutableStateOf(true) }
+    var saving by remember { mutableStateOf(false) }
     var errorText by remember { mutableStateOf<String?>(null) }
 
-    Dialog(onDismissRequest = onDismiss) {
+    Dialog(
+        onDismissRequest = { if (!saving) onDismiss() },
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
         Surface(
             shape = RoundedCornerShape(20.dp),
             color = AppColors.surface,
-            modifier = Modifier.fillMaxWidth()
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 20.dp)
+                .heightIn(max = 680.dp)
         ) {
             Column(
-                modifier = Modifier.padding(20.dp),
+                modifier = Modifier
+                    .verticalScroll(rememberScrollState())
+                    .padding(20.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Text("Add Custom Provider", fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = AppColors.textPrimary)
                 Text(
-                    "Connect any OpenAI-compatible (e.g. TokenHarbor, OpenRouter, Groq), Anthropic, or Gemini endpoint with live /models discovery.",
+                    "Connect any OpenAI-compatible (TokenHarbor, OpenRouter, Groq, Together, Nvidia NIM, vLLM), Anthropic, or Gemini endpoint.",
                     fontSize = 12.sp,
                     color = AppColors.textSecondary
                 )
@@ -762,6 +803,7 @@ fun AddProviderDialog(
                         Triple("TokenHarbor", "https://api.tokenharbor.ai/v1", "OPENAI"),
                         Triple("OpenRouter", "https://openrouter.ai/api/v1", "OPENAI"),
                         Triple("Groq Cloud", "https://api.groq.com/openai/v1", "OPENAI"),
+                        Triple("Together AI", "https://api.together.xyz/v1", "OPENAI"),
                         Triple("Local Termux LLM", "http://127.0.0.1:8080/v1", "OPENAI")
                     )
                     items(presets) { (pName, pUrl, pFmt) ->
@@ -779,7 +821,8 @@ fun AddProviderDialog(
                 FormField(label = "Display Name", value = name, onChange = { name = it }, placeholder = "e.g. TokenHarbor, Together AI, vLLM")
                 FormField(label = "Base URL", value = baseUrl, onChange = { baseUrl = it }, placeholder = "https://api.example.com/v1", mono = true)
                 FormField(label = "API Key (optional for local)", value = apiKey, onChange = { apiKey = it }, secret = true)
-                FormField(label = "Optional Custom Model ID", value = modelText, onChange = { modelText = it }, placeholder = "Or leave blank and Test Connection", mono = true)
+                FormField(label = "Model ID (optional — auto-fetched on test)", value = modelText, onChange = { modelText = it }, placeholder = "e.g. gpt-4o, deepseek-chat, qwen2.5-coder", mono = true)
+                FormField(label = "Custom Headers JSON (optional)", value = customHeaders, onChange = { customHeaders = it }, placeholder = "{\"HTTP-Referer\": \"https://app\"}", mono = true)
 
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     for (fmt in listOf("OPENAI", "ANTHROPIC", "GEMINI")) {
@@ -787,42 +830,104 @@ fun AddProviderDialog(
                     }
                 }
 
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Supports tool calling", fontSize = 13.sp, color = AppColors.textPrimary, modifier = Modifier.weight(1f))
+                    Switch(checked = supportsTools, onCheckedChange = { supportsTools = it })
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Supports vision / images", fontSize = 13.sp, color = AppColors.textPrimary, modifier = Modifier.weight(1f))
+                    Switch(checked = supportsVision, onCheckedChange = { supportsVision = it })
+                }
+
                 if (errorText != null) {
                     Text(errorText ?: "", fontSize = 12.sp, color = AppColors.error)
                 }
 
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                    TextButton(onClick = onDismiss) { Text("Cancel", color = AppColors.textSecondary) }
-                    Spacer(modifier = Modifier.width(8.dp))
+                fun validateAndSave(runTest: Boolean) {
+                    val trimmedName = name.trim()
+                    val trimmedUrl = baseUrl.trim()
+                    if (trimmedName.isBlank()) {
+                        errorText = "Please enter a Display Name."
+                        return
+                    }
+                    if (!(trimmedUrl.startsWith("http://") || trimmedUrl.startsWith("https://")) || trimmedUrl == "https://" || trimmedUrl == "http://") {
+                        errorText = "Please enter a valid Base URL starting with http:// or https://"
+                        return
+                    }
+                    if (customHeaders.isNotBlank()) {
+                        try {
+                            JSONObject(customHeaders)
+                        } catch (_: Exception) {
+                            errorText = "Custom Headers must be valid JSON."
+                            return
+                        }
+                    }
+                    errorText = null
+                    saving = true
+                    scope.launch {
+                        try {
+                            val cleanModel = modelText.trim()
+                            val created = repo.addCustomProvider(
+                                name = trimmedName,
+                                baseUrl = trimmedUrl,
+                                apiFormat = apiFormat,
+                                rawApiKey = apiKey,
+                                models = if (cleanModel.isNotBlank()) listOf(cleanModel) else emptyList(),
+                                selectedModel = cleanModel,
+                                customHeadersJson = customHeaders.trim().ifBlank { null },
+                                supportsVision = supportsVision,
+                                supportsTools = supportsTools
+                            )
+                            if (runTest && (apiKey.isNotBlank() || trimmedUrl.contains("127.0.0.1") || trimmedUrl.contains("localhost"))) {
+                                val diag = repo.testAndFetchModels(created)
+                                Toast.makeText(
+                                    context,
+                                    if (diag.ok) "✓ Added ${created.name} (${diag.modelCount} models)"
+                                    else "Saved ${created.name} (test note: ${diag.errorMessage ?: "check key/model"})",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            } else {
+                                Toast.makeText(context, "✓ Added custom provider ${created.name}", Toast.LENGTH_SHORT).show()
+                            }
+                            onDismiss()
+                        } catch (e: kotlinx.coroutines.CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            errorText = "Failed to add provider: ${e.message ?: e.javaClass.simpleName}"
+                        } finally {
+                            saving = false
+                        }
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    TextButton(enabled = !saving, onClick = onDismiss) {
+                        Text("Cancel", color = AppColors.textSecondary)
+                    }
+                    Spacer(modifier = Modifier.width(6.dp))
+                    OutlinedButton(
+                        enabled = !saving,
+                        onClick = { validateAndSave(runTest = false) }
+                    ) {
+                        Text("Save Only", fontSize = 12.sp, color = AppColors.textPrimary)
+                    }
+                    Spacer(modifier = Modifier.width(6.dp))
                     Button(
-                        onClick = {
-                            if (name.isBlank() || !baseUrl.startsWith("http")) {
-                                errorText = "Please enter a name and a valid http/https Base URL."
-                                return@Button
-                            }
-                            scope.launch {
-                                val id = name.lowercase().replace(Regex("[^a-z0-9]+"), "-").trim('-') + "-" + UUID.randomUUID().toString().take(4)
-                                val entity = ProviderConfigEntity(
-                                    id = id,
-                                    name = name.trim(),
-                                    apiFormat = apiFormat,
-                                    baseUrl = baseUrl.trim().trimEnd('/'),
-                                    selectedModel = modelText.trim(),
-                                    modelsJson = if (modelText.isNotBlank()) "[\"${modelText.trim()}\"]" else "[]",
-                                    encryptedApiKey = if (apiKey.isBlank()) "" else KeyStoreManager.encrypt(apiKey.trim()),
-                                    priority = nextPriority,
-                                    isEnabled = true
-                                )
-                                repo.updateProvider(entity)
-                                if (apiKey.isNotBlank() || baseUrl.contains("127.0.0.1") || baseUrl.contains("localhost")) {
-                                    repo.testAndFetchModels(entity)
-                                }
-                                onDismiss()
-                            }
-                        },
+                        enabled = !saving,
+                        onClick = { validateAndSave(runTest = true) },
                         colors = ButtonDefaults.buttonColors(containerColor = AppColors.accent, contentColor = AppColors.onAccent)
                     ) {
-                        Text("Add & Test")
+                        if (saving) {
+                            CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp, color = AppColors.onAccent)
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Adding…", fontSize = 12.sp)
+                        } else {
+                            Text("Add & Test", fontSize = 12.sp)
+                        }
                     }
                 }
             }

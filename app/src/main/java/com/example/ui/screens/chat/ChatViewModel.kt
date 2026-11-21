@@ -90,6 +90,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     val approval: StateFlow<ApprovalRequest?> = agentEngine.approvalRequest
     val workingFiles: StateFlow<List<WorkingFileEntry>> = agentEngine.workingFiles
     val runStartedAtMs: StateFlow<Long?> = agentEngine.runStartedAtMs
+    val processState: StateFlow<com.example.data.agent.AgentProcessState> = agentEngine.processState
     val engineHealth: StateFlow<EngineHealthState> = termuxBridge.healthState
     val terminalOutput: StateFlow<String> = termuxBridge.terminalOutput
 

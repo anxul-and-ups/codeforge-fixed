@@ -289,8 +289,17 @@ class ProviderRepository(
         return addAdditionalKeyForProvider(p, keyLabel, rawApiKey)
     }
 
+    /**
+     * Upserts the provider into Room using INSERT(REPLACE) so both existing and brand-new
+     * custom providers are guaranteed to persist (Room @Update silently updates 0 rows if ID is new).
+     */
     suspend fun updateProvider(provider: ProviderConfigEntity) {
-        providerDao.updateProvider(provider)
+        providerDao.insertProvider(provider)
+    }
+
+    suspend fun upsertProvider(provider: ProviderConfigEntity): ProviderConfigEntity {
+        providerDao.insertProvider(provider)
+        return provider
     }
 
     suspend fun addCustomProvider(
@@ -298,30 +307,56 @@ class ProviderRepository(
         baseUrl: String,
         apiFormat: String,
         rawApiKey: String,
-        models: List<String>,
-        selectedModel: String,
-        customHeadersJson: String?,
-        supportsVision: Boolean,
-        supportsTools: Boolean
+        models: List<String> = emptyList(),
+        selectedModel: String = "",
+        customHeadersJson: String? = null,
+        supportsVision: Boolean = false,
+        supportsTools: Boolean = true
     ): ProviderConfigEntity {
-        val id = UUID.randomUUID().toString()
+        val slug = name.trim().lowercase().replace(Regex("[^a-z0-9]+"), "-").trim('-').ifBlank { "custom" }
+        val id = "$slug-${UUID.randomUUID().toString().take(6)}"
         val all = providerDao.getAllProvidersOnce()
         val priority = (all.maxOfOrNull { it.priority } ?: 0) + 1
+        val normalizedUrl = baseUrl.trim().trimEnd('/').removeSuffix("/chat/completions")
+        val cleanModel = selectedModel.trim()
+        val mergedModels = buildList {
+            if (cleanModel.isNotBlank()) add(cleanModel)
+            for (m in models) {
+                val t = m.trim()
+                if (t.isNotBlank() && t !in this) add(t)
+            }
+        }
         val entity = ProviderConfigEntity(
             id = id,
             name = name.trim(),
-            baseUrl = baseUrl.trim().trimEnd('/'),
-            apiFormat = apiFormat,
-            encryptedApiKey = KeyStoreManager.encrypt(rawApiKey.trim()),
-            modelsJson = JSONArray(models).toString(),
-            selectedModel = selectedModel.trim(),
+            baseUrl = normalizedUrl,
+            apiFormat = apiFormat.uppercase(),
+            encryptedApiKey = if (rawApiKey.isBlank()) "" else KeyStoreManager.encrypt(rawApiKey.trim()),
+            modelsJson = JSONArray(mergedModels).toString(),
+            selectedModel = cleanModel,
             priority = priority,
             isEnabled = true,
-            customHeadersJson = customHeadersJson,
+            customHeadersJson = customHeadersJson?.trim()?.ifBlank { null },
             supportsVision = supportsVision,
             supportsTools = supportsTools
         )
         providerDao.insertProvider(entity)
+        if (cleanModel.isNotBlank()) {
+            providerDao.insertCachedModels(
+                listOf(
+                    ModelCacheEntity(
+                        id = "$id::$cleanModel",
+                        providerId = id,
+                        keyId = id,
+                        modelId = cleanModel,
+                        displayName = cleanModel,
+                        contextWindow = 0,
+                        supportsTools = supportsTools,
+                        supportsVision = supportsVision
+                    )
+                )
+            )
+        }
         return entity
     }
 
@@ -337,18 +372,28 @@ class ProviderRepository(
      */
     suspend fun testAndFetchModels(provider: ProviderConfigEntity, freeOnly: Boolean = false): ConnectionTestDiagnosis {
         val t0 = System.currentTimeMillis()
+        // Ensure row exists in Room before updating status
+        if (providerDao.getProviderById(provider.id) == null) {
+            providerDao.insertProvider(provider)
+        }
         return try {
             val fetch = llmClient.fetchModelsDetailed(provider, freeOnly)
             val latency = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
             cacheServerModels(provider, fetch)
 
-            val autoSelected = if (provider.selectedModel.isNotBlank() && provider.selectedModel in fetch.models) {
+            val allModels = buildList {
+                if (provider.selectedModel.isNotBlank() && provider.selectedModel !in fetch.models) {
+                    add(provider.selectedModel)
+                }
+                addAll(fetch.models)
+            }
+            val autoSelected = if (provider.selectedModel.isNotBlank()) {
                 provider.selectedModel
             } else {
-                fetch.models.firstOrNull().orEmpty()
+                allModels.firstOrNull().orEmpty()
             }
             val updated = provider.copy(
-                modelsJson = JSONArray(fetch.models).toString(),
+                modelsJson = JSONArray(allModels).toString(),
                 selectedModel = autoSelected,
                 lastTestedAt = System.currentTimeMillis(),
                 lastTestStatus = "WORKING",
@@ -357,7 +402,7 @@ class ProviderRepository(
                 lastErrorClass = null,
                 cooldownUntilTimestamp = 0L
             )
-            providerDao.updateProvider(updated)
+            providerDao.insertProvider(updated)
             if (autoSelected.isNotBlank()) {
                 providerDao.upsertHealthState(
                     HealthStateEntity(
@@ -375,15 +420,47 @@ class ProviderRepository(
                 providerName = provider.name,
                 success = true,
                 latencyMs = latency,
-                modelsFound = fetch.models.size,
-                plainReason = "Working (${latency} ms) · ${fetch.models.size} models fetched from server"
+                modelsFound = allModels.size,
+                plainReason = "Working (${latency} ms) · ${allModels.size} models fetched from server"
             )
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
+            // Some custom OpenAI-compatible proxies don't implement GET /models (404/405),
+            // but DO work with POST /chat/completions if a custom model ID is provided.
+            if (provider.selectedModel.isNotBlank()) {
+                val pingErr = try {
+                    llmClient.testConnectionError(provider)
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (ex: Exception) {
+                    ex.message ?: ex.javaClass.simpleName
+                }
+                if (pingErr == null) {
+                    val latency = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
+                    val updated = provider.copy(
+                        modelsJson = JSONArray(listOf(provider.selectedModel)).toString(),
+                        lastTestedAt = System.currentTimeMillis(),
+                        lastTestStatus = "WORKING",
+                        lastLatencyMs = latency,
+                        lastError = null,
+                        lastErrorClass = null,
+                        cooldownUntilTimestamp = 0L
+                    )
+                    providerDao.insertProvider(updated)
+                    return ConnectionTestDiagnosis(
+                        providerId = provider.id,
+                        providerName = provider.name,
+                        success = true,
+                        latencyMs = latency,
+                        modelsFound = 1,
+                        plainReason = "Connected (${latency} ms) using custom model ${provider.selectedModel}"
+                    )
+                }
+            }
             val latency = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
             val errClass = classifyError(e)
-            providerDao.updateProvider(
+            providerDao.insertProvider(
                 provider.copy(
                     lastTestedAt = System.currentTimeMillis(),
                     lastTestStatus = if (errClass == ProviderErrorClass.AUTH) "INVALID" else "FAILED",
@@ -399,7 +476,7 @@ class ProviderRepository(
                 latencyMs = latency,
                 modelsFound = 0,
                 errorClass = errClass,
-                plainReason = "${errClass.label}: ${errClass.plainReason}",
+                plainReason = "${errClass.label}: ${e.message?.take(160) ?: errClass.plainReason}",
                 suggestedFix = errClass.suggestedFix
             )
         }

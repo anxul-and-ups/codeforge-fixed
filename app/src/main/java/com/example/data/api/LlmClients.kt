@@ -28,9 +28,8 @@ import java.util.concurrent.TimeUnit
 class LlmClient(
     private val okHttpClient: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(45, TimeUnit.SECONDS)
         .writeTimeout(15, TimeUnit.SECONDS)
-        .callTimeout(30, TimeUnit.SECONDS)
         .build()
 ) {
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
@@ -880,7 +879,7 @@ class LlmClient(
         val budget = if (flags.reasoning) budgetFor(req.reasoningLevel) else 0
         gen.put("maxOutputTokens", req.maxTokens + budget)
         if (flags.reasoning) {
-            if (req.reasoningLevel != ReasoningLevel.OFF) {
+            if (budget > 0) {
                 gen.put(
                     "thinkingConfig",
                     JSONObject().put("thinkingBudget", budget).put("includeThoughts", true)
@@ -1016,16 +1015,19 @@ class LlmClient(
         val builder = Request.Builder()
         when (format) {
             "ANTHROPIC" -> {
-                builder.url("$base/v1/models?limit=100")
+                val rootBase = base.removeSuffix("/v1/messages").removeSuffix("/v1")
+                builder.url("$rootBase/v1/models?limit=100")
                     .header("x-api-key", apiKey)
                     .header("anthropic-version", "2023-06-01")
             }
             "GEMINI" -> {
-                builder.url("$base/v1beta/models?pageSize=200")
+                val rootBase = base.removeSuffix("/v1beta")
+                builder.url("$rootBase/v1beta/models?pageSize=200")
                     .header("x-goog-api-key", apiKey)
             }
             else -> {
-                builder.url("$base/models")
+                val rootBase = base.removeSuffix("/chat/completions")
+                builder.url("$rootBase/models")
                 if (apiKey.isNotEmpty()) builder.header("Authorization", "Bearer $apiKey")
             }
         }

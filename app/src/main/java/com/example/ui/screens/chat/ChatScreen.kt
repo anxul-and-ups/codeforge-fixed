@@ -122,6 +122,8 @@ fun ChatScreen(
     val workingFiles by viewModel.workingFiles.collectAsState()
     val engineHealth by viewModel.engineHealth.collectAsState()
     val terminalOutput by viewModel.terminalOutput.collectAsState()
+    val processState by viewModel.processState.collectAsState()
+    val runStartedAtMs by viewModel.runStartedAtMs.collectAsState()
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val drawerState = rememberDrawerState(DrawerValue.Closed)
@@ -714,6 +716,125 @@ fun ChatScreen(
                                     Text(cmd.trim(), fontSize = 13.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.SemiBold, color = AppColors.accent)
                                     Text(desc, fontSize = 12.sp, color = AppColors.textSecondary)
                                 }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---------------- Cloud IDE Deterministic Process State Bar ----------------
+            if (uiState.isAgentRunning || processState.phase != com.example.data.agent.AgentProcessPhase.IDLE) {
+                var elapsedSec by remember(runStartedAtMs) { mutableStateOf(0L) }
+                LaunchedEffect(runStartedAtMs, uiState.isAgentRunning) {
+                    val start = runStartedAtMs ?: System.currentTimeMillis()
+                    while (uiState.isAgentRunning) {
+                        elapsedSec = ((System.currentTimeMillis() - start) / 1000L).coerceAtLeast(0L)
+                        kotlinx.coroutines.delay(1000L)
+                    }
+                }
+                val phaseColor = when (processState.phase) {
+                    com.example.data.agent.AgentProcessPhase.PATCHING -> Color(0xFFD2A8FF)
+                    com.example.data.agent.AgentProcessPhase.DISCOVERING -> Color(0xFF79C0FF)
+                    com.example.data.agent.AgentProcessPhase.EXECUTING_COMMAND -> Color(0xFF3FB950)
+                    com.example.data.agent.AgentProcessPhase.WAITING_APPROVAL -> Color(0xFFD29922)
+                    com.example.data.agent.AgentProcessPhase.ERROR,
+                    com.example.data.agent.AgentProcessPhase.ABORTED -> Color(0xFFF85149)
+                    else -> Color(0xFF58A6FF)
+                }
+                val mm = elapsedSec / 60
+                val ss = elapsedSec % 60
+                val timerText = "%02d:%02d".format(mm, ss)
+
+                Surface(
+                    color = Color(0xFF0D1117),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 10.dp, vertical = 4.dp)
+                        .border(1.dp, phaseColor.copy(alpha = 0.45f), RoundedCornerShape(12.dp))
+                        .testTag("cloud_process_state_bar")
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 10.dp, vertical = 7.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        if (uiState.isAgentRunning) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(14.dp),
+                                strokeWidth = 2.dp,
+                                color = phaseColor
+                            )
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .clip(CircleShape)
+                                    .background(phaseColor)
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Surface(
+                            shape = RoundedCornerShape(6.dp),
+                            color = phaseColor.copy(alpha = 0.16f)
+                        ) {
+                            Text(
+                                text = processState.phase.label,
+                                fontSize = 10.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold,
+                                color = phaseColor,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = processState.detail.ifBlank { uiState.currentAgentStatus.ifBlank { "Working…" } },
+                                fontSize = 11.sp,
+                                color = Color(0xFFE6EDF3),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            val cmdPreview = processState.activeCommand
+                            if (!cmdPreview.isNullOrBlank()) {
+                                Text(
+                                    text = cmdPreview,
+                                    fontSize = 10.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = Color(0xFF8B949E),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = timerText,
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.SemiBold,
+                            color = Color(0xFF8B949E)
+                        )
+                        if (uiState.isAgentRunning) {
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = Color(0xFFF85149).copy(alpha = 0.2f),
+                                modifier = Modifier
+                                    .border(1.dp, Color(0xFFF85149).copy(alpha = 0.55f), RoundedCornerShape(8.dp))
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable { viewModel.stopAgent() }
+                                    .testTag("process_bar_abort_button")
+                            ) {
+                                Text(
+                                    text = "Abort",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color(0xFFFFA198),
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                )
                             }
                         }
                     }

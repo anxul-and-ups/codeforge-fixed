@@ -28,6 +28,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -91,6 +92,8 @@ fun MainScreen(
     val approvalState by chatViewModel.approval.collectAsState()
     val approval = approvalState
     if (approval != null) {
+        var customReply by remember(approval.id) { mutableStateOf("") }
+        val isAskUser = approval.toolName == "ask_user"
         AlertDialog(
             onDismissRequest = { chatViewModel.resolveApproval(false) },
             title = { Text(approval.title, fontWeight = FontWeight.SemiBold) },
@@ -119,12 +122,32 @@ fun MainScreen(
                             }
                         }
                     }
+                    if (isAskUser) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        OutlinedTextField(
+                            value = customReply,
+                            onValueChange = { customReply = it },
+                            placeholder = { Text("Or type exact path / custom reply…", fontSize = 12.sp) },
+                            singleLine = false,
+                            maxLines = 3,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("ask_user_custom_input")
+                        )
+                    }
                 }
             },
             confirmButton = {
-                if (approval.options.isEmpty()) {
-                    TextButton(onClick = { chatViewModel.resolveApproval(true) }) {
-                        Text(approval.allowLabel, color = AppColors.accent, fontWeight = FontWeight.SemiBold)
+                when {
+                    isAskUser && customReply.isNotBlank() -> {
+                        TextButton(onClick = { chatViewModel.resolveApprovalChoice(customReply.trim()) }) {
+                            Text("Send Reply", color = AppColors.accent, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                    approval.options.isEmpty() -> {
+                        TextButton(onClick = { chatViewModel.resolveApproval(true) }) {
+                            Text(approval.allowLabel, color = AppColors.accent, fontWeight = FontWeight.SemiBold)
+                        }
                     }
                 }
             },
