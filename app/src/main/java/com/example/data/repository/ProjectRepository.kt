@@ -1089,4 +1089,139 @@ class ProjectRepository(
             }
         }
     }
+
+    // ---------------------------------------------------------------------------------------
+    // Advanced Codebase Management: Upload, Replace, Multi-Codebase Copy/Paste, ZIP Replace & SAF Export
+    // ---------------------------------------------------------------------------------------
+
+    /** Lists all non-ignored relative file paths inside [projectId], sorted alphabetically. */
+    suspend fun listAllRelativeFiles(projectId: String): List<String> = withContext(Dispatchers.IO) {
+        val project = projectDao.getProjectById(projectId) ?: return@withContext emptyList()
+        val rootDir = File(project.rootPath)
+        if (!rootDir.exists()) return@withContext emptyList()
+        walkFiltered(rootDir)
+            .filter { it.isFile }
+            .map { it.relativeTo(rootDir).path.replace(File.separatorChar, '/') }
+            .sorted()
+            .toList()
+    }
+
+    /**
+     * Imports a file from Android SAF [uri] into [projectId] at [targetRelativePath].
+     * Returns Pair(previousTextIfTextFile, newTextIfTextFile) so callers can record exact Manual Edit diffs.
+     */
+    suspend fun importFileFromUri(
+        projectId: String,
+        targetRelativePath: String,
+        uri: Uri
+    ): Pair<String?, String?> = withContext(Dispatchers.IO) {
+        val project = projectDao.getProjectById(projectId)
+            ?: throw IllegalArgumentException("Project not found")
+        val targetFile = resolveSafePath(File(project.rootPath), targetRelativePath)
+        val oldText = if (targetFile.exists() && targetFile.isFile && !isBinaryFile(targetFile) && targetFile.length() < 512_000L) {
+            try { targetFile.readText() } catch (_: Exception) { null }
+        } else null
+
+        targetFile.parentFile?.mkdirs()
+        val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+            ?: throw IllegalStateException("Could not open selected file.")
+        targetFile.writeBytes(bytes)
+        updateProjectStats(project)
+
+        val isBinary = bytes.take(4096).any { it == 0.toByte() }
+        val newText = if (!isBinary && bytes.size < 512_000) {
+            try { String(bytes, Charsets.UTF_8) } catch (_: Exception) { null }
+        } else null
+        oldText to newText
+    }
+
+    /**
+     * Copies a file from [sourceProjectId]/[sourceRelPath] to [destProjectId]/[destRelPath]
+     * (supporting both same-project folder moves/copies and side-by-side Multi-Codebase transfers).
+     */
+    suspend fun copyFileBetweenProjects(
+        sourceProjectId: String,
+        sourceRelPath: String,
+        destProjectId: String,
+        destRelPath: String
+    ): Pair<String?, String?> = withContext(Dispatchers.IO) {
+        val srcProject = projectDao.getProjectById(sourceProjectId)
+            ?: throw IllegalArgumentException("Source project not found")
+        val dstProject = projectDao.getProjectById(destProjectId)
+            ?: throw IllegalArgumentException("Destination project not found")
+        val srcFile = resolveSafePath(File(srcProject.rootPath), sourceRelPath)
+        if (!srcFile.exists() || !srcFile.isFile) {
+            throw NoSuchFileException(srcFile, reason = "Source file not found: $sourceRelPath")
+        }
+        val dstFile = resolveSafePath(File(dstProject.rootPath), destRelPath)
+        val oldText = if (dstFile.exists() && dstFile.isFile && !isBinaryFile(dstFile) && dstFile.length() < 512_000L) {
+            try { dstFile.readText() } catch (_: Exception) { null }
+        } else null
+        dstFile.parentFile?.mkdirs()
+        srcFile.copyTo(dstFile, overwrite = true)
+        updateProjectStats(dstProject)
+        val newText = if (!isBinaryFile(dstFile) && dstFile.length() < 512_000L) {
+            try { dstFile.readText() } catch (_: Exception) { null }
+        } else null
+        oldText to newText
+    }
+
+    /**
+     * Extracts a ZIP archive (from Android [uri]) into an existing [projectId],
+     * inspecting entries and accurately replacing matching files in place.
+     */
+    suspend fun extractZipUriIntoProject(
+        projectId: String,
+        uri: Uri,
+        targetSubdir: String? = null
+    ): ZipReplaceReport = withContext(Dispatchers.IO) {
+        val project = projectDao.getProjectById(projectId)
+            ?: throw IllegalArgumentException("Project not found")
+        val rootDir = File(project.rootPath)
+        val report = context.contentResolver.openInputStream(uri)?.use { inp ->
+            ZipWorkspaceHelper.extractAndReplaceZipStream(inp, rootDir, targetSubdir)
+        } ?: throw IllegalStateException("Could not open ZIP archive.")
+        updateProjectStats(project)
+        report
+    }
+
+    /**
+     * Extracts a local/Termux filesystem ZIP file into [projectId], accurately replacing matching files.
+     */
+    suspend fun extractZipFileIntoProject(
+        projectId: String,
+        zipFile: File,
+        targetSubdir: String? = null
+    ): ZipReplaceReport = withContext(Dispatchers.IO) {
+        val project = projectDao.getProjectById(projectId)
+            ?: throw IllegalArgumentException("Project not found")
+        val rootDir = File(project.rootPath)
+        val report = ZipWorkspaceHelper.extractAndReplaceZip(zipFile, rootDir, targetSubdir)
+        updateProjectStats(project)
+        report
+    }
+
+    /** Exports the entire project Codebase as a `.zip` directly to a SAF [destUri] chosen by the user. */
+    suspend fun exportProjectZipToUri(projectId: String, destUri: Uri): Int = withContext(Dispatchers.IO) {
+        val project = projectDao.getProjectById(projectId)
+            ?: throw IllegalArgumentException("Project not found")
+        val rootDir = File(project.rootPath)
+        context.contentResolver.openOutputStream(destUri)?.use { out ->
+            ZipWorkspaceHelper.writeDirectoryToZipStream(rootDir, out)
+        } ?: throw IllegalStateException("Could not open destination URI for ZIP export.")
+    }
+
+    /** Exports a single file from [projectId] directly to a SAF [destUri] chosen by the user. */
+    suspend fun exportSingleFileToUri(projectId: String, relativePath: String, destUri: Uri): Long = withContext(Dispatchers.IO) {
+        val project = projectDao.getProjectById(projectId)
+            ?: throw IllegalArgumentException("Project not found")
+        val srcFile = resolveSafePath(File(project.rootPath), relativePath)
+        if (!srcFile.exists() || !srcFile.isFile) {
+            throw NoSuchFileException(srcFile, reason = "File not found: $relativePath")
+        }
+        context.contentResolver.openOutputStream(destUri)?.use { out ->
+            srcFile.inputStream().use { inp -> inp.copyTo(out) }
+        } ?: throw IllegalStateException("Could not open destination URI for file download.")
+    }
 }
+

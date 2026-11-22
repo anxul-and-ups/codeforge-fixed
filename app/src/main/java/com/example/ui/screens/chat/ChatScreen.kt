@@ -30,12 +30,14 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.FolderOpen
@@ -112,6 +114,9 @@ fun ChatScreen(
     onOpenGitHub: () -> Unit = {},
     onOpenDiffReview: () -> Unit = {},
     onOpenSettings: () -> Unit = {},
+    onOpenCodebase: () -> Unit = {},
+    onOpenGhBuild: () -> Unit = {},
+    onExitProjectToHome: () -> Unit = {},
     githubManager: com.example.data.github.GitHubManager? = null,
     githubConnected: Boolean = false
 ) {
@@ -125,6 +130,7 @@ fun ChatScreen(
     val codebaseFiles by viewModel.codebaseFiles.collectAsState()
     val codebaseLoading by viewModel.codebaseLoading.collectAsState()
     val openedFileViewer by viewModel.openedFileViewer.collectAsState()
+    val manualEdits by viewModel.manualEdits.collectAsState()
     val engineHealth by viewModel.engineHealth.collectAsState()
     val terminalOutput by viewModel.terminalOutput.collectAsState()
     val processState by viewModel.processState.collectAsState()
@@ -342,15 +348,30 @@ fun ChatScreen(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    IconButton(
-                        onClick = { scope.launch { drawerState.open() } },
-                        modifier = Modifier.size(38.dp)
-                    ) {
-                        Icon(
-                            Icons.Default.Menu,
-                            contentDescription = "Conversations",
-                            tint = AppColors.textPrimary
-                        )
+                    if (!isScratch) {
+                        IconButton(
+                            onClick = onExitProjectToHome,
+                            modifier = Modifier
+                                .size(38.dp)
+                                .testTag("exit_project_button")
+                        ) {
+                            Icon(
+                                Icons.AutoMirrored.Filled.ArrowBack,
+                                contentDescription = "Back to Projects",
+                                tint = AppColors.textPrimary
+                            )
+                        }
+                    } else {
+                        IconButton(
+                            onClick = { scope.launch { drawerState.open() } },
+                            modifier = Modifier.size(38.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.Menu,
+                                contentDescription = "Conversations",
+                                tint = AppColors.textPrimary
+                            )
+                        }
                     }
 
                     Column(modifier = Modifier.weight(1f)) {
@@ -358,7 +379,10 @@ fun ChatScreen(
                         Row(
                             modifier = Modifier
                                 .clip(RoundedCornerShape(6.dp))
-                                .clickable { showProjectPicker = true }
+                                .clickable {
+                                    if (isScratch) showProjectPicker = true
+                                    else scope.launch { drawerState.open() }
+                                }
                                 .padding(horizontal = 4.dp, vertical = 2.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
@@ -374,7 +398,7 @@ fun ChatScreen(
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )
-                            Spacer(modifier = Modifier.width(4.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
                             Text(
                                 text = "~/forge/projects/${if (isScratch) "scratch" else (uiState.activeProject?.slug ?: "app")}",
                                 fontSize = 10.sp,
@@ -387,7 +411,8 @@ fun ChatScreen(
 
                         Spacer(modifier = Modifier.height(4.dp))
 
-                        // Model dropdown pill + Agent dropdown pill (`[ provider/model ⌄ ]  [ build ⌄ ]`)
+                        // Clean minimal pills: [ provider/model ⌄ ]  [ build ⌄ ]  [ Termux status ]
+                        // ("Codebase" button removed from top bar — now cleanly in Bottom Navigation Bar)
                         Row(
                             modifier = Modifier.horizontalScroll(rememberScrollState()),
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -457,47 +482,12 @@ fun ChatScreen(
                                 }
                             }
 
-                            // In-Chat Codebase Pill (always accessible, displays live green checkmark count when AI edits/creates files)
-                            val modifiedAiCount = remember(codebaseFiles) { codebaseFiles.count { it.isModifiedByAi } }
-                            Surface(
-                                shape = RoundedCornerShape(10.dp),
-                                color = if (modifiedAiCount > 0) AppColors.diffAddBg else AppColors.surface,
-                                modifier = Modifier
-                                    .border(
-                                        1.dp,
-                                        if (modifiedAiCount > 0) AppColors.ok.copy(alpha = 0.45f) else AppColors.border,
-                                        RoundedCornerShape(10.dp)
-                                    )
-                                    .clip(RoundedCornerShape(10.dp))
-                                    .clickable { showCodebaseSheet = true }
-                                    .testTag("codebase_panel_button")
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Icon(
-                                        imageVector = if (modifiedAiCount > 0) Icons.Default.CheckCircle else Icons.Default.FolderOpen,
-                                        contentDescription = "Open Codebase",
-                                        tint = if (modifiedAiCount > 0) AppColors.ok else AppColors.accent,
-                                        modifier = Modifier.size(14.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(5.dp))
-                                    Text(
-                                        text = if (modifiedAiCount > 0) "Codebase · $modifiedAiCount" else "Codebase",
-                                        fontSize = 11.5.sp,
-                                        fontWeight = FontWeight.SemiBold,
-                                        color = if (modifiedAiCount > 0) AppColors.diffAddText else AppColors.textPrimary
-                                    )
-                                }
-                            }
-
-                            // Live Termux HTTP Bridge Connection Pill (Polled every 5s via GET 127.0.0.1:47831/health)
+                            // Live Termux HTTP Bridge Status Pill
                             val isConnected = engineHealth.engineRunning
-                            val statusColor = if (isConnected) AppColors.ok else AppColors.error
+                            val statusColor = if (isConnected) AppColors.ok else AppColors.warn
                             Surface(
                                 shape = RoundedCornerShape(10.dp),
-                                color = if (isConnected) AppColors.diffAddBg else AppColors.diffRemoveBg,
+                                color = if (isConnected) AppColors.diffAddBg else AppColors.surfaceAlt,
                                 modifier = Modifier
                                     .border(1.dp, statusColor.copy(alpha = 0.40f), RoundedCornerShape(10.dp))
                                     .clip(RoundedCornerShape(10.dp))
@@ -516,28 +506,13 @@ fun ChatScreen(
                                     )
                                     Spacer(modifier = Modifier.width(5.dp))
                                     Text(
-                                        text = if (isConnected) "Connected" else "Disconnected",
+                                        text = if (isConnected) "Termux" else "Direct Mode",
                                         fontSize = 11.sp,
                                         fontWeight = FontWeight.SemiBold,
-                                        color = if (isConnected) AppColors.diffAddText else AppColors.diffRemoveText
+                                        color = if (isConnected) AppColors.diffAddText else AppColors.textSecondary
                                     )
                                 }
                             }
-                        }
-                    }
-
-                    // GitHub Actions Cloud Build trigger button
-                    if (!isScratch) {
-                        IconButton(
-                            onClick = { viewModel.pushAndBuild() },
-                            modifier = Modifier.size(36.dp)
-                        ) {
-                            Icon(
-                                Icons.Default.CloudUpload,
-                                contentDescription = "Push & Build on GitHub Actions",
-                                tint = AppColors.accent,
-                                modifier = Modifier.size(19.dp)
-                            )
                         }
                     }
 
@@ -549,74 +524,71 @@ fun ChatScreen(
                         Icon(
                             Icons.Default.Terminal,
                             contentDescription = "Open Terminal Drawer",
-                            tint = if (engineHealth.engineRunning) Color(0xFF3FB950) else Color(0xFFF85149),
+                            tint = if (engineHealth.engineRunning) AppColors.ok else AppColors.textSecondary,
                             modifier = Modifier.size(19.dp)
                         )
                     }
 
-                    // Settings Button (matches top-right gear in screenshot)
-                    IconButton(
-                        onClick = onOpenSettings,
-                        modifier = Modifier.size(36.dp)
-                    ) {
-                        Icon(
-                            Icons.Default.Settings,
-                            contentDescription = "Settings",
-                            tint = AppColors.textSecondary,
-                            modifier = Modifier.size(20.dp)
-                        )
+                    // Outer home Settings button hidden in Distraction-Free Project Mode
+                    if (isScratch) {
+                        IconButton(
+                            onClick = onOpenSettings,
+                            modifier = Modifier.size(36.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.Settings,
+                                contentDescription = "Settings",
+                                tint = AppColors.textSecondary,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
                     }
                 }
             }
 
             Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(AppColors.border))
 
-            // ---------------- Live Disconnected Alert Banner ----------------
+            // ---------------- Non-Blocking Termux Bridge Banner ----------------
             if (!engineHealth.engineRunning) {
                 Surface(
-                    color = AppColors.diffRemoveBg,
+                    color = AppColors.surfaceAlt,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .border(0.5.dp, AppColors.error.copy(alpha = 0.35f))
+                        .border(0.5.dp, AppColors.border)
                 ) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                            .padding(horizontal = 12.dp, vertical = 5.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(
-                            Icons.Default.Warning,
-                            contentDescription = "Termux Disconnected",
-                            tint = AppColors.error,
-                            modifier = Modifier.size(16.dp)
+                        Box(
+                            modifier = Modifier
+                                .size(7.dp)
+                                .clip(CircleShape)
+                                .background(AppColors.warn)
                         )
                         Spacer(modifier = Modifier.width(8.dp))
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "Termux Bridge Offline (127.0.0.1:47831)",
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = AppColors.diffRemoveText
-                            )
-                            Text(
-                                text = "Start the Python HTTP bridge in Termux to run commands.",
-                                fontSize = 11.sp,
-                                color = AppColors.textSecondary
-                            )
-                        }
-                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "Termux Offline · Direct Codebase Mode active",
+                            fontSize = 11.5.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = AppColors.textSecondary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f)
+                        )
                         TextButton(
                             onClick = { viewModel.repairEngine() },
-                            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 0.dp)
                         ) {
-                            Text("Retry", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = AppColors.accent)
+                            Text("Connect", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = AppColors.accent)
                         }
                         TextButton(
                             onClick = { showTerminalSheet = true },
-                            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 6.dp, vertical = 0.dp)
                         ) {
-                            Text("Bridge", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = AppColors.textPrimary)
+                            Text("Bridge", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = AppColors.textPrimary)
                         }
                     }
                 }
@@ -680,7 +652,9 @@ fun ChatScreen(
                         isChatMode = uiState.mode == AgentMode.CHAT,
                         onRetry = { viewModel.retryFailedMessage(message) },
                         onSwitchToBuild = { viewModel.setMode(AgentMode.BUILD) },
-                        onOpenWorkingFiles = { showCodebaseSheet = true }
+                        onOpenWorkingFiles = {
+                            if (!isScratch) onOpenCodebase() else showCodebaseSheet = true
+                        }
                     )
                 }
 
@@ -703,9 +677,10 @@ fun ChatScreen(
             if (inputText.startsWith("/") && !inputText.contains(" ")) {
                 val slashCommands = listOf(
                     "/codebase" to "Browse workspace files & code viewer",
+                    "/push" to "Push to GitHub & trigger Actions build",
+                    "/ghbuild" to "Open GitHub Actions Build monitor",
                     "/mode" to "Switch Build / Plan agent",
                     "/model" to "Open active provider Model Picker",
-                    "/build" to "Sync & trigger GitHub Actions cloud build",
                     "/files" to "Open session changed files",
                     "/terminal" to "Open Forge Terminal drawer",
                     "/clone " to "Clone a GitHub repository URL"
@@ -727,7 +702,15 @@ fun ChatScreen(
                                         .clickable {
                                             when (cmd.trim()) {
                                                 "/codebase" -> {
-                                                    showCodebaseSheet = true
+                                                    if (!isScratch) onOpenCodebase() else showCodebaseSheet = true
+                                                    inputText = ""
+                                                }
+                                                "/push" -> {
+                                                    viewModel.pushAndBuild()
+                                                    inputText = ""
+                                                }
+                                                "/ghbuild" -> {
+                                                    if (!isScratch) onOpenGhBuild() else onOpenGitHub()
                                                     inputText = ""
                                                 }
                                                 "/mode" -> {
@@ -736,10 +719,6 @@ fun ChatScreen(
                                                 }
                                                 "/model" -> {
                                                     showModelPicker = true
-                                                    inputText = ""
-                                                }
-                                                "/build" -> {
-                                                    viewModel.pushAndBuild()
                                                     inputText = ""
                                                 }
                                                 "/files" -> {
@@ -803,20 +782,13 @@ fun ChatScreen(
                             .padding(horizontal = 12.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        if (uiState.isAgentRunning) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(14.dp),
-                                strokeWidth = 2.dp,
-                                color = phaseColor
-                            )
-                        } else {
-                            Box(
-                                modifier = Modifier
-                                    .size(8.dp)
-                                    .clip(CircleShape)
-                                    .background(phaseColor)
-                            )
-                        }
+                        // Static colored indicator dot (removes redundant spinning circle loader above Send button)
+                        Box(
+                            modifier = Modifier
+                                .size(8.dp)
+                                .clip(CircleShape)
+                                .background(phaseColor)
+                        )
                         Spacer(modifier = Modifier.width(8.dp))
                         Surface(
                             shape = RoundedCornerShape(6.dp),
@@ -884,7 +856,27 @@ fun ChatScreen(
                 }
             }
 
-            // ---------------- Bottom Composer Pill (Matches Video & Screenshot) ----------------
+            // ---------------- Manual Edit Card (Strictly User-Modified Files Only) ----------------
+            if (manualEdits.isNotEmpty()) {
+                ManualEditSummaryCard(
+                    edits = manualEdits,
+                    onOpenFile = { rec ->
+                        viewModel.openCodebaseFile(
+                            CodebaseFileItem(
+                                path = rec.relativePath,
+                                name = rec.relativePath.substringAfterLast('/'),
+                                relativeDir = rec.relativePath.substringBeforeLast('/', ""),
+                                isManuallyEdited = true
+                            )
+                        )
+                        if (!isScratch) onOpenCodebase() else showCodebaseSheet = true
+                    },
+                    onDismissRecord = { rec -> viewModel.dismissManualEdit(rec.id) },
+                    onClearAll = { viewModel.clearManualEdits() }
+                )
+            }
+
+            // ---------------- Bottom Composer Pill ----------------
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -978,13 +970,13 @@ fun ChatScreen(
                                 inputText = it
                                 viewModel.saveDraftForCurrentChat(it)
                             },
-                            enabled = engineHealth.engineRunning,
+                            enabled = true,
                             placeholder = {
                                 Text(
                                     text = if (engineHealth.engineRunning) {
                                         "Type a message..."
                                     } else {
-                                        "Disconnected — Start Termux bridge on 127.0.0.1:47831..."
+                                        "Build in Codebase or ask anything..."
                                     },
                                     fontSize = 14.sp
                                 )
@@ -1003,15 +995,14 @@ fun ChatScreen(
                                 disabledTextColor = AppColors.textMuted,
                                 focusedPlaceholderColor = AppColors.textMuted,
                                 unfocusedPlaceholderColor = AppColors.textMuted,
-                                disabledPlaceholderColor = Color(0xFFF85149).copy(alpha = 0.75f)
+                                disabledPlaceholderColor = AppColors.textMuted
                             ),
                             modifier = Modifier
                                 .weight(1f)
                                 .testTag("chat_input_field")
                         )
 
-                        val canSend = engineHealth.engineRunning &&
-                            (inputText.isNotBlank() || uiState.pendingAttachments.isNotEmpty()) &&
+                        val canSend = (inputText.isNotBlank() || uiState.pendingAttachments.isNotEmpty()) &&
                             !uiState.isPreparing
                         if (uiState.isAgentRunning) {
                             // Stop Button: Warm surface circle with crisp rose-red stop square
@@ -1033,7 +1024,7 @@ fun ChatScreen(
                                 )
                             }
                         } else {
-                            // Send Button: Burnt rust-orange accent circle matching CodeForge visual identity
+                            // Send Button: Burnt rust-orange accent circle (no redundant double spinner)
                             val sendBg = if (canSend) AppColors.accent else AppColors.accent.copy(alpha = 0.38f)
                             Box(
                                 modifier = Modifier
@@ -1048,20 +1039,12 @@ fun ChatScreen(
                                     .testTag("send_message_button"),
                                 contentAlignment = Alignment.Center
                             ) {
-                                if (uiState.isPreparing) {
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.size(18.dp),
-                                        strokeWidth = 2.dp,
-                                        color = AppColors.onAccent
-                                    )
-                                } else {
-                                    Icon(
-                                        Icons.Default.Send,
-                                        contentDescription = "Send",
-                                        tint = AppColors.onAccent,
-                                        modifier = Modifier.size(19.dp)
-                                    )
-                                }
+                                Icon(
+                                    Icons.Default.Send,
+                                    contentDescription = "Send",
+                                    tint = AppColors.onAccent,
+                                    modifier = Modifier.size(19.dp)
+                                )
                             }
                         }
                     }
@@ -1851,3 +1834,143 @@ private fun ProjectPickerDialog(
         }
     }
 }
+
+/**
+ * Clean rectangular "Manual Edit" card rendered in Chat ONLY when the user has manually modified,
+ * uploaded, replaced, pasted, or deleted files in Codebase (never lists AI-agent edits).
+ * Every listed change is automatically synced into AgentEngine's prompt context.
+ */
+@Composable
+private fun ManualEditSummaryCard(
+    edits: List<com.example.data.agent.ManualEditRecord>,
+    onOpenFile: (com.example.data.agent.ManualEditRecord) -> Unit,
+    onDismissRecord: (com.example.data.agent.ManualEditRecord) -> Unit,
+    onClearAll: () -> Unit
+) {
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = AppColors.surface,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 4.dp)
+            .border(1.dp, AppColors.accent.copy(alpha = 0.40f), RoundedCornerShape(14.dp))
+            .testTag("manual_edit_card")
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 9.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    Icons.Default.Edit,
+                    contentDescription = "Manual Edit",
+                    tint = AppColors.accent,
+                    modifier = Modifier.size(15.dp)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = "Manual Edit",
+                    fontSize = 12.5.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = AppColors.textPrimary
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Surface(
+                    shape = RoundedCornerShape(6.dp),
+                    color = AppColors.accentSoft
+                ) {
+                    Text(
+                        text = "${edits.size} synced to agent",
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = AppColors.accent,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                    )
+                }
+                Spacer(modifier = Modifier.weight(1f))
+                Text(
+                    text = "Clear",
+                    fontSize = 11.5.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = AppColors.textMuted,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .clickable { onClearAll() }
+                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                        .testTag("manual_edit_clear_all")
+                )
+            }
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 126.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                for (rec in edits) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(AppColors.surfaceAlt)
+                            .clickable { onOpenFile(rec) }
+                            .padding(horizontal = 8.dp, vertical = 5.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Surface(
+                            shape = RoundedCornerShape(5.dp),
+                            color = AppColors.accentSoft
+                        ) {
+                            Text(
+                                text = rec.action.label,
+                                fontSize = 9.5.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = AppColors.accent,
+                                modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(7.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = rec.relativePath,
+                                fontSize = 11.5.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Medium,
+                                color = AppColors.textPrimary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            if (rec.diffSummary.isNotBlank()) {
+                                Text(
+                                    text = rec.diffSummary,
+                                    fontSize = 10.sp,
+                                    color = AppColors.textMuted,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+                        IconButton(
+                            onClick = { onDismissRecord(rec) },
+                            modifier = Modifier.size(26.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.Close,
+                                contentDescription = "Dismiss manual edit",
+                                tint = AppColors.textMuted,
+                                modifier = Modifier.size(14.dp)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+

@@ -50,11 +50,14 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.CodeForgeApp
+import com.example.data.repository.ProjectRepository
 import com.example.ui.navigation.Screen
 import com.example.ui.screens.analytics.AnalyticsScreen
 import com.example.ui.screens.builds.BuildLogScreen
+import com.example.ui.screens.builds.GhBuildScreen
 import com.example.ui.screens.chat.ChatScreen
 import com.example.ui.screens.chat.ChatViewModel
+import com.example.ui.screens.codebase.CodebaseScreen
 import com.example.ui.screens.diff.DiffReviewScreen
 import com.example.ui.screens.files.FilesScreen
 import com.example.ui.screens.github.GitHubScreen
@@ -72,12 +75,15 @@ fun MainScreen(
     val chatViewModel: ChatViewModel = viewModel()
     val activeProject by chatViewModel.activeProject.collectAsState()
 
+    val isInProject = activeProject != null && activeProject?.id != ProjectRepository.SCRATCH_ID
     var currentScreen by remember { mutableStateOf<Screen>(Screen.Chat) }
 
     BackHandler(enabled = currentScreen != Screen.Chat) {
         currentScreen = when (currentScreen) {
-            Screen.Files, Screen.Changes -> Screen.Projects
-            Screen.Analytics, Screen.GitHub, Screen.Providers, Screen.Builds, Screen.Onboarding -> Screen.Settings
+            Screen.Codebase, Screen.GhBuild -> Screen.Chat
+            Screen.Files, Screen.Changes -> if (isInProject) Screen.Codebase else Screen.Projects
+            Screen.Analytics, Screen.GitHub, Screen.Providers, Screen.Builds, Screen.Onboarding ->
+                if (isInProject) Screen.Chat else Screen.Settings
             else -> Screen.Chat
         }
     }
@@ -159,6 +165,9 @@ fun MainScreen(
         )
     }
 
+    // Distraction-Free Project Mode: inside a created project, show ONLY [Chat | Codebase | GH Build]
+    val navItems = if (isInProject) Screen.projectBottomNavItems else Screen.bottomNavItems
+
     Scaffold(
         modifier = modifier
             .fillMaxSize()
@@ -171,7 +180,7 @@ fun MainScreen(
                         .fillMaxWidth()
                         .background(AppColors.bg)
                         .navigationBarsPadding()
-                        .padding(horizontal = 24.dp, vertical = 8.dp),
+                        .padding(horizontal = 20.dp, vertical = 8.dp),
                     contentAlignment = Alignment.Center
                 ) {
                     Surface(
@@ -189,9 +198,11 @@ fun MainScreen(
                             horizontalArrangement = Arrangement.SpaceEvenly,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            for (screen in Screen.bottomNavItems) {
+                            for (screen in navItems) {
                                 val isSelected = currentScreen == screen ||
                                     (screen == Screen.Projects && (currentScreen == Screen.Files || currentScreen == Screen.Changes)) ||
+                                    (screen == Screen.Codebase && (currentScreen == Screen.Files || currentScreen == Screen.Changes)) ||
+                                    (screen == Screen.GhBuild && currentScreen == Screen.Builds) ||
                                     (screen == Screen.Settings && currentScreen in setOf(Screen.Analytics, Screen.GitHub, Screen.Providers, Screen.Builds, Screen.Onboarding))
                                 Surface(
                                     shape = RoundedCornerShape(999.dp),
@@ -207,7 +218,7 @@ fun MainScreen(
                                         .testTag("nav_item_${screen.route}")
                                 ) {
                                     Row(
-                                        modifier = Modifier.padding(horizontal = 18.dp, vertical = 8.dp),
+                                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
                                         Icon(
@@ -242,7 +253,7 @@ fun MainScreen(
                 targetState = currentScreen,
                 modifier = Modifier.fillMaxSize(),
                 transitionSpec = {
-                    val dur = if (app.settingsStore.reduceMotion) 0 else 220
+                    val dur = if (app.settingsStore.reduceMotion) 0 else 200
                     (fadeIn(animationSpec = tween(durationMillis = dur)) +
                         slideInVertically(animationSpec = tween(durationMillis = dur)) { it / 32 }) togetherWith
                         fadeOut(animationSpec = tween(durationMillis = dur / 2))
@@ -257,7 +268,7 @@ fun MainScreen(
                             onOpenChat = { currentScreen = Screen.Chat },
                             onOpenFiles = { proj ->
                                 chatViewModel.selectProject(proj)
-                                currentScreen = Screen.Files
+                                currentScreen = Screen.Codebase
                             },
                             onOpenChanges = { proj ->
                                 chatViewModel.selectProject(proj)
@@ -280,6 +291,12 @@ fun MainScreen(
                             onOpenGitHub = { currentScreen = Screen.GitHub },
                             onOpenDiffReview = { currentScreen = Screen.Changes },
                             onOpenSettings = { currentScreen = Screen.Settings },
+                            onOpenCodebase = { currentScreen = Screen.Codebase },
+                            onOpenGhBuild = { currentScreen = Screen.GhBuild },
+                            onExitProjectToHome = {
+                                chatViewModel.detachProjectFromChat()
+                                currentScreen = Screen.Projects
+                            },
                             githubManager = app.githubManager,
                             githubConnected = app.settingsStore.githubConnected,
                             onSetupProvider = { id ->
@@ -288,6 +305,31 @@ fun MainScreen(
                                 returnToChat = true
                                 currentScreen = Screen.Providers
                             }
+                        )
+                    }
+                    Screen.Codebase -> {
+                        CodebaseScreen(
+                            app = app,
+                            chatViewModel = chatViewModel,
+                            onOpenGhBuild = { currentScreen = Screen.GhBuild },
+                            onSendToAgent = { prompt ->
+                                currentScreen = Screen.Chat
+                                chatViewModel.sendMessage(prompt)
+                            },
+                            onOpenGitHubSettings = { currentScreen = Screen.GitHub },
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    }
+                    Screen.GhBuild -> {
+                        GhBuildScreen(
+                            app = app,
+                            chatViewModel = chatViewModel,
+                            onSendErrorToAgent = { errPrompt ->
+                                currentScreen = Screen.Chat
+                                chatViewModel.sendMessage(errPrompt)
+                            },
+                            onOpenGitHubSettings = { currentScreen = Screen.GitHub },
+                            modifier = Modifier.fillMaxSize()
                         )
                     }
                     Screen.Files -> {
@@ -313,7 +355,7 @@ fun MainScreen(
                             settings = app.settingsStore,
                             chatViewModel = chatViewModel,
                             projectRepository = app.projectRepository,
-                            onOpenBuilds = { currentScreen = Screen.Builds },
+                            onOpenBuilds = { currentScreen = Screen.GhBuild },
                             modifier = Modifier.fillMaxSize()
                         )
                     }
@@ -370,7 +412,7 @@ fun MainScreen(
                             onOpenUsage = { currentScreen = Screen.Analytics },
                             onOpenGitHub = { currentScreen = Screen.GitHub },
                             onOpenProviders = { currentScreen = Screen.Providers },
-                            onOpenBuilds = { currentScreen = Screen.Builds },
+                            onOpenBuilds = { currentScreen = Screen.GhBuild },
                             onReopenOnboarding = { currentScreen = Screen.Onboarding },
                             onPushAndBuild = {
                                 currentScreen = Screen.Chat

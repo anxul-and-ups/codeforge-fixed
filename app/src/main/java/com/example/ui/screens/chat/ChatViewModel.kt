@@ -82,14 +82,23 @@ data class CodebaseFileItem(
     val name: String,
     val relativeDir: String,
     val modifiedState: com.example.data.agent.WorkingFileState? = null,
-    val diffSummary: String? = null
+    val diffSummary: String? = null,
+    val isManuallyEdited: Boolean = false
 ) {
     val isModifiedByAi: Boolean
         get() = modifiedState == com.example.data.agent.WorkingFileState.CREATED ||
             modifiedState == com.example.data.agent.WorkingFileState.EDITED
 }
 
+data class CodebaseClipboardItem(
+    val sourceProjectId: String,
+    val sourceProjectName: String,
+    val relativePath: String,
+    val fileName: String
+)
+
 data class CodeFileViewerState(
+    val projectId: String = "",
     val path: String,
     val fileName: String,
     val content: String = "",
@@ -107,6 +116,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val chatRepo = app.chatRepository
     private val settings = app.settingsStore
     private val agentEngine = app.agentEngine
+    private val manualEditTracker = app.manualEditTracker
     val termuxBridge = app.termuxBridge
 
     val approval: StateFlow<ApprovalRequest?> = agentEngine.approvalRequest
@@ -124,37 +134,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val _codebaseLoading = MutableStateFlow(false)
     val codebaseLoading: StateFlow<Boolean> = _codebaseLoading.asStateFlow()
 
-    val codebaseFiles: StateFlow<List<CodebaseFileItem>> = combine(_rawWorkspaceFiles, workingFiles) { rawPaths, worked ->
-        val workedMap = LinkedHashMap<String, WorkingFileEntry>()
-        for (w in worked) {
-            val norm = w.path.trim().removePrefix("./").trimStart('/')
-            workedMap[norm] = w
-        }
-        val mergedPaths = LinkedHashSet<String>()
-        // Put AI-created/edited files first so green ticks are immediately visible, then all workspace files
-        for (w in worked) {
-            val norm = w.path.trim().removePrefix("./").trimStart('/')
-            if (norm.isNotBlank() && w.state != com.example.data.agent.WorkingFileState.DELETED) {
-                mergedPaths.add(norm)
-            }
-        }
-        for (p in rawPaths) {
-            val norm = p.trim().removePrefix("./").trimStart('/')
-            if (norm.isNotBlank()) mergedPaths.add(norm)
-        }
-        mergedPaths.map { rel ->
-            val w = workedMap[rel] ?: workedMap.entries.firstOrNull { rel.endsWith("/${it.key}") || it.key.endsWith("/$rel") }?.value
-            val name = rel.substringAfterLast('/')
-            val dir = rel.substringBeforeLast('/', "")
-            CodebaseFileItem(
-                path = rel,
-                name = name,
-                relativeDir = dir,
-                modifiedState = w?.state,
-                diffSummary = w?.diffSummary
-            )
-        }
-    }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+    private val _clipboardItem = MutableStateFlow<CodebaseClipboardItem?>(null)
+    val clipboardItem: StateFlow<CodebaseClipboardItem?> = _clipboardItem.asStateFlow()
+
+    private val _secondaryProject = MutableStateFlow<ProjectEntity?>(null)
+    val secondaryProject: StateFlow<ProjectEntity?> = _secondaryProject.asStateFlow()
+
+    private val _secondaryFiles = MutableStateFlow<List<CodebaseFileItem>>(emptyList())
+    val secondaryFiles: StateFlow<List<CodebaseFileItem>> = _secondaryFiles.asStateFlow()
 
     private val _openedFileViewer = MutableStateFlow<CodeFileViewerState?>(null)
     val openedFileViewer: StateFlow<CodeFileViewerState?> = _openedFileViewer.asStateFlow()
@@ -171,6 +158,47 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         .map { it.activeProject }
         .distinctUntilChanged()
         .stateIn(viewModelScope, SharingStarted.Eagerly, null)
+
+    /** Manual edits made ONLY by the user for the active project (never AI edits). */
+    val manualEdits: StateFlow<List<com.example.data.agent.ManualEditRecord>> =
+        combine(activeProject, manualEditTracker.records) { proj, _ ->
+            if (proj == null) emptyList() else manualEditTracker.editsForProject(proj.id)
+        }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    val codebaseFiles: StateFlow<List<CodebaseFileItem>> =
+        combine(_rawWorkspaceFiles, workingFiles, manualEdits) { rawPaths, worked, manualList ->
+            val workedMap = LinkedHashMap<String, WorkingFileEntry>()
+            for (w in worked) {
+                val norm = w.path.trim().removePrefix("./").trimStart('/')
+                workedMap[norm] = w
+            }
+            val manualPaths = manualList.map { it.relativePath }.toSet()
+            val mergedPaths = LinkedHashSet<String>()
+            // Put AI-created/edited files first so green ticks are immediately visible, then all workspace files
+            for (w in worked) {
+                val norm = w.path.trim().removePrefix("./").trimStart('/')
+                if (norm.isNotBlank() && w.state != com.example.data.agent.WorkingFileState.DELETED) {
+                    mergedPaths.add(norm)
+                }
+            }
+            for (p in rawPaths) {
+                val norm = p.trim().removePrefix("./").trimStart('/')
+                if (norm.isNotBlank()) mergedPaths.add(norm)
+            }
+            mergedPaths.map { rel ->
+                val w = workedMap[rel] ?: workedMap.entries.firstOrNull { rel.endsWith("/${it.key}") || it.key.endsWith("/$rel") }?.value
+                val name = rel.substringAfterLast('/')
+                val dir = rel.substringBeforeLast('/', "")
+                CodebaseFileItem(
+                    path = rel,
+                    name = name,
+                    relativeDir = dir,
+                    modifiedState = w?.state,
+                    diffSummary = w?.diffSummary,
+                    isManuallyEdited = rel in manualPaths
+                )
+            }
+        }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     private val activeProjectId = MutableStateFlow<String?>(null)
     private val activeConversationId = MutableStateFlow<String?>(null)
@@ -414,10 +442,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 val proj = _uiState.value.activeProject
                 val hasProject = proj != null && proj.id != com.example.data.repository.ProjectRepository.SCRATCH_ID
-                val rootPath = activeWorkspaceDirPath()
-                val found = mutableListOf<String>()
+                val found = LinkedHashSet<String>()
 
-                if (termuxBridge.status.value.engineRunning) {
+                // 1. Always read local Codebase files first (instant, works offline & directly reflects AI + manual edits)
+                if (proj != null) {
+                    val localFiles = projectRepo.listAllRelativeFiles(proj.id)
+                    found.addAll(localFiles)
+                }
+
+                // 2. If in scratch mode or Termux is online, also include Termux files when local list is empty
+                if ((found.isEmpty() || !hasProject) && termuxBridge.status.value.engineRunning) {
+                    val rootPath = activeWorkspaceDirPath()
                     val escaped = "'" + rootPath.replace("'", "'\"'\"'") + "'"
                     val cmd = "if [ -d $escaped ]; then cd $escaped && " +
                         "if command -v rg >/dev/null 2>&1; then " +
@@ -433,21 +468,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             .forEach { found.add(it) }
                     }
                 }
-
-                // Fallback to local project file tree when Termux bridge returned empty
-                if (found.isEmpty() && hasProject && proj != null) {
-                    withContext(Dispatchers.IO) {
-                        val tree = projectRepo.getFileTree(proj.id)
-                        fun collect(node: com.example.domain.model.FileNode) {
-                            for (c in node.children) {
-                                if (c.isDirectory) collect(c)
-                                else if (c.path.isNotBlank()) found.add(c.path)
-                            }
-                        }
-                        if (tree != null) collect(tree)
-                    }
-                }
-                _rawWorkspaceFiles.value = found.distinct().sorted()
+                _rawWorkspaceFiles.value = found.sorted()
+                refreshSecondaryCodebaseFiles()
             } catch (_: Exception) {
                 // Keep existing list on transient scan error
             } finally {
@@ -456,8 +478,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun openCodebaseFile(item: CodebaseFileItem) {
+    fun openCodebaseFile(item: CodebaseFileItem, projectIdOverride: String? = null) {
+        val targetProjId = projectIdOverride ?: _uiState.value.activeProject?.id ?: com.example.data.repository.ProjectRepository.SCRATCH_ID
         _openedFileViewer.value = CodeFileViewerState(
+            projectId = targetProjId,
             path = item.path,
             fileName = item.name,
             isLoading = true,
@@ -465,23 +489,26 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             diffSummary = item.diffSummary
         )
         viewModelScope.launch {
-            val proj = _uiState.value.activeProject
-            val hasProject = proj != null && proj.id != com.example.data.repository.ProjectRepository.SCRATCH_ID
-            val rootPath = activeWorkspaceDirPath()
             val clean = item.path.trim().removePrefix("./")
-            val candidatePaths = buildList {
-                if (clean.startsWith("/")) add(clean)
-                else {
-                    add("$rootPath/$clean")
-                    val homePath = "${com.example.data.termux.TermuxBridge.TERMUX_HOME}/$clean"
-                    if (homePath != "$rootPath/$clean") add(homePath)
+            var loaded: String? = withContext(Dispatchers.IO) {
+                try {
+                    projectRepo.readFile(targetProjId, clean)
+                } catch (_: Exception) {
+                    null
                 }
             }
-
-            var loaded: String? = null
             var lastErr: String? = null
 
-            if (termuxBridge.status.value.engineRunning) {
+            if (loaded == null && projectIdOverride == null && termuxBridge.status.value.engineRunning) {
+                val rootPath = activeWorkspaceDirPath()
+                val candidatePaths = buildList {
+                    if (clean.startsWith("/")) add(clean)
+                    else {
+                        add("$rootPath/$clean")
+                        val homePath = "${com.example.data.termux.TermuxBridge.TERMUX_HOME}/$clean"
+                        if (homePath != "$rootPath/$clean") add(homePath)
+                    }
+                }
                 for (abs in candidatePaths) {
                     val escaped = "'" + abs.replace("'", "'\"'\"'") + "'"
                     val pyCmd = "python3 -c \"import base64,pathlib,sys; p=pathlib.Path($escaped); " +
@@ -500,18 +527,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
 
-            if (loaded == null && hasProject && proj != null) {
-                loaded = withContext(Dispatchers.IO) {
-                    try {
-                        projectRepo.readFile(proj.id, clean)
-                    } catch (_: Exception) {
-                        null
-                    }
-                }
-            }
-
             _openedFileViewer.value = if (loaded != null) {
                 CodeFileViewerState(
+                    projectId = targetProjId,
                     path = item.path,
                     fileName = item.name,
                     content = loaded,
@@ -521,6 +539,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 )
             } else {
                 CodeFileViewerState(
+                    projectId = targetProjId,
                     path = item.path,
                     fileName = item.name,
                     isLoading = false,
@@ -534,6 +553,260 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun closeCodebaseFile() {
         _openedFileViewer.value = null
+    }
+
+    /** Saves a user's manual edit inside the Codebase file viewer and records it in ManualEditTracker. */
+    fun saveManualFileEdit(projectId: String, relativePath: String, newContent: String) {
+        viewModelScope.launch {
+            try {
+                val oldContent = withContext(Dispatchers.IO) {
+                    try { projectRepo.readFile(projectId, relativePath) } catch (_: Exception) { null }
+                }
+                projectRepo.writeFile(projectId, relativePath, newContent)
+                manualEditTracker.recordManualEdit(
+                    projectId = projectId,
+                    relativePath = relativePath,
+                    action = com.example.data.agent.ManualEditAction.EDITED,
+                    oldContent = oldContent,
+                    newContent = newContent
+                )
+                _openedFileViewer.update { cur ->
+                    if (cur != null && cur.path == relativePath && cur.projectId == projectId) {
+                        cur.copy(content = newContent)
+                    } else cur
+                }
+                refreshCodebaseFiles()
+                _uiState.update { it.copy(failoverNotice = "✓ Saved manual edit to $relativePath (synced to agent)") }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(failoverNotice = "⚠️ Save failed: ${e.message}") }
+            }
+        }
+    }
+
+    /** Uploads a file from Android SAF [uri] into [projectId] (optionally inside [folderPrefix]) and records Manual Edit. */
+    fun uploadFileToCodebase(projectId: String, uri: Uri, folderPrefix: String = "") {
+        viewModelScope.launch {
+            try {
+                val rawName = projectRepo.queryDisplayName(uri) ?: uri.lastPathSegment?.substringAfterLast('/') ?: "uploaded_file"
+                val cleanFolder = folderPrefix.trim().trim('/')
+                val relPath = if (cleanFolder.isEmpty()) rawName else "$cleanFolder/$rawName"
+                if (rawName.lowercase().endsWith(".zip")) {
+                    val report = projectRepo.extractZipUriIntoProject(projectId, uri, cleanFolder.ifEmpty { null })
+                    for (p in report.replacedFiles) {
+                        manualEditTracker.recordManualEdit(projectId, p, com.example.data.agent.ManualEditAction.REPLACED)
+                    }
+                    for (p in report.addedFiles) {
+                        manualEditTracker.recordManualEdit(projectId, p, com.example.data.agent.ManualEditAction.UPLOADED)
+                    }
+                    refreshCodebaseFiles()
+                    _uiState.update { it.copy(failoverNotice = "✓ Unzipped $rawName: ${report.replacedFiles.size} replaced, ${report.addedFiles.size} added") }
+                    return@launch
+                }
+                val (oldText, newText) = projectRepo.importFileFromUri(projectId, relPath, uri)
+                manualEditTracker.recordManualEdit(
+                    projectId = projectId,
+                    relativePath = relPath,
+                    action = if (oldText != null) com.example.data.agent.ManualEditAction.REPLACED else com.example.data.agent.ManualEditAction.UPLOADED,
+                    oldContent = oldText,
+                    newContent = newText
+                )
+                refreshCodebaseFiles()
+                _uiState.update { it.copy(failoverNotice = "✓ Uploaded $relPath") }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(failoverNotice = "⚠️ Upload failed: ${e.message}") }
+            }
+        }
+    }
+
+    /** Long-press Replace: overwrites [targetRelativePath] with the chosen file from Android storage & records Manual Edit. */
+    fun replaceCodebaseFile(projectId: String, targetRelativePath: String, uri: Uri) {
+        viewModelScope.launch {
+            try {
+                val (oldText, newText) = projectRepo.importFileFromUri(projectId, targetRelativePath, uri)
+                manualEditTracker.recordManualEdit(
+                    projectId = projectId,
+                    relativePath = targetRelativePath,
+                    action = com.example.data.agent.ManualEditAction.REPLACED,
+                    oldContent = oldText,
+                    newContent = newText
+                )
+                refreshCodebaseFiles()
+                _uiState.update { it.copy(failoverNotice = "✓ Replaced $targetRelativePath (synced to agent)") }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(failoverNotice = "⚠️ Replace failed: ${e.message}") }
+            }
+        }
+    }
+
+    fun deleteCodebaseFileManually(projectId: String, relativePath: String) {
+        viewModelScope.launch {
+            try {
+                val oldContent = withContext(Dispatchers.IO) {
+                    try { projectRepo.readFile(projectId, relativePath) } catch (_: Exception) { null }
+                }
+                projectRepo.deleteFile(projectId, relativePath)
+                manualEditTracker.recordManualEdit(
+                    projectId = projectId,
+                    relativePath = relativePath,
+                    action = com.example.data.agent.ManualEditAction.DELETED,
+                    oldContent = oldContent,
+                    newContent = null
+                )
+                refreshCodebaseFiles()
+                _uiState.update { it.copy(failoverNotice = "Deleted $relativePath") }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(failoverNotice = "⚠️ Delete failed: ${e.message}") }
+            }
+        }
+    }
+
+    fun copyFileToClipboard(projectId: String, projectName: String, relativePath: String) {
+        _clipboardItem.value = CodebaseClipboardItem(
+            sourceProjectId = projectId,
+            sourceProjectName = projectName,
+            relativePath = relativePath,
+            fileName = relativePath.substringAfterLast('/')
+        )
+        _uiState.update { it.copy(failoverNotice = "Copied ${relativePath.substringAfterLast('/')} to Codebase clipboard") }
+    }
+
+    fun clearClipboard() {
+        _clipboardItem.value = null
+    }
+
+    fun pasteClipboardInto(destProjectId: String, destFolder: String = "") {
+        val clip = _clipboardItem.value ?: return
+        viewModelScope.launch {
+            try {
+                val cleanFolder = destFolder.trim().trim('/')
+                val destRelPath = if (cleanFolder.isEmpty()) clip.fileName else "$cleanFolder/${clip.fileName}"
+                val (oldText, newText) = projectRepo.copyFileBetweenProjects(
+                    sourceProjectId = clip.sourceProjectId,
+                    sourceRelPath = clip.relativePath,
+                    destProjectId = destProjectId,
+                    destRelPath = destRelPath
+                )
+                manualEditTracker.recordManualEdit(
+                    projectId = destProjectId,
+                    relativePath = destRelPath,
+                    action = com.example.data.agent.ManualEditAction.PASTED,
+                    oldContent = oldText,
+                    newContent = newText
+                )
+                refreshCodebaseFiles()
+                _uiState.update { it.copy(failoverNotice = "✓ Pasted ${clip.fileName} into ${if (cleanFolder.isEmpty()) "root" else cleanFolder}") }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(failoverNotice = "⚠️ Paste failed: ${e.message}") }
+            }
+        }
+    }
+
+    fun openSecondaryCodebase(project: ProjectEntity) {
+        _secondaryProject.value = project
+        refreshSecondaryCodebaseFiles()
+    }
+
+    fun createSecondaryCodebase(name: String) {
+        viewModelScope.launch {
+            try {
+                val proj = projectRepo.createProject(name.trim().ifBlank { "Secondary Codebase" }, "Empty")
+                _secondaryProject.value = proj
+                refreshSecondaryCodebaseFiles()
+            } catch (e: Exception) {
+                _uiState.update { it.copy(failoverNotice = "⚠️ Could not create secondary codebase: ${e.message}") }
+            }
+        }
+    }
+
+    fun closeSecondaryCodebase() {
+        _secondaryProject.value = null
+        _secondaryFiles.value = emptyList()
+    }
+
+    fun refreshSecondaryCodebaseFiles() {
+        val sec = _secondaryProject.value ?: return
+        viewModelScope.launch {
+            try {
+                val rels = projectRepo.listAllRelativeFiles(sec.id)
+                val manualPaths = manualEditTracker.editsForProject(sec.id).map { it.relativePath }.toSet()
+                _secondaryFiles.value = rels.map { rel ->
+                    CodebaseFileItem(
+                        path = rel,
+                        name = rel.substringAfterLast('/'),
+                        relativeDir = rel.substringBeforeLast('/', ""),
+                        isManuallyEdited = rel in manualPaths
+                    )
+                }
+            } catch (_: Exception) {
+                // ignore
+            }
+        }
+    }
+
+    fun downloadSingleFileToUri(projectId: String, relativePath: String, destUri: Uri) {
+        viewModelScope.launch {
+            try {
+                projectRepo.exportSingleFileToUri(projectId, relativePath, destUri)
+                _uiState.update { it.copy(failoverNotice = "✓ Downloaded ${relativePath.substringAfterLast('/')}") }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(failoverNotice = "⚠️ Download failed: ${e.message}") }
+            }
+        }
+    }
+
+    fun downloadProjectZipToUri(projectId: String, destUri: Uri) {
+        viewModelScope.launch {
+            try {
+                val count = projectRepo.exportProjectZipToUri(projectId, destUri)
+                _uiState.update { it.copy(failoverNotice = "✓ Exported $count file(s) to ZIP archive") }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(failoverNotice = "⚠️ ZIP export failed: ${e.message}") }
+            }
+        }
+    }
+
+    fun dismissManualEdit(recordId: String) {
+        manualEditTracker.dismissRecord(recordId)
+    }
+
+    fun clearManualEdits() {
+        val proj = _uiState.value.activeProject ?: return
+        manualEditTracker.clearForProject(proj.id)
+    }
+
+    fun activeProjectRootFile(): File? {
+        val proj = _uiState.value.activeProject ?: return null
+        return File(proj.rootPath)
+    }
+
+    fun pushActiveProjectToGitHub(repoInput: String, commitMessage: String, onDone: (Boolean, String) -> Unit = { _, _ -> }) {
+        val proj = _uiState.value.activeProject ?: return
+        viewModelScope.launch {
+            try {
+                val repo = app.gitHubRepository.normalizeRepo(repoInput)
+                if (repo.isBlank() || !repo.contains("/")) {
+                    onDone(false, "Enter repository as owner/repo")
+                    return@launch
+                }
+                settings.linkRepo(proj.id, repo)
+                val res = app.githubManager.push(
+                    projectId = proj.id,
+                    repo = repo,
+                    deleteExtra = false,
+                    message = commitMessage.ifBlank { "Update from CodeForge" }
+                )
+                val desc = app.githubManager.describe(res, repo)
+                if (!res.noChanges) {
+                    app.githubManager.watchBuild(proj.name, repo, res.commitSha)
+                }
+                _uiState.update { it.copy(failoverNotice = "✓ $desc") }
+                onDone(true, desc)
+            } catch (e: Exception) {
+                val err = e.message ?: "Push failed"
+                _uiState.update { it.copy(failoverNotice = "⚠️ $err") }
+                onDone(false, err)
+            }
+        }
     }
 
     // ---------------------------------------------------------------------------------------
@@ -666,6 +939,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     ?: chatRepo.createConversation(project.id, "New Chat")
             }
             setActiveConversation(conv.id)
+            refreshCodebaseFiles()
         }
     }
 
@@ -994,6 +1268,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
+        val trimmedInput = promptText.trim()
+        if (attachments.isEmpty() && (trimmedInput.equals("/push", ignoreCase = true) || trimmedInput.equals("/build", ignoreCase = true))) {
+            saveDraftForCurrentChat("")
+            pushAndBuild()
+            return
+        }
+
         saveDraftForCurrentChat("")
 
         val images = attachments.filter { it.isImage }.mapNotNull { it.base64Data }
@@ -1039,10 +1320,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val sent = chatRepo.addUserMessage(conv.id, display, status = "SENDING")
             var projectId = proj.id
+            var finalPrompt = prompt
             if (zip != null) {
-                _uiState.update { it.copy(currentAgentStatus = "Importing ${zip.name}…") }
+                _uiState.update { it.copy(currentAgentStatus = "Extracting ${zip.name}…") }
                 try {
-                    projectId = importZipKeepingChat(zip.uri, zip.name).id
+                    if (proj.id != com.example.data.repository.ProjectRepository.SCRATCH_ID) {
+                        // Extract & replace matching files directly inside the active project!
+                        val report = projectRepo.extractZipUriIntoProject(proj.id, zip.uri)
+                        refreshCodebaseFiles()
+                        finalPrompt = buildString {
+                            append(prompt)
+                            append("\n\n[Extracted ZIP \"${zip.name}\" into active project \"${proj.name}\"]\n")
+                            append(report.toReadableSummary())
+                        }
+                    } else {
+                        projectId = importZipKeepingChat(zip.uri, zip.name).id
+                    }
                 } catch (e: kotlinx.coroutines.CancellationException) {
                     throw e
                 } catch (e: Throwable) {
@@ -1058,7 +1351,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 RunRequest(
                     projectId = projectId,
                     conversationId = conv.id,
-                    userPrompt = prompt,
+                    userPrompt = finalPrompt,
                     imagesBase64 = images,
                     docs = docs,
                     mode = mode,

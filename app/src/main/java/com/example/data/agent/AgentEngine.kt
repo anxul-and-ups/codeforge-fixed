@@ -64,7 +64,8 @@ sealed class AgentEvent {
 enum class AgentMode { CHAT, BUILD }
 
 private val READ_ONLY_TOOLS = setOf(
-    "list_files", "find_files", "read_file", "search_code", "discover_skills_and_repos", "run_command", "ask_user"
+    "list_files", "find_files", "read_file", "search_code", "discover_skills_and_repos",
+    "web_search", "list_localhost_servers", "run_command", "ask_user"
 )
 
 enum class WorkingFileState(val label: String) {
@@ -145,7 +146,10 @@ class AgentEngine(
     private val termuxBridge: TermuxBridge,
     private val settings: SettingsStore,
     private val buildLogStore: BuildLogStore,
-    private val githubManager: GitHubManager
+    private val githubManager: GitHubManager,
+    private val manualEditTracker: ManualEditTracker = ManualEditTracker(),
+    private val webSearchClient: com.example.data.api.WebSearchClient = com.example.data.api.WebSearchClient(),
+    private val localhostServerManager: com.example.data.termux.LocalhostServerManager = com.example.data.termux.LocalhostServerManager()
 ) {
     private val _agentEvents = MutableSharedFlow<AgentEvent>(extraBufferCapacity = 8192)
     val agentEvents = _agentEvents.asSharedFlow()
@@ -793,55 +797,80 @@ HOW TO UNDERSTAND THE USER
             emptyList()
         }
         val liveTermuxSkills = getCachedTermuxSkillsAndRefreshAsync()
+        val termuxOnline = termuxBridge.status.value.engineRunning
+        val manualEditsBlock = manualEditTracker.buildAgentContextBlock(projectId)
+        val activeServersSummary = localhostServerManager.formatActiveServers()
+        val projectFilesPreview = try {
+            val rels = projectRepository.listAllRelativeFiles(projectId)
+            if (rels.isEmpty()) "" else {
+                val shown = rels.take(60).joinToString(", ")
+                val extra = if (rels.size > 60) " (+${rels.size - 60} more)" else ""
+                "Active Codebase files (${rels.size}): $shown$extra"
+            }
+        } catch (_: Exception) { "" }
+
+        val envModeLine = if (termuxOnline) {
+            "Environment: Termux HTTP Bridge ONLINE (127.0.0.1:47831) + Direct Local Codebase synced for project \"$projectName\"."
+        } else {
+            "Environment: Direct Local Codebase Mode ACTIVE (Termux bridge offline). All file tools (`write_file`, `edit_file`, `apply_patch`, `read_file`, `list_files`, `find_files`, `search_code`, `extract_and_replace_zip`, `github_push`, `web_search`) work DIRECTLY inside the Codebase without needing Termux!"
+        }
 
         val bridgeMandate = """
-CRITICAL CLOUD CODE ENGINE ARCHITECTURE (TERMUX HTTP BRIDGE)
-- You are CodeForge v2 — a deterministic Cloud Code Engine controlling the user's real Termux environment via HTTP Bridge (`http://127.0.0.1:47831/exec`, cwd `/data/data/com.termux/files/home`).
-- NEVER assume or inspect Android's app sandbox (`/data/data/com.aistudio...`). Everything lives in Termux (`/data/data/com.termux/files/home`).
-- SURGICAL CODE PATCHING & FILE CREATION:
-  1. ALWAYS call `read_file` before editing any existing file.
-  2. Prefer minimal, surgical diffs using `apply_patch` (unified diff `@@` hunks), `edit_file` (exact/whitespace/indent-tolerant snippet replacement), `replace_line_range`, or `insert_after_line` for targeted fixes and refactors.
-  3. Use `write_file` freely to create new files or perform full file writes when writing a complete file from scratch or replacing most of a file.
-- INDEXED FILE DISCOVERY & NAVIGATION:
-  1. Use `find_files` (ripgrep/glob indexed search) to locate target files in deep directories accurately.
-  2. Use `search_code` (ripgrep regex search with file globs & context) to pinpoint exact functions, classes, or symbols before reading/patching.
-- TERMUX INSTALLED SKILLS & REPOSITORIES MASTERY:
-  1. When the user mentions an installed skill or repo (e.g., "is repo ka use karke...", "rea skill chalao", "mere repo se ye karo"), FIRST call `discover_skills_and_repos(query="...")` to automatically locate it across `~`, `~/forge/tools`, `~/forge/projects`, `~/.claude/skills`, `~/.agents/skills`, `~/.codex/skills` and read its `SKILL.md` / `AGENTS.md` / `README.md`.
-  2. Follow the exact commands, flags, virtualenvs, and workflows defined in that repo/skill's `SKILL.md` or `README.md`.
-  3. If `discover_skills_and_repos` cannot find the repo/skill or multiple matches exist, immediately call `ask_user` to ask the user for the exact folder path or permission.
-- NON-BLOCKING EXECUTION DISCIPLINE:
-  1. Default command timeout is 120s (pass `timeout` up to 1800s for builds/installs). Never run interactive prompts (`read`, `vim`, `nano`, `less`) or blocking servers in the foreground — use non-interactive flags (`-y`, `--yes`) and `nohup ... > out.log 2>&1 &` for daemons.
-  2. If the bridge returns a real connection/auth error (401, 404, ECONNREFUSED), report it clearly and STOP. Do not loop.
+CLAUDE CODE-LEVEL ENGINEERING & DEBUGGING ARCHITECTURE
+- You are CodeForge — an expert senior Android (Kotlin/Java/Gradle), Web (HTML/CSS/JS/TS), Python, and Termux systems engineer.
+- $envModeLine
+- PERSISTENT CONTEXT MEMORY:
+  - Always stay strictly anchored to the active project ("$projectName"), the user's ongoing task, and prior turns in this conversation. Never forget the active project or reset context mid-conversation.
+  - Whenever the user manually modifies files in Codebase, those exact diffs appear in USER MANUAL EDITS below — always inspect and respect them.
+- CLAUDE CODE-LEVEL DEBUGGING WORKFLOW:
+  1. Inspect first: use `list_files`, `find_files`, `search_code`, and `read_file` to understand the exact code, build config, imports, and call graph before editing.
+  2. Pinpoint root cause: diagnose the exact root cause for Android (Gradle/KSP/Compose/Manifest/Kotlin), web, or backend errors rather than guessing.
+  3. Minimal surgical edits: ALWAYS prefer `apply_patch` (unified diff), `edit_file`, `replace_line_range`, or `insert_after_line` on existing files. NEVER blindly rewrite entire working files. Use `write_file` when creating new files or building a new project directly inside Codebase.
+  4. Clear final summary: end with a concise structured breakdown of **Root Cause**, **What Was Fixed** (exact files & changes), and **Next/Verification** steps.
+- DIRECT CODEBASE GENERATION (WITHOUT TERMUX):
+  - When the user asks to build an app, website, or write code directly (or when Termux is offline), create and organize all files directly in the Codebase using `write_file` with clean relative paths (e.g., `index.html`, `styles.css`, `app.js`, or `app/src/main/...`). For HTML/CSS/JS projects, ensure `index.html` links relative `./styles.css` and `./app.js` cleanly so the in-app WebView Preview renders immediately.
+- WEB SEARCH VS TERMUX LOCAL SEARCH (CRITICAL SEPARATION):
+  - NEVER use `find_files`, `search_code`, or `discover_skills_and_repos` when the user asks about an external GitHub repository, online library, tool, or documentation (e.g., `morluto/rea`, npm/pip packages, API docs).
+  - ALWAYS use `web_search` for external repositories, documentation, and installation instructions.
+  - Use `discover_skills_and_repos` ONLY for repos/skills already installed locally in Termux.
+- ZIP EXTRACTION & REPLACEMENT:
+  - When the user provides a `.zip` file path in Termux/storage (or attaches a `.zip`), use `extract_and_replace_zip` to unzip, inspect contents, and accurately replace matching files in the project directory.
+- TERMUX MASTER, LOCALHOST SERVERS & NETWORK AUTO-FIX:
+  - You have deep Termux ARM64 expertise (pkg/apt, python, node, git, build tools, storage permissions, non-interactive flags `-y`).
+  - LOCALHOST WEB HOSTING: When asked to host/serve a site locally in Termux, create/verify the files, call `start_localhost_server(port=..., cwd=...)` which launches in the background and tracks its PID, and return the active `http://localhost:<port>` URL. When the user asks to stop the server, call `stop_localhost_server` to cleanly terminate the tracked PID.
+  - NETWORK & MIRROR AUTO-FIX: If Termux encounters connection errors with GitHub or package repositories (IPv6 stalls, DNS failures, `Failed to connect`, dead apt/pkg mirrors), FIRST call `ask_user` to ask the user's permission to apply a network/mirror fix, and once approved, automatically force IPv4 (`curl -4`, `git -c http.version=HTTP/1.1` / `-4`), switch Termux mirrors (`termux-change-repo` or update `${'$'}PREFIX/etc/apt/sources.list`), or fix DNS settings.
+- NON-BLOCKING EXECUTION:
+  - Never run interactive prompts (`read`, `vim`, `nano`, `less`) or foreground servers in `run_command`.
+  - If a path, repo, or requirement is ambiguous, call `ask_user` instead of guessing or looping.
         """.trimIndent()
 
         if (mode == AgentMode.CHAT) {
             sb.append(
                 """
-You are CodeForge v2 in PLAN / CHAT MODE (read-only analysis & Termux inspection) connected via `http://127.0.0.1:47831/exec`. Active workspace: "$projectName"${if (hasProject) "" else " (Termux Home `/data/data/com.termux/files/home`)"}.
+You are CodeForge in PLAN / CHAT MODE (read-only analysis, debugging diagnosis, and web research). Active workspace: "$projectName".
 
 $bridgeMandate
 
 $understand
 
 CHAT/PLAN MODE RULES
-- Inspect files, discover repos/skills (`discover_skills_and_repos`, `find_files`, `search_code`, `read_file`), and run read-only Termux checks via `run_command`.
-- If the user asks to patch files, explain the surgical plan or remind them to switch the header pill to `build` mode.
+- Inspect files, search code, run `web_search`, and check `list_localhost_servers`.
+- If the user asks to modify files, explain the exact surgical plan or remind them to switch to `build` mode.
                 """.trimIndent()
             )
         } else {
             sb.append(
                 """
-You are CodeForge v2 in BUILD MODE: an autonomous Cloud Code Engine controlling the user's real Termux environment via `http://127.0.0.1:47831/exec`. Active workspace: "$projectName"${if (hasProject) "" else " (Termux Home `/data/data/com.termux/files/home`)"}.
+You are CodeForge in BUILD MODE: an autonomous Claude Code-level software engineering agent. Active workspace: "$projectName".
 
 $bridgeMandate
 
 $understand
 
 BUILD MODE WORKFLOW
-1. Discover first: use `discover_skills_and_repos`, `find_files`, and `search_code` to pinpoint exact paths and line numbers.
-2. Read before patching: call `read_file` on the target range, then apply a minimal surgical patch using `apply_patch`, `edit_file`, `replace_line_range`, or `insert_after_line`.
-3. Verify: run tests, linters, or the target CLI/repo tool via `run_command` or `run_installed_tool` to verify the fix.
-4. When finished, write a concise summary in the user's language and call `finish`.
+1. Inspect & diagnose: use `list_files`, `find_files`, `search_code`, `read_file`, or `web_search` (for external repos/docs).
+2. Apply minimal surgical fixes (`apply_patch`, `edit_file`, `replace_line_range`, `insert_after_line`) or build new files directly in Codebase (`write_file`).
+3. Verify changes and present a crisp summary (Root Cause / What Was Fixed / Verification), then call `finish`.
                 """.trimIndent()
             )
         }
@@ -855,21 +884,29 @@ PROGRESS NOTES (shown in Activity Timeline, ALWAYS in English)
 - In your first reply of a task, begin with a line "TITLE: " plus a 3-8 word English title.
 
 RULES
-- Default working directory in Termux is `/data/data/com.termux/files/home`.
-- For simple checks, run ONE single command, read STDOUT, and answer immediately. NEVER repeat a command that already succeeded.
 - Never read or print secrets (.env, keystores, google-services.json).
+- Never repeat a command that already succeeded.
             """.trimIndent()
         )
 
+        if (projectFilesPreview.isNotBlank()) {
+            sb.append("\n\nACTIVE WORKSPACE SNAPSHOT:\n").append(projectFilesPreview)
+        }
+        if (manualEditsBlock.isNotBlank()) {
+            sb.append("\n\n").append(manualEditsBlock)
+        }
+        if (localhostServerManager.servers.value.isNotEmpty()) {
+            sb.append("\n\n").append(activeServersSummary)
+        }
         if (agentMemory.isNotBlank()) {
             sb.append("\n\nPROJECT MEMORY (AGENT.md):\n").append(agentMemory)
         }
         if (liveTermuxSkills.isNotBlank()) {
-            sb.append("\n\nDISCOVERED TERMUX REPOS & SKILLS (live snapshot — call `discover_skills_and_repos` for full SKILL.md/README.md):\n")
+            sb.append("\n\nDISCOVERED TERMUX REPOS & SKILLS (local snapshot — call `discover_skills_and_repos` for full SKILL.md/README.md):\n")
             sb.append(liveTermuxSkills)
         }
         if (installedTools.isNotEmpty()) {
-            sb.append("\n\nREGISTERED TOOLS IN APP DB (invoke via `run_installed_tool` or `run_command`):\n")
+            sb.append("\n\nREGISTERED TOOLS IN APP DB:\n")
             installedTools.forEach { t ->
                 sb.append("- **${t.name}** (id=`${t.id}`, type=${t.type}): entry=`${t.entryCommand}` in `${t.installPath}` — ${t.description}\n")
             }
@@ -1225,7 +1262,21 @@ RULES
                             else -> 90_000L
                         }
                         withTimeoutOrNull(hardTimeoutMs) {
-                            executeTool(req.projectId, call, req.mode, readFilesInRun)
+                            executeTool(
+                                projectId = req.projectId,
+                                call = call,
+                                mode = req.mode,
+                                readFilesInRun = readFilesInRun,
+                                onReasoningTrace = { traceLine ->
+                                    if (reasoningAll.isNotEmpty()) reasoningAll.append("\n")
+                                    reasoningAll.append(traceLine)
+                                    _agentEvents.tryEmit(
+                                        AgentEvent.ReasoningChunk(
+                                            if (reasoningAll.length == traceLine.length) traceLine else "\n$traceLine"
+                                        )
+                                    )
+                                }
+                            )
                         } ?: ToolResult(
                             text = "Tool `${call.name}` timed out after ${hardTimeoutMs / 1000}s and was safely aborted so the loop can continue.",
                             isError = true,
@@ -1465,9 +1516,9 @@ RULES
 
     private fun inferStepType(toolName: String): String = when (toolName) {
         "read_file", "list_files" -> "READ"
-        "search_code", "find_files", "discover_skills_and_repos" -> "SEARCH"
-        "apply_patch", "edit_file", "write_file", "insert_after_line", "replace_line_range", "delete_file", "move_file" -> "EDIT"
-        "run_command", "git_clone", "install_repo_tool", "run_installed_tool" -> "CMD"
+        "search_code", "find_files", "discover_skills_and_repos", "web_search" -> "SEARCH"
+        "apply_patch", "edit_file", "write_file", "insert_after_line", "replace_line_range", "delete_file", "move_file", "extract_and_replace_zip" -> "EDIT"
+        "run_command", "git_clone", "install_repo_tool", "run_installed_tool", "start_localhost_server", "stop_localhost_server", "list_localhost_servers", "github_push" -> "CMD"
         "plan" -> "PLAN"
         "ask_user" -> "ASK"
         else -> "TOOL"
@@ -1475,8 +1526,8 @@ RULES
 
     private fun inferProcessPhase(toolName: String): AgentProcessPhase = when (toolName) {
         "plan" -> AgentProcessPhase.PLANNING
-        "find_files", "search_code", "list_files", "read_file", "discover_skills_and_repos" -> AgentProcessPhase.DISCOVERING
-        "apply_patch", "edit_file", "insert_after_line", "replace_line_range", "write_file", "delete_file", "move_file" -> AgentProcessPhase.PATCHING
+        "find_files", "search_code", "list_files", "read_file", "discover_skills_and_repos", "web_search" -> AgentProcessPhase.DISCOVERING
+        "apply_patch", "edit_file", "insert_after_line", "replace_line_range", "write_file", "delete_file", "move_file", "extract_and_replace_zip" -> AgentProcessPhase.PATCHING
         "ask_user" -> AgentProcessPhase.WAITING_APPROVAL
         "finish" -> AgentProcessPhase.COMPLETED
         else -> AgentProcessPhase.EXECUTING_COMMAND
@@ -1490,6 +1541,11 @@ RULES
                 a.optString("path").take(70).ifBlank { null }
             "find_files" -> a.optString("pattern").take(60).ifBlank { a.optString("path", "~") }
             "search_code" -> a.optString("query").take(60).ifBlank { null }
+            "web_search" -> a.optString("query").ifBlank { a.optString("fetch_url") }.take(70).ifBlank { null }
+            "extract_and_replace_zip" -> a.optString("zip_path").take(70).ifBlank { null }
+            "start_localhost_server" -> "http://localhost:${a.optInt("port", 8080)}"
+            "stop_localhost_server" -> "Stop server ${a.optInt("port", 0).takeIf { it > 0 }?.let { ":$it" } ?: ""}".trim()
+            "github_push" -> a.optString("repo").ifBlank { "Push to GitHub" }
             "discover_skills_and_repos" -> a.optString("query").ifBlank { "Scanning Termux skills & repos" }
             "run_installed_tool" -> "${a.optString("tool_name")} ${a.optString("args")}".trim().take(70)
             else -> null
@@ -1502,7 +1558,13 @@ RULES
             "list_files" -> "Listing ${a.optString("path", ".")}"
             "find_files" -> "Discovering files matching “${a.optString("pattern", "*").take(36)}”"
             "read_file" -> "Reading ${a.optString("path")}"
-            "search_code" -> "Searching regex “${a.optString("query").take(40)}”"
+            "search_code" -> "Searching “${a.optString("query").take(40)}”"
+            "web_search" -> "Searching the web for “${a.optString("query").ifBlank { a.optString("fetch_url") }.take(40)}”"
+            "extract_and_replace_zip" -> "Extracting & replacing from ${a.optString("zip_path").substringAfterLast('/')}"
+            "start_localhost_server" -> "Starting localhost server on port ${a.optInt("port", 8080)}"
+            "stop_localhost_server" -> "Stopping localhost server"
+            "list_localhost_servers" -> "Checking running localhost servers"
+            "github_push" -> "Pushing Codebase to GitHub"
             "discover_skills_and_repos" -> {
                 val q = a.optString("query").trim()
                 if (q.isNotBlank()) "Finding Termux repo/skill “$q”" else "Scanning Termux skills & repos"
@@ -1511,7 +1573,7 @@ RULES
             "edit_file" -> "Surgically editing ${a.optString("path")}"
             "insert_after_line" -> "Inserting lines in ${a.optString("path")}"
             "replace_line_range" -> "Replacing lines in ${a.optString("path")}"
-            "write_file" -> "Creating ${a.optString("path")}"
+            "write_file" -> "Writing ${a.optString("path")}"
             "delete_file" -> "Deleting ${a.optString("path")}"
             "move_file" -> "Moving ${a.optString("from_path")}"
             "run_command" -> "Running `${a.optString("command").take(42)}`"
@@ -1705,11 +1767,27 @@ RULES
         )
     }
 
+    private fun isExplicitTermuxPath(rawPath: String): Boolean {
+        val t = rawPath.trim()
+        return t.startsWith("~/") || t == "~" ||
+            t.startsWith("/data/data/com.termux") ||
+            t.startsWith("/sdcard") ||
+            t.startsWith("/storage")
+    }
+
+    private fun shouldUseLocalCodebase(projectId: String, rawPath: String = "."): Boolean {
+        val termuxOnline = termuxBridge.status.value.engineRunning
+        if (!termuxOnline) return true
+        val hasProject = projectId != ProjectRepository.SCRATCH_ID
+        return hasProject && !isExplicitTermuxPath(rawPath)
+    }
+
     private suspend fun executeTool(
         projectId: String,
         call: LlmToolCall,
         mode: AgentMode,
-        readFilesInRun: MutableSet<String>
+        readFilesInRun: MutableSet<String>,
+        onReasoningTrace: (String) -> Unit = {}
     ): ToolResult {
         if (mode == AgentMode.CHAT && call.name !in READ_ONLY_TOOLS) {
             return ToolResult(
@@ -1731,6 +1809,18 @@ RULES
             when (call.name) {
                 "list_files" -> {
                     val path = args.optString("path", ".")
+                    if (shouldUseLocalCodebase(projectId, path)) {
+                        val tree = projectRepository.getFileTree(projectId)
+                        val node = if (tree != null) findNode(tree, path) else null
+                        val out = if (node == null) {
+                            "(empty codebase — use write_file to create files directly)"
+                        } else {
+                            val sb = StringBuilder()
+                            renderTree(node, 0, sb, intArrayOf(0))
+                            sb.toString().ifBlank { "(empty folder)" }
+                        }
+                        return ToolResult(out, stepType = "READ", filePath = cleanPath(path))
+                    }
                     val targetPath = resolveTermuxCwd(path)
                     val cmd = "ls -la ${shellEscapeSingleQuotes(targetPath)}"
                     val execRes = termuxBridge.execCommand(
@@ -1743,6 +1833,19 @@ RULES
                 "find_files" -> {
                     val rawPath = args.optString("path", ".")
                     val pattern = args.optString("pattern", "").trim()
+                    if (shouldUseLocalCodebase(projectId, rawPath)) {
+                        val allFiles = projectRepository.listAllRelativeFiles(projectId)
+                        val cleanPrefix = cleanPath(rawPath).let { if (it == ".") "" else it }
+                        val regex = if (pattern.isNotBlank()) {
+                            try { Regex(pattern, RegexOption.IGNORE_CASE) } catch (_: Exception) { null }
+                        } else null
+                        val matched = allFiles.filter { rel ->
+                            (cleanPrefix.isEmpty() || rel.startsWith(cleanPrefix)) &&
+                                (pattern.isBlank() || regex?.containsMatchIn(rel) == true || rel.contains(pattern, ignoreCase = true))
+                        }.take(250)
+                        val text = if (matched.isEmpty()) "(no files matched '$pattern' in Codebase)" else matched.joinToString("\n")
+                        return ToolResult(text, stepType = "SEARCH", filePath = cleanPrefix.ifEmpty { "." })
+                    }
                     val maxDepth = args.optInt("max_depth", 8).coerceIn(1, 20)
                     val targetPath = resolveTermuxCwd(rawPath)
                     val escapedRoot = shellEscapeSingleQuotes(targetPath)
@@ -1766,9 +1869,28 @@ RULES
                     if (KeyStoreManager.isPotentialSecretFile(clean)) {
                         return ToolResult("Blocked: $clean looks like a secrets/credentials file and will not be read.", true, filePath = clean)
                     }
-                    val targetPath = resolveTermuxCwd(path)
                     val start = if (args.has("start_line")) args.optInt("start_line", 1).coerceAtLeast(1) else 1
                     val end = if (args.has("end_line")) args.optInt("end_line", start + 250).coerceAtLeast(start) else (start + 250)
+                    if (shouldUseLocalCodebase(projectId, path)) {
+                        val content = try {
+                            projectRepository.readFile(projectId, clean)
+                        } catch (e: Exception) {
+                            return ToolResult("File not found in Codebase: $clean (${e.message})", isError = true, filePath = clean, stepType = "READ")
+                        }
+                        val lines = content.lines()
+                        val fromIdx = (start - 1).coerceIn(0, lines.size)
+                        val toIdx = end.coerceIn(fromIdx, lines.size)
+                        val numbered = (fromIdx until toIdx).joinToString("\n") { idx -> "${idx + 1}\t${lines[idx]}" }
+                        readFilesInRun.add(clean)
+                        recordWorkingFile(clean, WorkingFileState.READING)
+                        return ToolResult(
+                            text = if (numbered.isBlank()) "(empty file)" else numbered,
+                            isError = false,
+                            filePath = clean,
+                            stepType = "READ"
+                        )
+                    }
+                    val targetPath = resolveTermuxCwd(path)
                     val cmd = "nl -ba ${shellEscapeSingleQuotes(targetPath)} | sed -n '${start},${end}p'"
                     val execRes = termuxBridge.execCommand(
                         command = cmd,
@@ -1784,9 +1906,14 @@ RULES
                 "search_code" -> {
                     val q = args.getString("query")
                     val isRegex = args.optBoolean("regex", true)
+                    val rawSearchPath = args.optString("path", ".")
+                    if (shouldUseLocalCodebase(projectId, rawSearchPath)) {
+                        val res = projectRepository.searchCode(projectId, q, isRegex)
+                        return ToolResult(res, stepType = "SEARCH")
+                    }
                     val glob = args.optString("glob", "").trim()
                     val contextLines = args.optInt("context_lines", 0).coerceIn(0, 5)
-                    val searchRoot = resolveTermuxCwd(args.optString("path", "."))
+                    val searchRoot = resolveTermuxCwd(rawSearchPath)
                     val rootExpr = if (args.has("path")) shellEscapeSingleQuotes(searchRoot)
                     else "\$( [ -d ~/forge/projects ] && echo ~/forge/projects || echo ~ )"
                     val rgGlob = if (glob.isNotBlank()) " --glob ${shellEscapeSingleQuotes(glob)}" else ""
@@ -1892,18 +2019,27 @@ PYEOF
                     val rawPath = args.getString("path")
                     val patchText = args.getString("patch")
                     val path = cleanPath(rawPath)
-                    if (!awaitApproval("apply_patch", "Apply surgical patch to $path in Termux")) {
+                    if (!awaitApproval("apply_patch", "Apply surgical patch to $path")) {
                         return ToolResult("The user denied this patch.", true, filePath = path, stepType = "EDIT")
                     }
+                    val useLocal = shouldUseLocalCodebase(projectId, rawPath)
                     val targetPath = resolveTermuxCwd(rawPath)
                     val t0 = System.currentTimeMillis()
-                    val (originalContent, readRes) = readTermuxFileRaw(targetPath)
+                    val originalContent: String? = if (useLocal) {
+                        try { projectRepository.readFile(projectId, path) } catch (_: Exception) { null }
+                    } else {
+                        val (c, readRes) = readTermuxFileRaw(targetPath)
+                        if (c == null) {
+                            return formatBridgeToolResult(
+                                readRes.copy(stderr = readRes.stderr.ifBlank { "File not found: $targetPath" }),
+                                stepType = "EDIT",
+                                filePath = path
+                            )
+                        }
+                        c
+                    }
                     if (originalContent == null) {
-                        return formatBridgeToolResult(
-                            readRes.copy(stderr = readRes.stderr.ifBlank { "File not found: $targetPath" }),
-                            stepType = "EDIT",
-                            filePath = path
-                        )
+                        return ToolResult("File not found in Codebase: $path", isError = true, filePath = path, stepType = "EDIT")
                     }
                     val (patchedContent, outcome) = SurgicalPatchEngine.applyUnifiedPatch(originalContent, patchText, path)
                     if (!outcome.success) {
@@ -1913,11 +2049,11 @@ PYEOF
                             isError = true,
                             filePath = path,
                             commandText = "apply_patch $path",
-                            cwdText = TermuxBridge.TERMUX_HOME,
+                            cwdText = if (useLocal) "Codebase" else TermuxBridge.TERMUX_HOME,
                             stepType = "EDIT",
                             uiResultJson = buildDiffUiJson(
                                 commandLabel = "apply_patch $path",
-                                cwd = TermuxBridge.TERMUX_HOME,
+                                cwd = if (useLocal) "Codebase" else TermuxBridge.TERMUX_HOME,
                                 filePath = path,
                                 diffPreview = "",
                                 addedLines = 0,
@@ -1929,11 +2065,17 @@ PYEOF
                             )
                         )
                     }
-                    val writeRes = writeTermuxFileAtomic(targetPath, patchedContent)
-                    if (writeRes.exitCode != 0) {
-                        return formatBridgeToolResult(writeRes, stepType = "EDIT", filePath = path)
+                    val syntaxWarn: String?
+                    if (useLocal) {
+                        projectRepository.writeFile(projectId, path, patchedContent)
+                        syntaxWarn = null
+                    } else {
+                        val writeRes = writeTermuxFileAtomic(targetPath, patchedContent)
+                        if (writeRes.exitCode != 0) {
+                            return formatBridgeToolResult(writeRes, stepType = "EDIT", filePath = path)
+                        }
+                        syntaxWarn = validatePatchedSyntax(targetPath)
                     }
-                    val syntaxWarn = validatePatchedSyntax(targetPath)
                     val dur = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
                     val diffLabel = "+${outcome.linesAdded} -${outcome.linesRemoved}"
                     readFilesInRun.add(path)
@@ -1953,12 +2095,12 @@ PYEOF
                         touched = listOf(path),
                         diffSummary = diffLabel,
                         commandText = "apply_patch $path ($diffLabel)",
-                        cwdText = TermuxBridge.TERMUX_HOME,
+                        cwdText = if (useLocal) "Codebase" else TermuxBridge.TERMUX_HOME,
                         filePath = path,
                         stepType = "EDIT",
                         uiResultJson = buildDiffUiJson(
                             commandLabel = "apply_patch $path",
-                            cwd = TermuxBridge.TERMUX_HOME,
+                            cwd = if (useLocal) "Codebase" else TermuxBridge.TERMUX_HOME,
                             filePath = path,
                             diffPreview = outcome.diffPreview,
                             addedLines = outcome.linesAdded,
@@ -1973,21 +2115,30 @@ PYEOF
                 "edit_file" -> {
                     val rawPath = args.getString("path")
                     val path = cleanPath(rawPath)
-                    if (!awaitApproval("edit_file", "Surgically edit $path in Termux")) {
+                    if (!awaitApproval("edit_file", "Surgically edit $path")) {
                         return ToolResult("The user denied this edit.", true, filePath = path, stepType = "EDIT")
                     }
+                    val useLocal = shouldUseLocalCodebase(projectId, rawPath)
                     val targetPath = resolveTermuxCwd(rawPath)
                     val oldStr = args.getString("old_str")
                     val newStr = args.getString("new_str")
                     val replaceAll = args.optBoolean("replace_all", false)
                     val t0 = System.currentTimeMillis()
-                    val (originalContent, readRes) = readTermuxFileRaw(targetPath)
+                    val originalContent: String? = if (useLocal) {
+                        try { projectRepository.readFile(projectId, path) } catch (_: Exception) { null }
+                    } else {
+                        val (c, readRes) = readTermuxFileRaw(targetPath)
+                        if (c == null) {
+                            return formatBridgeToolResult(
+                                readRes.copy(stderr = readRes.stderr.ifBlank { "File not found: $targetPath" }),
+                                stepType = "EDIT",
+                                filePath = path
+                            )
+                        }
+                        c
+                    }
                     if (originalContent == null) {
-                        return formatBridgeToolResult(
-                            readRes.copy(stderr = readRes.stderr.ifBlank { "File not found: $targetPath" }),
-                            stepType = "EDIT",
-                            filePath = path
-                        )
+                        return ToolResult("File not found in Codebase: $path", isError = true, filePath = path, stepType = "EDIT")
                     }
                     val (updatedContent, outcome) = FileEditEngine.applyStructuredEdit(
                         content = originalContent,
@@ -2002,11 +2153,11 @@ PYEOF
                             isError = true,
                             filePath = path,
                             commandText = "edit_file $path",
-                            cwdText = TermuxBridge.TERMUX_HOME,
+                            cwdText = if (useLocal) "Codebase" else TermuxBridge.TERMUX_HOME,
                             stepType = "EDIT",
                             uiResultJson = buildDiffUiJson(
                                 commandLabel = "edit_file $path",
-                                cwd = TermuxBridge.TERMUX_HOME,
+                                cwd = if (useLocal) "Codebase" else TermuxBridge.TERMUX_HOME,
                                 filePath = path,
                                 diffPreview = "",
                                 addedLines = 0,
@@ -2018,11 +2169,17 @@ PYEOF
                             )
                         )
                     }
-                    val writeRes = writeTermuxFileAtomic(targetPath, updatedContent)
-                    if (writeRes.exitCode != 0) {
-                        return formatBridgeToolResult(writeRes, stepType = "EDIT", filePath = path)
+                    val syntaxWarn: String?
+                    if (useLocal) {
+                        projectRepository.writeFile(projectId, path, updatedContent)
+                        syntaxWarn = null
+                    } else {
+                        val writeRes = writeTermuxFileAtomic(targetPath, updatedContent)
+                        if (writeRes.exitCode != 0) {
+                            return formatBridgeToolResult(writeRes, stepType = "EDIT", filePath = path)
+                        }
+                        syntaxWarn = validatePatchedSyntax(targetPath)
                     }
-                    val syntaxWarn = validatePatchedSyntax(targetPath)
                     val unifiedDiff = SurgicalPatchEngine.generateUnifiedDiff(path, originalContent, updatedContent)
                     val dur = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
                     val diffLabel = "+${outcome.linesAdded} -${outcome.linesRemoved}"
@@ -2040,12 +2197,12 @@ PYEOF
                         touched = listOf(path),
                         diffSummary = diffLabel,
                         commandText = "edit_file $path ($diffLabel)",
-                        cwdText = TermuxBridge.TERMUX_HOME,
+                        cwdText = if (useLocal) "Codebase" else TermuxBridge.TERMUX_HOME,
                         filePath = path,
                         stepType = "EDIT",
                         uiResultJson = buildDiffUiJson(
                             commandLabel = "edit_file $path",
-                            cwd = TermuxBridge.TERMUX_HOME,
+                            cwd = if (useLocal) "Codebase" else TermuxBridge.TERMUX_HOME,
                             filePath = path,
                             diffPreview = unifiedDiff,
                             addedLines = outcome.linesAdded,
@@ -2063,13 +2220,20 @@ PYEOF
                     if (!awaitApproval("insert_after_line", "Insert lines in $path")) {
                         return ToolResult("The user denied this edit.", true, filePath = path, stepType = "EDIT")
                     }
+                    val useLocal = shouldUseLocalCodebase(projectId, rawPath)
                     val targetPath = resolveTermuxCwd(rawPath)
                     val lineNum = args.getInt("line").coerceAtLeast(0)
                     val content = args.getString("content")
                     val t0 = System.currentTimeMillis()
-                    val (originalContent, readRes) = readTermuxFileRaw(targetPath)
+                    val originalContent: String? = if (useLocal) {
+                        try { projectRepository.readFile(projectId, path) } catch (_: Exception) { null }
+                    } else {
+                        val (c, readRes) = readTermuxFileRaw(targetPath)
+                        if (c == null) return formatBridgeToolResult(readRes, stepType = "EDIT", filePath = path)
+                        c
+                    }
                     if (originalContent == null) {
-                        return formatBridgeToolResult(readRes, stepType = "EDIT", filePath = path)
+                        return ToolResult("File not found in Codebase: $path", isError = true, filePath = path, stepType = "EDIT")
                     }
                     val (updatedContent, outcome) = FileEditEngine.applyStructuredEdit(
                         content = originalContent,
@@ -2077,9 +2241,13 @@ PYEOF
                         rawNewText = content,
                         insertAfterLine = lineNum
                     )
-                    val writeRes = writeTermuxFileAtomic(targetPath, updatedContent)
-                    if (writeRes.exitCode != 0) {
-                        return formatBridgeToolResult(writeRes, stepType = "EDIT", filePath = path)
+                    if (useLocal) {
+                        projectRepository.writeFile(projectId, path, updatedContent)
+                    } else {
+                        val writeRes = writeTermuxFileAtomic(targetPath, updatedContent)
+                        if (writeRes.exitCode != 0) {
+                            return formatBridgeToolResult(writeRes, stepType = "EDIT", filePath = path)
+                        }
                     }
                     val unifiedDiff = SurgicalPatchEngine.generateUnifiedDiff(path, originalContent, updatedContent)
                     val dur = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
@@ -2092,12 +2260,12 @@ PYEOF
                         touched = listOf(path),
                         diffSummary = diffLabel,
                         commandText = "insert_after_line $path:$lineNum ($diffLabel)",
-                        cwdText = TermuxBridge.TERMUX_HOME,
+                        cwdText = if (useLocal) "Codebase" else TermuxBridge.TERMUX_HOME,
                         filePath = path,
                         stepType = "EDIT",
                         uiResultJson = buildDiffUiJson(
                             commandLabel = "insert_after_line $path (after line $lineNum)",
-                            cwd = TermuxBridge.TERMUX_HOME,
+                            cwd = if (useLocal) "Codebase" else TermuxBridge.TERMUX_HOME,
                             filePath = path,
                             diffPreview = unifiedDiff,
                             addedLines = outcome.linesAdded,
@@ -2115,14 +2283,21 @@ PYEOF
                     if (!awaitApproval("replace_line_range", "Replace lines in $path")) {
                         return ToolResult("The user denied this edit.", true, filePath = path, stepType = "EDIT")
                     }
+                    val useLocal = shouldUseLocalCodebase(projectId, rawPath)
                     val targetPath = resolveTermuxCwd(rawPath)
                     val startLine = args.getInt("start_line").coerceAtLeast(1)
                     val endLine = args.getInt("end_line").coerceAtLeast(startLine)
                     val content = args.getString("content")
                     val t0 = System.currentTimeMillis()
-                    val (originalContent, readRes) = readTermuxFileRaw(targetPath)
+                    val originalContent: String? = if (useLocal) {
+                        try { projectRepository.readFile(projectId, path) } catch (_: Exception) { null }
+                    } else {
+                        val (c, readRes) = readTermuxFileRaw(targetPath)
+                        if (c == null) return formatBridgeToolResult(readRes, stepType = "EDIT", filePath = path)
+                        c
+                    }
                     if (originalContent == null) {
-                        return formatBridgeToolResult(readRes, stepType = "EDIT", filePath = path)
+                        return ToolResult("File not found in Codebase: $path", isError = true, filePath = path, stepType = "EDIT")
                     }
                     val (updatedContent, outcome) = FileEditEngine.applyStructuredEdit(
                         content = originalContent,
@@ -2131,9 +2306,13 @@ PYEOF
                         replaceStartLine = startLine,
                         replaceEndLine = endLine
                     )
-                    val writeRes = writeTermuxFileAtomic(targetPath, updatedContent)
-                    if (writeRes.exitCode != 0) {
-                        return formatBridgeToolResult(writeRes, stepType = "EDIT", filePath = path)
+                    if (useLocal) {
+                        projectRepository.writeFile(projectId, path, updatedContent)
+                    } else {
+                        val writeRes = writeTermuxFileAtomic(targetPath, updatedContent)
+                        if (writeRes.exitCode != 0) {
+                            return formatBridgeToolResult(writeRes, stepType = "EDIT", filePath = path)
+                        }
                     }
                     val unifiedDiff = SurgicalPatchEngine.generateUnifiedDiff(path, originalContent, updatedContent)
                     val dur = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
@@ -2146,12 +2325,12 @@ PYEOF
                         touched = listOf(path),
                         diffSummary = diffLabel,
                         commandText = "replace_line_range $path:$startLine..$endLine ($diffLabel)",
-                        cwdText = TermuxBridge.TERMUX_HOME,
+                        cwdText = if (useLocal) "Codebase" else TermuxBridge.TERMUX_HOME,
                         filePath = path,
                         stepType = "EDIT",
                         uiResultJson = buildDiffUiJson(
                             commandLabel = "replace_line_range $path ($startLine..$endLine)",
-                            cwd = TermuxBridge.TERMUX_HOME,
+                            cwd = if (useLocal) "Codebase" else TermuxBridge.TERMUX_HOME,
                             filePath = path,
                             diffPreview = unifiedDiff,
                             addedLines = outcome.linesAdded,
@@ -2166,22 +2345,32 @@ PYEOF
                 "write_file" -> {
                     val rawPath = args.getString("path")
                     val path = cleanPath(rawPath)
-                    if (!awaitApproval("write_file", "Write file $path in Termux")) {
+                    if (!awaitApproval("write_file", "Write file $path")) {
                         return ToolResult("The user denied this write.", true, filePath = path, stepType = "EDIT")
                     }
+                    val useLocal = shouldUseLocalCodebase(projectId, rawPath)
                     val targetPath = resolveTermuxCwd(rawPath)
                     val content = args.getString("content")
                     val t0 = System.currentTimeMillis()
 
-                    // Read previous content if the file exists so we produce a real unified diff & accurate CREATED/EDITED badge
-                    val (existingContent, _) = readTermuxFileRaw(targetPath)
+                    val existingContent: String? = if (useLocal) {
+                        try { projectRepository.readFile(projectId, path) } catch (_: Exception) { null }
+                    } else {
+                        readTermuxFileRaw(targetPath).first
+                    }
                     val isNewFile = existingContent == null
 
-                    val writeRes = writeTermuxFileAtomic(targetPath, content)
-                    if (writeRes.exitCode != 0) {
-                        return formatBridgeToolResult(writeRes, stepType = "EDIT", filePath = path)
+                    val syntaxWarn: String?
+                    if (useLocal) {
+                        projectRepository.writeFile(projectId, path, content)
+                        syntaxWarn = null
+                    } else {
+                        val writeRes = writeTermuxFileAtomic(targetPath, content)
+                        if (writeRes.exitCode != 0) {
+                            return formatBridgeToolResult(writeRes, stepType = "EDIT", filePath = path)
+                        }
+                        syntaxWarn = validatePatchedSyntax(targetPath)
                     }
-                    val syntaxWarn = validatePatchedSyntax(targetPath)
                     readFilesInRun.add(path)
                     val oldLines = existingContent?.lines().orEmpty()
                     val newLines = content.lines()
@@ -2203,12 +2392,12 @@ PYEOF
                         touched = listOf(path),
                         diffSummary = diffLabel,
                         commandText = "write_file $path ($diffLabel)",
-                        cwdText = TermuxBridge.TERMUX_HOME,
+                        cwdText = if (useLocal) "Codebase" else TermuxBridge.TERMUX_HOME,
                         filePath = path,
                         stepType = "EDIT",
                         uiResultJson = buildDiffUiJson(
                             commandLabel = "write_file $path",
-                            cwd = TermuxBridge.TERMUX_HOME,
+                            cwd = if (useLocal) "Codebase" else TermuxBridge.TERMUX_HOME,
                             filePath = path,
                             diffPreview = unifiedDiff,
                             addedLines = addedCount,
@@ -2223,8 +2412,13 @@ PYEOF
                 "delete_file" -> {
                     val rawPath = args.getString("path")
                     val path = cleanPath(rawPath)
-                    if (!awaitApproval("delete_file", "Delete $path in Termux", isRisky = true)) {
+                    if (!awaitApproval("delete_file", "Delete $path", isRisky = true)) {
                         return ToolResult("The user denied this deletion.", true, filePath = path, stepType = "EDIT")
+                    }
+                    if (shouldUseLocalCodebase(projectId, rawPath)) {
+                        val msg = projectRepository.deleteFile(projectId, path)
+                        recordWorkingFile(path, WorkingFileState.DELETED)
+                        return ToolResult(msg, changed = true, removed = listOf(path), filePath = path, stepType = "EDIT")
                     }
                     val targetPath = resolveTermuxCwd(rawPath)
                     val execRes = termuxBridge.execCommand(
@@ -2240,8 +2434,15 @@ PYEOF
                     val rawTo = args.getString("to_path")
                     val from = cleanPath(rawFrom)
                     val to = cleanPath(rawTo)
-                    if (!awaitApproval("move_file", "Move $from → $to in Termux")) {
+                    if (!awaitApproval("move_file", "Move $from → $to")) {
                         return ToolResult("The user denied this move.", true, filePath = to, stepType = "EDIT")
+                    }
+                    if (shouldUseLocalCodebase(projectId, rawFrom) && shouldUseLocalCodebase(projectId, rawTo)) {
+                        val msg = projectRepository.moveFile(projectId, from, to)
+                        readFilesInRun.add(to)
+                        recordWorkingFile(from, WorkingFileState.DELETED)
+                        recordWorkingFile(to, WorkingFileState.CREATED)
+                        return ToolResult(msg, changed = true, touched = listOf(to), removed = listOf(from), filePath = to, stepType = "EDIT")
                     }
                     val fromTarget = resolveTermuxCwd(rawFrom)
                     val toTarget = resolveTermuxCwd(rawTo)
@@ -2378,6 +2579,148 @@ PYEOF
                         sb.append("- [ ] ").append(itemsArr.optString(i)).append("\n")
                     }
                     ToolResult(sb.toString().trim(), stepType = "PLAN")
+                }
+                "web_search" -> {
+                    val query = args.optString("query", "").trim()
+                    val searchType = args.optString("type", "auto").trim()
+                    val fetchUrl = args.optString("fetch_url", "").trim().ifBlank { null }
+                    if (query.isBlank() && fetchUrl == null) {
+                        return ToolResult("Error: provide either 'query' or 'fetch_url' for web_search.", isError = true, stepType = "SEARCH")
+                    }
+                    val report = webSearchClient.search(
+                        query = query,
+                        searchType = searchType,
+                        fetchUrl = fetchUrl,
+                        githubToken = settings.githubToken.ifBlank { null },
+                        onTrace = { trace -> onReasoningTrace(trace) }
+                    )
+                    ToolResult(
+                        text = report.formatForAgent(),
+                        isError = false,
+                        commandText = if (fetchUrl != null) "web_search $fetchUrl" else "web_search \"$query\"",
+                        stepType = "SEARCH"
+                    )
+                }
+                "extract_and_replace_zip" -> {
+                    val zipPath = args.getString("zip_path").trim()
+                    val targetSubdir = args.optString("target_subdir", "").trim().ifBlank { null }
+                    if (!awaitApproval("extract_and_replace_zip", "Extract $zipPath and replace matching files in active project")) {
+                        return ToolResult("User denied ZIP extraction.", isError = true, stepType = "EDIT")
+                    }
+                    val directFile = File(zipPath)
+                    val report = if (directFile.exists() && directFile.isFile) {
+                        projectRepository.extractZipFileIntoProject(projectId, directFile, targetSubdir)
+                    } else if (termuxBridge.status.value.engineRunning) {
+                        val resolved = resolveTermuxCwd(zipPath)
+                        val pyCmd = "python3 -c \"import base64,pathlib,sys; p=pathlib.Path(${shellEscapeSingleQuotes(resolved)}); " +
+                            "sys.exit(2) if not p.is_file() else print(base64.b64encode(p.read_bytes()).decode('ascii'))\""
+                        val readRes = termuxBridge.execCommand(pyCmd, cwd = TermuxBridge.TERMUX_HOME, timeoutSec = 45)
+                        if (readRes.exitCode != 0 || readRes.stdout.isBlank()) {
+                            return ToolResult("Could not read ZIP file at $resolved: ${readRes.stderr.ifBlank { "file not found" }}", isError = true, stepType = "EDIT")
+                        }
+                        val bytes = android.util.Base64.decode(readRes.stdout.trim(), android.util.Base64.DEFAULT)
+                        val tmpZip = File(appContext.cacheDir, "agent_extract_${System.currentTimeMillis()}.zip")
+                        try {
+                            tmpZip.writeBytes(bytes)
+                            projectRepository.extractZipFileIntoProject(projectId, tmpZip, targetSubdir)
+                        } finally {
+                            tmpZip.delete()
+                        }
+                    } else {
+                        return ToolResult("ZIP file not found at '$zipPath'. Attach it via '+' in Chat or start Termux Bridge to read Termux paths.", isError = true, stepType = "EDIT")
+                    }
+                    report.replacedFiles.forEach { recordWorkingFile(it, WorkingFileState.EDITED, "Replaced from ZIP") }
+                    report.addedFiles.forEach { recordWorkingFile(it, WorkingFileState.CREATED, "Added from ZIP") }
+                    ToolResult(
+                        text = report.toReadableSummary(),
+                        isError = false,
+                        changed = report.totalWritten > 0,
+                        touched = report.replacedFiles + report.addedFiles,
+                        diffSummary = "${report.replacedFiles.size} replaced, ${report.addedFiles.size} added",
+                        commandText = "extract_and_replace_zip $zipPath",
+                        stepType = "EDIT"
+                    )
+                }
+                "start_localhost_server" -> {
+                    if (!termuxBridge.status.value.engineRunning) {
+                        return ToolResult(
+                            "Termux bridge is offline. Start Termux bridge to run a localhost server, or use the built-in HTML/CSS/JS WebView Preview button inside the Codebase tab!",
+                            isError = true,
+                            stepType = "CMD"
+                        )
+                    }
+                    val port = args.optInt("port", 8080).coerceIn(1024, 65535)
+                    val rawCwd = args.optString("cwd", ".").trim()
+                    val customCmd = args.optString("command", "").trim().ifBlank { null }
+                    val cwd = resolveTermuxCwd(rawCwd)
+                    val startRes = localhostServerManager.startServer(
+                        bridge = termuxBridge,
+                        port = port,
+                        cwd = cwd,
+                        customCommand = customCmd
+                    )
+                    startRes.fold(
+                        onSuccess = { info ->
+                            ToolResult(
+                                text = "Localhost server started!\nURL: ${info.url}\nPID: ${info.pid}\nPort: ${info.port}\nDirectory: ${info.cwd}\nCommand: `${info.command}`\nLog: ${info.logPath}\nTo stop it later, call `stop_localhost_server(port=${info.port})`.",
+                                isError = false,
+                                commandText = info.command,
+                                cwdText = info.cwd,
+                                stepType = "CMD"
+                            )
+                        },
+                        onFailure = { err ->
+                            ToolResult(
+                                text = err.message ?: "Failed to start localhost server on port $port.",
+                                isError = true,
+                                commandText = customCmd ?: "python3 -m http.server $port",
+                                cwdText = cwd,
+                                stepType = "CMD"
+                            )
+                        }
+                    )
+                }
+                "stop_localhost_server" -> {
+                    val port = if (args.has("port")) args.optInt("port", 0).takeIf { it > 0 } else null
+                    val pid = if (args.has("pid")) args.optInt("pid", 0).takeIf { it > 0 } else null
+                    val summary = localhostServerManager.stopServer(termuxBridge, portOrPid = pid ?: port)
+                    ToolResult(summary, isError = false, commandText = "stop_localhost_server", stepType = "CMD")
+                }
+                "list_localhost_servers" -> {
+                    ToolResult(localhostServerManager.formatActiveServers(), isError = false, stepType = "CMD")
+                }
+                "github_push" -> {
+                    val repoInput = args.optString("repo", "").trim().ifBlank {
+                        settings.repoFor(projectId) ?: settings.githubRepo
+                    }
+                    val commitMessage = args.optString("message", "").trim().ifBlank { "Update from CodeForge" }
+                    if (!settings.githubConnected || settings.githubToken.isBlank()) {
+                        return ToolResult("GitHub is not connected yet. Connect a GitHub token in Settings -> GitHub or the GH Build tab first.", isError = true, stepType = "CMD")
+                    }
+                    if (repoInput.isBlank() || !repoInput.contains("/")) {
+                        return ToolResult("No GitHub repository linked to this project. Ask the user for `owner/repo` or link one in Codebase -> Push to GitHub.", isError = true, stepType = "CMD")
+                    }
+                    val normalizedRepo = gitHubRepository.normalizeRepo(repoInput)
+                    if (!awaitApproval("github_push", "Push active Codebase to GitHub repository `$normalizedRepo`?\nCommit: $commitMessage")) {
+                        return ToolResult("User cancelled GitHub push.", isError = true, stepType = "CMD")
+                    }
+                    settings.linkRepo(projectId, normalizedRepo)
+                    val pushResult = githubManager.push(
+                        projectId = projectId,
+                        repo = normalizedRepo,
+                        deleteExtra = false,
+                        message = commitMessage
+                    )
+                    if (!pushResult.noChanges) {
+                        val projName = projectRepository.getProject(projectId)?.name ?: normalizedRepo
+                        githubManager.watchBuild(projName, normalizedRepo, pushResult.commitSha)
+                    }
+                    ToolResult(
+                        text = githubManager.describe(pushResult, normalizedRepo) + "\nYou can monitor live GitHub Actions in the GH Build tab.",
+                        isError = false,
+                        commandText = "git push $normalizedRepo",
+                        stepType = "CMD"
+                    )
                 }
                 "update_memory" -> {
                     val note = args.getString("note")
@@ -2585,6 +2928,48 @@ PYEOF
             description = "Record a short step-by-step checklist for a multi-step task.",
             parametersJsonSchema = """
                 {"type":"object","properties":{"steps":{"type":"array","items":{"type":"string"}}},"required":["steps"]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "web_search",
+            description = "Search the internet and GitHub for external repositories, libraries, documentation, and installation commands (e.g. 'morluto/rea'). NEVER use local Termux search tools for external repos/docs; always use web_search. Optionally pass fetch_url to read a specific web page.",
+            parametersJsonSchema = """
+                {"type":"object","properties":{"query":{"type":"string","description":"Search query or GitHub owner/repo slug (e.g. 'morluto/rea')"},"type":{"type":"string","enum":["auto","github","web"],"description":"Search target (default 'auto')"},"fetch_url":{"type":"string","description":"Optional direct URL to fetch and read text from"}},"required":["query"]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "extract_and_replace_zip",
+            description = "Unzip a .zip archive from Termux or storage, inspect its contents safely, and accurately replace matching files (and add new ones) inside the active project Codebase.",
+            parametersJsonSchema = """
+                {"type":"object","properties":{"zip_path":{"type":"string","description":"Path to the .zip file (Termux or local storage path)"},"target_subdir":{"type":"string","description":"Optional subfolder inside the project to extract into"}},"required":["zip_path"]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "start_localhost_server",
+            description = "Launch a background localhost web server inside Termux (tracks PID and port) and return the live http://localhost:<port> URL.",
+            parametersJsonSchema = """
+                {"type":"object","properties":{"port":{"type":"integer","description":"Port to bind on localhost (default 8080)"},"cwd":{"type":"string","description":"Directory to serve (e.g. '~/forge/projects/site')"},"command":{"type":"string","description":"Optional custom server command (defaults to python3 -m http.server <port> --bind 127.0.0.1)"}},"required":["port","cwd"]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "stop_localhost_server",
+            description = "Cleanly kill a tracked background localhost web server by port or PID (or stop all tracked servers if omitted).",
+            parametersJsonSchema = """
+                {"type":"object","properties":{"port":{"type":"integer","description":"Port of the server to stop"},"pid":{"type":"integer","description":"Specific PID to stop"}},"required":[]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "list_localhost_servers",
+            description = "List all currently tracked background localhost servers with their URLs, ports, and PIDs.",
+            parametersJsonSchema = """
+                {"type":"object","properties":{},"required":[]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "github_push",
+            description = "Push the active project Codebase directly to a GitHub repository and watch GitHub Actions builds.",
+            parametersJsonSchema = """
+                {"type":"object","properties":{"repo":{"type":"string","description":"GitHub repository as 'owner/repo' (uses linked repo if omitted)"},"message":{"type":"string","description":"Commit message"}},"required":[]}
             """.trimIndent()
         ),
         LlmTool(

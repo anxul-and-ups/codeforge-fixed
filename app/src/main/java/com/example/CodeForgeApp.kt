@@ -48,6 +48,9 @@ class CodeForgeApp : Application() {
         )
     }
     val gitHubRepository by lazy { GitHubRepository() }
+    val webSearchClient by lazy { com.example.data.api.WebSearchClient() }
+    val manualEditTracker by lazy { com.example.data.agent.ManualEditTracker(this) }
+    val localhostServerManager by lazy { com.example.data.termux.LocalhostServerManager() }
     val buildLogStore by lazy { com.example.data.logs.BuildLogStore(this) }
     val gitLogStore by lazy { com.example.data.logs.GitLogStore(this) }
     val githubManager by lazy {
@@ -75,7 +78,10 @@ class CodeForgeApp : Application() {
             termuxBridge = termuxBridge,
             settings = settingsStore,
             buildLogStore = buildLogStore,
-            githubManager = githubManager
+            githubManager = githubManager,
+            manualEditTracker = manualEditTracker,
+            webSearchClient = webSearchClient,
+            localhostServerManager = localhostServerManager
         )
     }
 
