@@ -217,4 +217,28 @@ class CodeForgeUnitTest {
             tmpDir.deleteRecursively()
         }
     }
+
+    @Test
+    fun testThinkTagStreamSplitterLiveExtraction() {
+        val textBuf = StringBuilder()
+        val thoughtBuf = StringBuilder()
+        val splitter = com.example.data.api.ThinkTagStreamSplitter(
+            onText = { textBuf.append(it) },
+            onThought = { thoughtBuf.append(it) }
+        )
+        // Deliberately split tags across chunk boundaries
+        listOf("<thi", "nk>Step 1: check files.", " Step 2: patch bug.</th", "ink>Done! Fixed the bug.").forEach {
+            splitter.feed(it)
+        }
+        splitter.flush()
+        assertEquals("Step 1: check files. Step 2: patch bug.", thoughtBuf.toString())
+        assertEquals("Done! Fixed the bug.", textBuf.toString())
+    }
+
+    @Test
+    fun testNetworkErrorLabelIsNotFalseNoInternet() {
+        val label = com.example.domain.model.ProviderErrorClass.NETWORK_DOWN.label
+        assertFalse("Should not falsely claim 'No internet connection'", label.equals("No internet connection", ignoreCase = true))
+    }
 }
+

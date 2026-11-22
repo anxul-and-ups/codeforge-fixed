@@ -688,8 +688,23 @@ class AgentEngine(
 
     private fun resolveReasoning(setting: ReasoningLevel, prompt: String, step: Int, lastToolError: Boolean): ReasoningLevel {
         if (setting != ReasoningLevel.AUTO) return setting
-        // Keep AUTO fast and responsive — never silently inject 12,000-token HIGH thinking stalls.
-        return if (lastToolError) ReasoningLevel.LOW else ReasoningLevel.OFF
+        // Fast low-latency thinking budget (1024 tok) so live Chain of Thought streams cleanly
+        // without 12k-token stalls; LlmClient auto-falls back if the model doesn't support thinking.
+        return ReasoningLevel.LOW
+    }
+
+    /**
+     * Returns the cached Termux skills snapshot immediately (0 ms TTFT overhead) and
+     * refreshes in the background if stale (>90s). Never blocks the first LLM token.
+     */
+    private fun getCachedTermuxSkillsAndRefreshAsync(): String {
+        val now = System.currentTimeMillis()
+        if ((cachedTermuxSkillsSnapshot.isBlank() || (now - cachedTermuxSkillsAtMs) >= 90_000L) &&
+            termuxBridge.status.value.engineRunning
+        ) {
+            scope.launch { fetchTermuxSkillsSnapshot() }
+        }
+        return cachedTermuxSkillsSnapshot
     }
 
     /**
@@ -777,17 +792,16 @@ HOW TO UNDERSTAND THE USER
         } catch (_: Exception) {
             emptyList()
         }
-        val liveTermuxSkills = fetchTermuxSkillsSnapshot()
+        val liveTermuxSkills = getCachedTermuxSkillsAndRefreshAsync()
 
         val bridgeMandate = """
 CRITICAL CLOUD CODE ENGINE ARCHITECTURE (TERMUX HTTP BRIDGE)
 - You are CodeForge v2 — a deterministic Cloud Code Engine controlling the user's real Termux environment via HTTP Bridge (`http://127.0.0.1:47831/exec`, cwd `/data/data/com.termux/files/home`).
 - NEVER assume or inspect Android's app sandbox (`/data/data/com.aistudio...`). Everything lives in Termux (`/data/data/com.termux/files/home`).
-- SURGICAL CODE PATCHING (MANDATORY):
+- SURGICAL CODE PATCHING & FILE CREATION:
   1. ALWAYS call `read_file` before editing any existing file.
-  2. NEVER overwrite an existing file (>15 lines) with `write_file` — the engine will block full-file rewrites to prevent instability!
-  3. Always apply minimal, surgical diffs using `apply_patch` (unified diff `@@` hunks), `edit_file` (exact/whitespace/indent-tolerant snippet replacement), `replace_line_range`, or `insert_after_line`.
-  4. Reserve `write_file` strictly for creating brand-new files or tiny (<15 line) configs.
+  2. Prefer minimal, surgical diffs using `apply_patch` (unified diff `@@` hunks), `edit_file` (exact/whitespace/indent-tolerant snippet replacement), `replace_line_range`, or `insert_after_line` for targeted fixes and refactors.
+  3. Use `write_file` freely to create new files or perform full file writes when writing a complete file from scratch or replacing most of a file.
 - INDEXED FILE DISCOVERY & NAVIGATION:
   1. Use `find_files` (ripgrep/glob indexed search) to locate target files in deep directories accurately.
   2. Use `search_code` (ripgrep regex search with file globs & context) to pinpoint exact functions, classes, or symbols before reading/patching.
@@ -1100,6 +1114,12 @@ RULES
                         if (title != null && history.isEmpty()) {
                             renameConversationIfDefault(req.conversationId, title)
                         }
+                        if (noteText.isNotBlank() && response.reasoning.isNullOrBlank()) {
+                            val planLine = "• $noteText"
+                            if (reasoningAll.isNotEmpty()) reasoningAll.append("\n")
+                            reasoningAll.append(planLine)
+                            _agentEvents.tryEmit(AgentEvent.ReasoningChunk(if (reasoningAll.length == planLine.length) planLine else "\n$planLine"))
+                        }
                         _agentEvents.tryEmit(AgentEvent.NoteAdded(noteText))
                     }
                     _agentEvents.tryEmit(AgentEvent.StreamingReset)
@@ -1194,7 +1214,24 @@ RULES
                         finished = true
                         ToolResult("Done.", stepType = "FINISH")
                     } else {
-                        executeTool(req.projectId, call, req.mode, readFilesInRun)
+                        val hardTimeoutMs = when (call.name) {
+                            "ask_user" -> 200_000L
+                            "run_command", "run_installed_tool", "git_clone", "install_repo_tool" -> {
+                                val reqSec = try {
+                                    JSONObject(call.argumentsJson).optInt("timeout", 120).coerceIn(10, 1800)
+                                } catch (_: Exception) { 120 }
+                                (reqSec + 25) * 1000L
+                            }
+                            else -> 90_000L
+                        }
+                        withTimeoutOrNull(hardTimeoutMs) {
+                            executeTool(req.projectId, call, req.mode, readFilesInRun)
+                        } ?: ToolResult(
+                            text = "Tool `${call.name}` timed out after ${hardTimeoutMs / 1000}s and was safely aborted so the loop can continue.",
+                            isError = true,
+                            commandText = extractActiveCommandPreview(call),
+                            stepType = inferStepType(call.name)
+                        )
                     }
 
                     if (result.changed) {
@@ -2129,54 +2166,38 @@ PYEOF
                 "write_file" -> {
                     val rawPath = args.getString("path")
                     val path = cleanPath(rawPath)
-                    if (!awaitApproval("write_file", "Create file $path in Termux")) {
+                    if (!awaitApproval("write_file", "Write file $path in Termux")) {
                         return ToolResult("The user denied this write.", true, filePath = path, stepType = "EDIT")
                     }
                     val targetPath = resolveTermuxCwd(rawPath)
                     val content = args.getString("content")
                     val t0 = System.currentTimeMillis()
 
-                    // Surgical Patch Guard: Prohibit full-file overwrite of existing files (> 15 lines)
-                    val checkCmd = "if [ -f ${shellEscapeSingleQuotes(targetPath)} ]; then wc -l < ${shellEscapeSingleQuotes(targetPath)}; else echo -1; fi"
-                    val checkRes = termuxBridge.execCommand(command = checkCmd, cwd = TermuxBridge.TERMUX_HOME, timeoutSec = 15)
-                    val existingLines = checkRes.stdout.trim().toIntOrNull() ?: -1
-                    val rewriteErr = SurgicalPatchEngine.checkFullRewriteAllowed(existingLines, path)
-                    if (rewriteErr != null) {
-                        val dur = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
-                        return ToolResult(
-                            text = rewriteErr,
-                            isError = true,
-                            filePath = path,
-                            commandText = "write_file $path (BLOCKED)",
-                            cwdText = TermuxBridge.TERMUX_HOME,
-                            stepType = "EDIT",
-                            uiResultJson = buildDiffUiJson(
-                                commandLabel = "write_file $path (blocked full rewrite)",
-                                cwd = TermuxBridge.TERMUX_HOME,
-                                filePath = path,
-                                diffPreview = "",
-                                addedLines = 0,
-                                removedLines = 0,
-                                stdout = "",
-                                stderr = rewriteErr,
-                                exitCode = 1,
-                                durationMs = dur
-                            )
-                        )
-                    }
+                    // Read previous content if the file exists so we produce a real unified diff & accurate CREATED/EDITED badge
+                    val (existingContent, _) = readTermuxFileRaw(targetPath)
+                    val isNewFile = existingContent == null
 
                     val writeRes = writeTermuxFileAtomic(targetPath, content)
                     if (writeRes.exitCode != 0) {
                         return formatBridgeToolResult(writeRes, stepType = "EDIT", filePath = path)
                     }
+                    val syntaxWarn = validatePatchedSyntax(targetPath)
                     readFilesInRun.add(path)
-                    val lineCount = content.lines().size
-                    val diffLabel = "+$lineCount"
-                    val unifiedDiff = SurgicalPatchEngine.generateUnifiedDiff(path, "", content)
+                    val oldLines = existingContent?.lines().orEmpty()
+                    val newLines = content.lines()
+                    val addedCount = if (isNewFile) newLines.size else (newLines.size - oldLines.size).coerceAtLeast(1)
+                    val removedCount = if (isNewFile) 0 else (oldLines.size - newLines.size).coerceAtLeast(0)
+                    val diffLabel = if (isNewFile) "+${newLines.size}" else "+$addedCount -$removedCount"
+                    val unifiedDiff = SurgicalPatchEngine.generateUnifiedDiff(path, existingContent.orEmpty(), content)
                     val dur = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
-                    recordWorkingFile(path, WorkingFileState.CREATED, diffLabel)
+                    recordWorkingFile(path, if (isNewFile) WorkingFileState.CREATED else WorkingFileState.EDITED, diffLabel)
+                    val verb = if (isNewFile) "Created" else "Updated"
+                    val summaryOut = buildString {
+                        appendLine("$verb $path (${newLines.size} lines, $diffLabel).")
+                        if (syntaxWarn != null) appendLine("⚠️ Syntax check warning:\n$syntaxWarn")
+                    }.trim()
                     ToolResult(
-                        text = "Created $path ($lineCount lines).",
+                        text = summaryOut,
                         isError = false,
                         changed = true,
                         touched = listOf(path),
@@ -2190,9 +2211,9 @@ PYEOF
                             cwd = TermuxBridge.TERMUX_HOME,
                             filePath = path,
                             diffPreview = unifiedDiff,
-                            addedLines = lineCount,
-                            removedLines = 0,
-                            stdout = "Created $path ($lineCount lines).",
+                            addedLines = addedCount,
+                            removedLines = removedCount,
+                            stdout = summaryOut,
                             stderr = "",
                             exitCode = 0,
                             durationMs = dur

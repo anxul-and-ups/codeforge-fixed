@@ -845,13 +845,13 @@ fun AddProviderDialog(
 
                 fun validateAndSave(runTest: Boolean) {
                     val trimmedName = name.trim()
-                    val trimmedUrl = baseUrl.trim()
+                    val trimmedUrl = repo.normalizeBaseUrl(baseUrl)
                     if (trimmedName.isBlank()) {
                         errorText = "Please enter a Display Name."
                         return
                     }
-                    if (!(trimmedUrl.startsWith("http://") || trimmedUrl.startsWith("https://")) || trimmedUrl == "https://" || trimmedUrl == "http://") {
-                        errorText = "Please enter a valid Base URL starting with http:// or https://"
+                    if (trimmedUrl.isBlank() || trimmedUrl == "https://" || trimmedUrl == "http://") {
+                        errorText = "Please enter a valid Base URL (e.g. https://api.example.com/v1)."
                         return
                     }
                     if (customHeaders.isNotBlank()) {

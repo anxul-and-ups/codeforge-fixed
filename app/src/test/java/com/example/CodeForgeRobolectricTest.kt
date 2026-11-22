@@ -222,4 +222,35 @@ class CodeForgeRobolectricTest {
             testScope.cancel()
         }
     }
+
+    @Test
+    fun `modelsForActiveProvider strictly returns only selected provider models`() {
+        val openai = ProviderConfigEntity(
+            id = "openai",
+            name = "OpenAI",
+            baseUrl = "https://api.openai.com/v1",
+            apiFormat = "OPENAI",
+            encryptedApiKey = "enc_key_1",
+            modelsJson = """["gpt-4o","gpt-4o-mini"]""",
+            selectedModel = "gpt-4o",
+            priority = 1,
+            isEnabled = true
+        )
+        val custom = ProviderConfigEntity(
+            id = "custom-proxy",
+            name = "My Proxy",
+            baseUrl = "https://proxy.example.com/v1",
+            apiFormat = "OPENAI",
+            encryptedApiKey = "enc_key_2",
+            modelsJson = """["deepseek-reasoner","qwen2.5-coder"]""",
+            selectedModel = "deepseek-reasoner",
+            priority = 2,
+            isEnabled = true
+        )
+        val (selected, models) = com.example.ui.screens.chat.modelsForActiveProvider(listOf(openai, custom), "custom-proxy")
+        assertEquals("custom-proxy", selected?.id)
+        assertEquals(listOf("deepseek-reasoner", "qwen2.5-coder"), models)
+        assertFalse("Must never leak models from other providers", models.contains("gpt-4o"))
+    }
 }
+

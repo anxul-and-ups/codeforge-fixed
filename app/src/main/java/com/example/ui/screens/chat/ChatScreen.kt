@@ -37,6 +37,8 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.PlayArrow
@@ -120,6 +122,9 @@ fun ChatScreen(
     val cachedModels by viewModel.cachedModels.collectAsState()
     val preferredId by viewModel.preferredProviderId.collectAsState()
     val workingFiles by viewModel.workingFiles.collectAsState()
+    val codebaseFiles by viewModel.codebaseFiles.collectAsState()
+    val codebaseLoading by viewModel.codebaseLoading.collectAsState()
+    val openedFileViewer by viewModel.openedFileViewer.collectAsState()
     val engineHealth by viewModel.engineHealth.collectAsState()
     val terminalOutput by viewModel.terminalOutput.collectAsState()
     val processState by viewModel.processState.collectAsState()
@@ -137,18 +142,22 @@ fun ChatScreen(
     var showRepoPicker by remember { mutableStateOf(false) }
     var showProjectPicker by remember { mutableStateOf(false) }
     var showWorkingFilesSheet by remember { mutableStateOf(false) }
+    var showCodebaseSheet by remember { mutableStateOf(false) }
     var showTerminalSheet by remember { mutableStateOf(false) }
     val projectsList by viewModel.projectsList.collectAsState()
     val isScratch = uiState.activeProject?.id == com.example.data.repository.ProjectRepository.SCRATCH_ID
 
+    val latestStreamingId = messages.lastOrNull { it.status == "STREAMING" }?.id
     val visibleMessages = messages.filter { m ->
-        !(m.status == "STREAMING" && m.content.isBlank() && toolStepsMap[m.id].isNullOrEmpty())
+        val hasLiveStream = uiState.isAgentRunning && m.id == latestStreamingId &&
+            (uiState.streamingContent.isNotBlank() || uiState.streamingReasoning.isNotBlank())
+        hasLiveStream || !(m.status == "STREAMING" && m.content.isBlank() && toolStepsMap[m.id].isNullOrEmpty())
     }
     val streamingMessageId = visibleMessages.lastOrNull { it.status == "STREAMING" }?.id
 
     val activeProvider = providers.firstOrNull { it.id == preferredId && isProviderReady(it) }
         ?: providers.firstOrNull { isProviderReady(it) }
-    val providerPrefix = activeProvider?.id?.lowercase()?.takeIf { it.isNotBlank() }
+    val providerPrefix = activeProvider?.name?.lowercase()?.replace(" ", "-")?.takeIf { it.isNotBlank() }
     val rawModelId = activeProvider?.selectedModel?.ifBlank { "pick-model" } ?: "add-provider"
     val fullModelLabel = if (providerPrefix != null && !rawModelId.contains("/")) {
         "$providerPrefix/$rawModelId"
@@ -169,7 +178,13 @@ fun ChatScreen(
     }
 
     val stepCount = toolStepsMap.values.sumOf { it.size }
-    LaunchedEffect(messages.size, stepCount, uiState.streamingContent.length / 40, uiState.isAgentRunning) {
+    LaunchedEffect(
+        messages.size,
+        stepCount,
+        uiState.streamingContent.length / 40,
+        uiState.streamingReasoning.length / 40,
+        uiState.isAgentRunning
+    ) {
         val total = listState.layoutInfo.totalItemsCount
         if (total > 0) listState.scrollToItem(total - 1)
     }
@@ -265,6 +280,24 @@ fun ChatScreen(
             onRevertFile = { path -> viewModel.revertSingleFile(path) },
             onRevertAll = { viewModel.revertAllChangesInLastRun() },
             onDismiss = { showWorkingFilesSheet = false }
+        )
+    }
+    if (showCodebaseSheet) {
+        val wsTitle = if (isScratch) "Termux Home" else (uiState.activeProject?.name ?: "Workspace")
+        val wsPath = if (isScratch) "~/forge/projects" else "~/forge/projects/${uiState.activeProject?.slug ?: "app"}"
+        CodebaseDrawerSheet(
+            workspaceTitle = wsTitle,
+            workspacePath = wsPath,
+            files = codebaseFiles,
+            isLoading = codebaseLoading,
+            openedFile = openedFileViewer,
+            onRefresh = { viewModel.refreshCodebaseFiles() },
+            onOpenFile = { item -> viewModel.openCodebaseFile(item) },
+            onCloseFile = { viewModel.closeCodebaseFile() },
+            onDismiss = {
+                viewModel.closeCodebaseFile()
+                showCodebaseSheet = false
+            }
         )
     }
     if (showTerminalSheet) {
@@ -424,14 +457,49 @@ fun ChatScreen(
                                 }
                             }
 
-                            // Live Termux HTTP Bridge Connection Pill (Polled every 5s via GET 127.0.0.1:47831/health)
-                            val isConnected = engineHealth.engineRunning
-                            val statusColor = if (isConnected) Color(0xFF3FB950) else Color(0xFFF85149)
+                            // In-Chat Codebase Pill (always accessible, displays live green checkmark count when AI edits/creates files)
+                            val modifiedAiCount = remember(codebaseFiles) { codebaseFiles.count { it.isModifiedByAi } }
                             Surface(
                                 shape = RoundedCornerShape(10.dp),
-                                color = statusColor.copy(alpha = 0.14f),
+                                color = if (modifiedAiCount > 0) AppColors.diffAddBg else AppColors.surface,
                                 modifier = Modifier
-                                    .border(1.dp, statusColor.copy(alpha = 0.45f), RoundedCornerShape(10.dp))
+                                    .border(
+                                        1.dp,
+                                        if (modifiedAiCount > 0) AppColors.ok.copy(alpha = 0.45f) else AppColors.border,
+                                        RoundedCornerShape(10.dp)
+                                    )
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .clickable { showCodebaseSheet = true }
+                                    .testTag("codebase_panel_button")
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = if (modifiedAiCount > 0) Icons.Default.CheckCircle else Icons.Default.FolderOpen,
+                                        contentDescription = "Open Codebase",
+                                        tint = if (modifiedAiCount > 0) AppColors.ok else AppColors.accent,
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(5.dp))
+                                    Text(
+                                        text = if (modifiedAiCount > 0) "Codebase · $modifiedAiCount" else "Codebase",
+                                        fontSize = 11.5.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = if (modifiedAiCount > 0) AppColors.diffAddText else AppColors.textPrimary
+                                    )
+                                }
+                            }
+
+                            // Live Termux HTTP Bridge Connection Pill (Polled every 5s via GET 127.0.0.1:47831/health)
+                            val isConnected = engineHealth.engineRunning
+                            val statusColor = if (isConnected) AppColors.ok else AppColors.error
+                            Surface(
+                                shape = RoundedCornerShape(10.dp),
+                                color = if (isConnected) AppColors.diffAddBg else AppColors.diffRemoveBg,
+                                modifier = Modifier
+                                    .border(1.dp, statusColor.copy(alpha = 0.40f), RoundedCornerShape(10.dp))
                                     .clip(RoundedCornerShape(10.dp))
                                     .clickable { showTerminalSheet = true }
                                     .testTag("termux_connection_pill")
@@ -451,38 +519,8 @@ fun ChatScreen(
                                         text = if (isConnected) "Connected" else "Disconnected",
                                         fontSize = 11.sp,
                                         fontWeight = FontWeight.SemiBold,
-                                        color = statusColor
+                                        color = if (isConnected) AppColors.diffAddText else AppColors.diffRemoveText
                                     )
-                                }
-                            }
-
-                            // Working Files Pill Badge
-                            if (workingFiles.isNotEmpty()) {
-                                Surface(
-                                    shape = RoundedCornerShape(10.dp),
-                                    color = AppColors.accentSoft,
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(10.dp))
-                                        .clickable { showWorkingFilesSheet = true }
-                                ) {
-                                    Row(
-                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Icon(
-                                            Icons.Default.Description,
-                                            contentDescription = "Working files",
-                                            tint = AppColors.accent,
-                                            modifier = Modifier.size(13.dp)
-                                        )
-                                        Spacer(modifier = Modifier.width(4.dp))
-                                        Text(
-                                            "${workingFiles.size}",
-                                            fontSize = 11.sp,
-                                            fontWeight = FontWeight.SemiBold,
-                                            color = AppColors.accent
-                                        )
-                                    }
                                 }
                             }
                         }
@@ -533,13 +571,13 @@ fun ChatScreen(
 
             Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(AppColors.border))
 
-            // ---------------- Live Disconnected Alert Banner (Bug 3 Fix) ----------------
+            // ---------------- Live Disconnected Alert Banner ----------------
             if (!engineHealth.engineRunning) {
                 Surface(
-                    color = Color(0xFF2D1215),
+                    color = AppColors.diffRemoveBg,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .border(0.5.dp, Color(0xFFF85149).copy(alpha = 0.55f))
+                        .border(0.5.dp, AppColors.error.copy(alpha = 0.35f))
                 ) {
                     Row(
                         modifier = Modifier
@@ -550,21 +588,21 @@ fun ChatScreen(
                         Icon(
                             Icons.Default.Warning,
                             contentDescription = "Termux Disconnected",
-                            tint = Color(0xFFF85149),
+                            tint = AppColors.error,
                             modifier = Modifier.size(16.dp)
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "Disconnected · Termux Bridge (127.0.0.1:47831) Offline",
+                                text = "Termux Bridge Offline (127.0.0.1:47831)",
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.SemiBold,
-                                color = Color(0xFFFFB4AB)
+                                color = AppColors.diffRemoveText
                             )
                             Text(
-                                text = "Start the Python HTTP bridge in Termux to enable chat & command execution.",
+                                text = "Start the Python HTTP bridge in Termux to run commands.",
                                 fontSize = 11.sp,
-                                color = Color(0xFFFFB4AB).copy(alpha = 0.85f)
+                                color = AppColors.textSecondary
                             )
                         }
                         Spacer(modifier = Modifier.width(6.dp))
@@ -572,13 +610,13 @@ fun ChatScreen(
                             onClick = { viewModel.repairEngine() },
                             contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 2.dp)
                         ) {
-                            Text("Retry", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = Color.White)
+                            Text("Retry", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = AppColors.accent)
                         }
                         TextButton(
                             onClick = { showTerminalSheet = true },
                             contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 2.dp)
                         ) {
-                            Text("Commands", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF58A6FF))
+                            Text("Bridge", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = AppColors.textPrimary)
                         }
                     }
                 }
@@ -642,7 +680,7 @@ fun ChatScreen(
                         isChatMode = uiState.mode == AgentMode.CHAT,
                         onRetry = { viewModel.retryFailedMessage(message) },
                         onSwitchToBuild = { viewModel.setMode(AgentMode.BUILD) },
-                        onOpenWorkingFiles = { showWorkingFilesSheet = true }
+                        onOpenWorkingFiles = { showCodebaseSheet = true }
                     )
                 }
 
@@ -664,10 +702,11 @@ fun ChatScreen(
             // ---------------- Slash Command Suggestions Popup ----------------
             if (inputText.startsWith("/") && !inputText.contains(" ")) {
                 val slashCommands = listOf(
+                    "/codebase" to "Browse workspace files & code viewer",
                     "/mode" to "Switch Build / Plan agent",
-                    "/model" to "Open live Model Picker",
+                    "/model" to "Open active provider Model Picker",
                     "/build" to "Sync & trigger GitHub Actions cloud build",
-                    "/files" to "Open Working Files panel",
+                    "/files" to "Open session changed files",
                     "/terminal" to "Open Forge Terminal drawer",
                     "/clone " to "Clone a GitHub repository URL"
                 ).filter { it.first.startsWith(inputText.lowercase()) }
@@ -687,6 +726,10 @@ fun ChatScreen(
                                         .fillMaxWidth()
                                         .clickable {
                                             when (cmd.trim()) {
+                                                "/codebase" -> {
+                                                    showCodebaseSheet = true
+                                                    inputText = ""
+                                                }
                                                 "/mode" -> {
                                                     showAgentPicker = true
                                                     inputText = ""
@@ -722,7 +765,7 @@ fun ChatScreen(
                 }
             }
 
-            // ---------------- Cloud IDE Deterministic Process State Bar ----------------
+            // ---------------- Warm Light Process State Bar ----------------
             if (uiState.isAgentRunning || processState.phase != com.example.data.agent.AgentProcessPhase.IDLE) {
                 var elapsedSec by remember(runStartedAtMs) { mutableStateOf(0L) }
                 LaunchedEffect(runStartedAtMs, uiState.isAgentRunning) {
@@ -733,31 +776,31 @@ fun ChatScreen(
                     }
                 }
                 val phaseColor = when (processState.phase) {
-                    com.example.data.agent.AgentProcessPhase.PATCHING -> Color(0xFFD2A8FF)
-                    com.example.data.agent.AgentProcessPhase.DISCOVERING -> Color(0xFF79C0FF)
-                    com.example.data.agent.AgentProcessPhase.EXECUTING_COMMAND -> Color(0xFF3FB950)
-                    com.example.data.agent.AgentProcessPhase.WAITING_APPROVAL -> Color(0xFFD29922)
+                    com.example.data.agent.AgentProcessPhase.PATCHING -> AppColors.accent
+                    com.example.data.agent.AgentProcessPhase.DISCOVERING -> AppColors.info
+                    com.example.data.agent.AgentProcessPhase.EXECUTING_COMMAND -> AppColors.ok
+                    com.example.data.agent.AgentProcessPhase.WAITING_APPROVAL -> AppColors.warn
                     com.example.data.agent.AgentProcessPhase.ERROR,
-                    com.example.data.agent.AgentProcessPhase.ABORTED -> Color(0xFFF85149)
-                    else -> Color(0xFF58A6FF)
+                    com.example.data.agent.AgentProcessPhase.ABORTED -> AppColors.error
+                    else -> AppColors.accent
                 }
                 val mm = elapsedSec / 60
                 val ss = elapsedSec % 60
                 val timerText = "%02d:%02d".format(mm, ss)
 
                 Surface(
-                    color = Color(0xFF0D1117),
-                    shape = RoundedCornerShape(12.dp),
+                    color = AppColors.surface,
+                    shape = RoundedCornerShape(14.dp),
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 10.dp, vertical = 4.dp)
-                        .border(1.dp, phaseColor.copy(alpha = 0.45f), RoundedCornerShape(12.dp))
+                        .padding(horizontal = 12.dp, vertical = 4.dp)
+                        .border(1.dp, AppColors.border, RoundedCornerShape(14.dp))
                         .testTag("cloud_process_state_bar")
                 ) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 10.dp, vertical = 7.dp),
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         if (uiState.isAgentRunning) {
@@ -777,7 +820,7 @@ fun ChatScreen(
                         Spacer(modifier = Modifier.width(8.dp))
                         Surface(
                             shape = RoundedCornerShape(6.dp),
-                            color = phaseColor.copy(alpha = 0.16f)
+                            color = phaseColor.copy(alpha = 0.14f)
                         ) {
                             Text(
                                 text = processState.phase.label,
@@ -792,8 +835,8 @@ fun ChatScreen(
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
                                 text = processState.detail.ifBlank { uiState.currentAgentStatus.ifBlank { "Working…" } },
-                                fontSize = 11.sp,
-                                color = Color(0xFFE6EDF3),
+                                fontSize = 11.5.sp,
+                                color = AppColors.textPrimary,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )
@@ -803,7 +846,7 @@ fun ChatScreen(
                                     text = cmdPreview,
                                     fontSize = 10.sp,
                                     fontFamily = FontFamily.Monospace,
-                                    color = Color(0xFF8B949E),
+                                    color = AppColors.textMuted,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
@@ -815,25 +858,25 @@ fun ChatScreen(
                             fontSize = 11.sp,
                             fontFamily = FontFamily.Monospace,
                             fontWeight = FontWeight.SemiBold,
-                            color = Color(0xFF8B949E)
+                            color = AppColors.textMuted
                         )
                         if (uiState.isAgentRunning) {
                             Spacer(modifier = Modifier.width(8.dp))
                             Surface(
                                 shape = RoundedCornerShape(8.dp),
-                                color = Color(0xFFF85149).copy(alpha = 0.2f),
+                                color = AppColors.diffRemoveBg,
                                 modifier = Modifier
-                                    .border(1.dp, Color(0xFFF85149).copy(alpha = 0.55f), RoundedCornerShape(8.dp))
+                                    .border(1.dp, AppColors.error.copy(alpha = 0.35f), RoundedCornerShape(8.dp))
                                     .clip(RoundedCornerShape(8.dp))
                                     .clickable { viewModel.stopAgent() }
                                     .testTag("process_bar_abort_button")
                             ) {
                                 Text(
-                                    text = "Abort",
+                                    text = "Stop",
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.Bold,
-                                    color = Color(0xFFFFA198),
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                    color = AppColors.diffRemoveText,
+                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp)
                                 )
                             }
                         }
@@ -971,33 +1014,32 @@ fun ChatScreen(
                             (inputText.isNotBlank() || uiState.pendingAttachments.isNotEmpty()) &&
                             !uiState.isPreparing
                         if (uiState.isAgentRunning) {
-                            // Stop Button: Dark circle with Red Rounded Square inside (matches video at 0:13)
+                            // Stop Button: Warm surface circle with crisp rose-red stop square
                             Box(
                                 modifier = Modifier
                                     .size(44.dp)
                                     .clip(CircleShape)
-                                    .background(Color(0xFF1E222A))
-                                    .border(1.5.dp, Color(0xFF3A3F4B), CircleShape)
+                                    .background(AppColors.diffRemoveBg)
+                                    .border(1.5.dp, AppColors.error.copy(alpha = 0.45f), CircleShape)
                                     .clickable { viewModel.stopAgent() }
                                     .testTag("stop_agent_button"),
                                 contentAlignment = Alignment.Center
                             ) {
                                 Box(
                                     modifier = Modifier
-                                        .size(16.dp)
+                                        .size(15.dp)
                                         .clip(RoundedCornerShape(4.dp))
-                                        .background(Color(0xFFFF4D4D))
+                                        .background(AppColors.error)
                                 )
                             }
                         } else {
-                            // Send Button: Blue circle with paper-plane Send icon (matches screenshot)
-                            val sendBg = if (canSend) Color(0xFF1868DB) else Color(0xFF1868DB).copy(alpha = 0.42f)
+                            // Send Button: Burnt rust-orange accent circle matching CodeForge visual identity
+                            val sendBg = if (canSend) AppColors.accent else AppColors.accent.copy(alpha = 0.38f)
                             Box(
                                 modifier = Modifier
                                     .size(44.dp)
                                     .clip(CircleShape)
                                     .background(sendBg)
-                                    .border(1.5.dp, Color.White.copy(alpha = 0.28f), CircleShape)
                                     .clickable(enabled = canSend) {
                                         val text = inputText
                                         inputText = ""
@@ -1010,13 +1052,13 @@ fun ChatScreen(
                                     CircularProgressIndicator(
                                         modifier = Modifier.size(18.dp),
                                         strokeWidth = 2.dp,
-                                        color = Color.White
+                                        color = AppColors.onAccent
                                     )
                                 } else {
                                     Icon(
                                         Icons.Default.Send,
                                         contentDescription = "Send",
-                                        tint = Color.White,
+                                        tint = AppColors.onAccent,
                                         modifier = Modifier.size(19.dp)
                                     )
                                 }
@@ -1153,8 +1195,8 @@ private fun CodeForgeAvatarBadge() {
         modifier = Modifier
             .size(28.dp)
             .clip(CircleShape)
-            .background(Color(0xFF1868DB).copy(alpha = 0.16f))
-            .border(1.dp, Color(0xFF1868DB).copy(alpha = 0.55f), CircleShape),
+            .background(AppColors.accentSoft)
+            .border(1.dp, AppColors.accent.copy(alpha = 0.35f), CircleShape),
         contentAlignment = Alignment.Center
     ) {
         Text(
@@ -1162,7 +1204,7 @@ private fun CodeForgeAvatarBadge() {
             fontSize = 10.sp,
             fontFamily = FontFamily.Monospace,
             fontWeight = FontWeight.Bold,
-            color = Color(0xFF388BFD)
+            color = AppColors.accent
         )
     }
 }
@@ -1440,10 +1482,10 @@ private fun ChatMessage(
                 }
             }
             if (text.isNotEmpty()) {
-                // Blue user message bubble matching screenshot (#1868DB)
+                // Warm burnt rust-orange primary user message bubble matching CodeForge identity
                 Surface(
                     shape = RoundedCornerShape(20.dp),
-                    color = Color(0xFF1868DB),
+                    color = AppColors.accent,
                     modifier = Modifier
                         .widthIn(max = 330.dp)
                         .testTag("user_message_bubble")
@@ -1452,7 +1494,7 @@ private fun ChatMessage(
                         text = text,
                         fontSize = 15.sp,
                         lineHeight = 21.sp,
-                        color = Color.White,
+                        color = AppColors.onAccent,
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)
                     )
                 }
@@ -1511,20 +1553,24 @@ private fun ChatMessage(
             }
 
             val reasoning = if (live && liveReasoning.isNotBlank()) liveReasoning else message.reasoning
+            val text = if (live) liveContent else cleanAssistantContent
             if (!reasoning.isNullOrBlank()) {
-                ThinkingBlockView(reasoning = reasoning)
+                ThinkingBlockView(
+                    reasoning = reasoning,
+                    isStreaming = live && text.isBlank(),
+                    modifier = Modifier.testTag("thinking_block_view")
+                )
             }
 
-            val text = if (live) liveContent else cleanAssistantContent
             val isErrorBubble = !live && message.status == "ERROR" && !isInterrupted
             if (text.isNotBlank()) {
                 if (isErrorBubble) {
                     Surface(
                         shape = RoundedCornerShape(14.dp),
-                        color = Color(0xFF2D1215),
+                        color = AppColors.diffRemoveBg,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .border(1.dp, Color(0xFFF85149), RoundedCornerShape(14.dp))
+                            .border(1.dp, AppColors.error.copy(alpha = 0.55f), RoundedCornerShape(14.dp))
                             .testTag("error_message_bubble")
                     ) {
                         Row(
@@ -1534,7 +1580,7 @@ private fun ChatMessage(
                             Icon(
                                 Icons.Default.Warning,
                                 contentDescription = "Error",
-                                tint = Color(0xFFF85149),
+                                tint = AppColors.error,
                                 modifier = Modifier
                                     .size(18.dp)
                                     .padding(top = 2.dp)
@@ -1545,7 +1591,7 @@ private fun ChatMessage(
                                 fontSize = 14.sp,
                                 lineHeight = 20.sp,
                                 fontWeight = FontWeight.Medium,
-                                color = Color(0xFFFFB4AB)
+                                color = AppColors.diffRemoveText
                             )
                         }
                     }
@@ -1614,7 +1660,7 @@ private fun ChatMessage(
                 val changed = remember(toolSteps) {
                     val out = LinkedHashSet<String>()
                     for (st in toolSteps) {
-                        if (st.toolName in setOf("edit_file", "write_file", "insert_after_line", "replace_line_range", "delete_file")) {
+                        if (st.toolName in setOf("apply_patch", "edit_file", "write_file", "insert_after_line", "replace_line_range", "delete_file")) {
                             val path = st.filePath ?: try { org.json.JSONObject(st.argumentsJson).optString("path") } catch (_: Exception) { "" }
                             if (path.isNotBlank() && !st.isError) out.add(path.substringAfterLast('/'))
                         }

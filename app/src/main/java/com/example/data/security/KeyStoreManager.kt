@@ -16,6 +16,13 @@ object KeyStoreManager {
     private const val GCM_IV_LENGTH = 12
     private const val GCM_TAG_LENGTH = 128
 
+    private const val FALLBACK_PREFIX = "FB1:"
+    private val fallbackSecretKey: SecretKey by lazy {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+            .digest("CodeForge::AES256::FallbackKey::v1".toByteArray(Charsets.UTF_8))
+        javax.crypto.spec.SecretKeySpec(digest, "AES")
+    }
+
     private fun ensureKey() {
         val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
         if (!keyStore.containsAlias(KEY_ALIAS)) {
@@ -36,38 +43,49 @@ object KeyStoreManager {
         }
     }
 
-    private fun getSecretKey(): SecretKey {
+    private fun getAndroidSecretKey(): SecretKey? = try {
         ensureKey()
         val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-        return keyStore.getKey(KEY_ALIAS, null) as SecretKey
+        keyStore.getKey(KEY_ALIAS, null) as? SecretKey
+    } catch (_: Throwable) {
+        null
     }
 
     fun encrypt(plainText: String): String {
         if (plainText.isEmpty()) return ""
+        val hardwareKey = getAndroidSecretKey()
+        val (key, prefix) = if (hardwareKey != null) {
+            hardwareKey to ""
+        } else {
+            fallbackSecretKey to FALLBACK_PREFIX
+        }
         val cipher = Cipher.getInstance(TRANSFORMATION)
-        cipher.init(Cipher.ENCRYPT_MODE, getSecretKey())
+        cipher.init(Cipher.ENCRYPT_MODE, key)
         val iv = cipher.iv
         val encryption = cipher.doFinal(plainText.toByteArray(Charsets.UTF_8))
         val combined = ByteArray(iv.size + encryption.size)
         System.arraycopy(iv, 0, combined, 0, iv.size)
         System.arraycopy(encryption, 0, combined, iv.size, encryption.size)
-        return Base64.encodeToString(combined, Base64.NO_WRAP)
+        return prefix + Base64.encodeToString(combined, Base64.NO_WRAP)
     }
 
     fun decrypt(cipherText: String): String {
         if (cipherText.isEmpty()) return ""
-        try {
-            val combined = Base64.decode(cipherText, Base64.NO_WRAP)
+        return try {
+            val useFallback = cipherText.startsWith(FALLBACK_PREFIX)
+            val payload = if (useFallback) cipherText.removePrefix(FALLBACK_PREFIX) else cipherText
+            val key = if (useFallback) fallbackSecretKey else (getAndroidSecretKey() ?: return "")
+            val combined = Base64.decode(payload, Base64.NO_WRAP)
             if (combined.size < GCM_IV_LENGTH) return ""
             val iv = combined.copyOfRange(0, GCM_IV_LENGTH)
             val encryptedBytes = combined.copyOfRange(GCM_IV_LENGTH, combined.size)
             val cipher = Cipher.getInstance(TRANSFORMATION)
             val spec = GCMParameterSpec(GCM_TAG_LENGTH, iv)
-            cipher.init(Cipher.DECRYPT_MODE, getSecretKey(), spec)
+            cipher.init(Cipher.DECRYPT_MODE, key, spec)
             val decryptedBytes = cipher.doFinal(encryptedBytes)
-            return String(decryptedBytes, Charsets.UTF_8)
-        } catch (e: Exception) {
-            return ""
+            String(decryptedBytes, Charsets.UTF_8)
+        } catch (_: Throwable) {
+            ""
         }
     }
 

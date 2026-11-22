@@ -302,6 +302,27 @@ class ProviderRepository(
         return provider
     }
 
+    fun normalizeBaseUrl(rawUrl: String): String {
+        val cleaned = rawUrl.trim()
+            .replace("\n", "")
+            .replace("\r", "")
+            .replace(" ", "")
+            .trimEnd('/')
+        if (cleaned.isBlank()) return ""
+        val withScheme = if (cleaned.startsWith("http://", ignoreCase = true) || cleaned.startsWith("https://", ignoreCase = true)) {
+            cleaned
+        } else {
+            val lower = cleaned.lowercase()
+            val isLocal = lower.startsWith("localhost") || lower.startsWith("127.0.0.1") ||
+                lower.startsWith("10.0.2.2") || lower.startsWith("192.168.") || lower.startsWith("10.")
+            if (isLocal) "http://$cleaned" else "https://$cleaned"
+        }
+        return withScheme
+            .removeSuffix("/chat/completions")
+            .removeSuffix("/models")
+            .trimEnd('/')
+    }
+
     suspend fun addCustomProvider(
         name: String,
         baseUrl: String,
@@ -317,7 +338,7 @@ class ProviderRepository(
         val id = "$slug-${UUID.randomUUID().toString().take(6)}"
         val all = providerDao.getAllProvidersOnce()
         val priority = (all.maxOfOrNull { it.priority } ?: 0) + 1
-        val normalizedUrl = baseUrl.trim().trimEnd('/').removeSuffix("/chat/completions")
+        val normalizedUrl = normalizeBaseUrl(baseUrl)
         val cleanModel = selectedModel.trim()
         val mergedModels = buildList {
             if (cleanModel.isNotBlank()) add(cleanModel)
@@ -372,27 +393,29 @@ class ProviderRepository(
      */
     suspend fun testAndFetchModels(provider: ProviderConfigEntity, freeOnly: Boolean = false): ConnectionTestDiagnosis {
         val t0 = System.currentTimeMillis()
+        val normalizedUrl = normalizeBaseUrl(provider.baseUrl).ifBlank { provider.baseUrl.trim() }
+        val target = if (normalizedUrl != provider.baseUrl) provider.copy(baseUrl = normalizedUrl) else provider
         // Ensure row exists in Room before updating status
-        if (providerDao.getProviderById(provider.id) == null) {
-            providerDao.insertProvider(provider)
+        if (providerDao.getProviderById(target.id) == null) {
+            providerDao.insertProvider(target)
         }
         return try {
-            val fetch = llmClient.fetchModelsDetailed(provider, freeOnly)
+            val fetch = llmClient.fetchModelsDetailed(target, freeOnly)
             val latency = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
-            cacheServerModels(provider, fetch)
+            cacheServerModels(target, fetch)
 
             val allModels = buildList {
-                if (provider.selectedModel.isNotBlank() && provider.selectedModel !in fetch.models) {
-                    add(provider.selectedModel)
+                if (target.selectedModel.isNotBlank() && target.selectedModel !in fetch.models) {
+                    add(target.selectedModel)
                 }
                 addAll(fetch.models)
             }
-            val autoSelected = if (provider.selectedModel.isNotBlank()) {
-                provider.selectedModel
+            val autoSelected = if (target.selectedModel.isNotBlank()) {
+                target.selectedModel
             } else {
                 allModels.firstOrNull().orEmpty()
             }
-            val updated = provider.copy(
+            val updated = target.copy(
                 modelsJson = JSONArray(allModels).toString(),
                 selectedModel = autoSelected,
                 lastTestedAt = System.currentTimeMillis(),
@@ -406,7 +429,7 @@ class ProviderRepository(
             if (autoSelected.isNotBlank()) {
                 providerDao.upsertHealthState(
                     HealthStateEntity(
-                        keyId = provider.id,
+                        keyId = target.id,
                         modelId = autoSelected,
                         state = "HEALTHY",
                         untilTimestamp = 0L,
@@ -416,8 +439,8 @@ class ProviderRepository(
                 )
             }
             ConnectionTestDiagnosis(
-                providerId = provider.id,
-                providerName = provider.name,
+                providerId = target.id,
+                providerName = target.name,
                 success = true,
                 latencyMs = latency,
                 modelsFound = allModels.size,
@@ -428,9 +451,9 @@ class ProviderRepository(
         } catch (e: Exception) {
             // Some custom OpenAI-compatible proxies don't implement GET /models (404/405),
             // but DO work with POST /chat/completions if a custom model ID is provided.
-            if (provider.selectedModel.isNotBlank()) {
+            if (target.selectedModel.isNotBlank()) {
                 val pingErr = try {
-                    llmClient.testConnectionError(provider)
+                    llmClient.testConnectionError(target)
                 } catch (ce: CancellationException) {
                     throw ce
                 } catch (ex: Exception) {
@@ -438,8 +461,8 @@ class ProviderRepository(
                 }
                 if (pingErr == null) {
                     val latency = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
-                    val updated = provider.copy(
-                        modelsJson = JSONArray(listOf(provider.selectedModel)).toString(),
+                    val updated = target.copy(
+                        modelsJson = JSONArray(listOf(target.selectedModel)).toString(),
                         lastTestedAt = System.currentTimeMillis(),
                         lastTestStatus = "WORKING",
                         lastLatencyMs = latency,
@@ -449,36 +472,55 @@ class ProviderRepository(
                     )
                     providerDao.insertProvider(updated)
                     return ConnectionTestDiagnosis(
-                        providerId = provider.id,
-                        providerName = provider.name,
+                        providerId = target.id,
+                        providerName = target.name,
                         success = true,
                         latencyMs = latency,
                         modelsFound = 1,
-                        plainReason = "Connected (${latency} ms) using custom model ${provider.selectedModel}"
+                        plainReason = "Connected (${latency} ms) using custom model ${target.selectedModel}"
                     )
                 }
             }
             val latency = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
             val errClass = classifyError(e)
+            val readableDetail = describeConnectionError(e, target.baseUrl)
             providerDao.insertProvider(
-                provider.copy(
+                target.copy(
                     lastTestedAt = System.currentTimeMillis(),
                     lastTestStatus = if (errClass == ProviderErrorClass.AUTH) "INVALID" else "FAILED",
                     lastLatencyMs = latency,
-                    lastError = e.message?.take(200),
+                    lastError = readableDetail.take(220),
                     lastErrorClass = errClass.name
                 )
             )
             ConnectionTestDiagnosis(
-                providerId = provider.id,
-                providerName = provider.name,
+                providerId = target.id,
+                providerName = target.name,
                 success = false,
                 latencyMs = latency,
                 modelsFound = 0,
                 errorClass = errClass,
-                plainReason = "${errClass.label}: ${e.message?.take(160) ?: errClass.plainReason}",
+                plainReason = readableDetail,
                 suggestedFix = errClass.suggestedFix
             )
+        }
+    }
+
+    private fun describeConnectionError(e: Exception, baseUrl: String): String {
+        val raw = e.message?.trim().orEmpty()
+        return when {
+            e is java.net.UnknownHostException ->
+                "Host not found for \"$baseUrl\". Check the Base URL domain spelling or DNS."
+            e is javax.net.ssl.SSLException ->
+                "TLS/SSL handshake failed for \"$baseUrl\" (${raw.take(120)})."
+            e is java.net.ConnectException ->
+                "Connection refused by \"$baseUrl\". Ensure the server/port is running."
+            e is java.net.SocketTimeoutException ->
+                "Server at \"$baseUrl\" timed out before responding."
+            e is IllegalArgumentException ->
+                "Invalid Base URL \"$baseUrl\" (${raw.take(120)})."
+            e is ApiException -> raw.ifBlank { "HTTP ${e.statusCode} error from provider" }
+            else -> raw.ifBlank { e.javaClass.simpleName }
         }
     }
 
@@ -612,6 +654,12 @@ class ProviderRepository(
      * Section 9.2 — Exact 9-class error classification.
      */
     fun classifyError(e: Exception): ProviderErrorClass {
+        if (e is IllegalArgumentException) {
+            return ProviderErrorClass.BAD_REQUEST
+        }
+        if (e is javax.net.ssl.SSLException || e is java.net.SocketTimeoutException || e is java.net.ConnectException) {
+            return ProviderErrorClass.TRANSIENT
+        }
         if (e is UnknownHostException || (e is IOException && e.message?.contains("Unable to resolve host", ignoreCase = true) == true)) {
             return ProviderErrorClass.NETWORK_DOWN
         }

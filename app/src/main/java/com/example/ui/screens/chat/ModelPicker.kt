@@ -27,6 +27,7 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -38,6 +39,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -45,6 +47,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -68,12 +71,29 @@ fun providerModels(p: ProviderConfigEntity): List<String> {
 
 private fun isLocalUrl(url: String): Boolean {
     val u = url.lowercase()
-    return u.contains("localhost") || u.contains("127.0.0.1") || u.contains("10.0.2.2")
+    return u.contains("localhost") || u.contains("127.0.0.1") || u.contains("10.0.2.2") ||
+        u.contains("192.168.") || u.contains("://10.")
 }
 
 /** A provider is usable when it is switched on and has an API key (or points to a local server). */
 fun isProviderReady(p: ProviderConfigEntity): Boolean =
     p.isEnabled && (p.encryptedApiKey.isNotEmpty() || isLocalUrl(p.baseUrl))
+
+/**
+ * Strictly resolves the single active provider and ONLY its models — never mixing models
+ * from other providers into the Chat model dropdown.
+ */
+fun modelsForActiveProvider(
+    providers: List<ProviderConfigEntity>,
+    activeProviderId: String?
+): Pair<ProviderConfigEntity?, List<String>> {
+    val ready = providers.filter { isProviderReady(it) }
+    val selected = ready.firstOrNull { it.id == activeProviderId }
+        ?: providers.firstOrNull { it.id == activeProviderId && it.isEnabled }
+        ?: ready.firstOrNull()
+    if (selected == null) return Pair(null, emptyList())
+    return Pair(selected, providerModels(selected))
+}
 
 enum class ModelFilterChip(val label: String) {
     ALL("All"),
@@ -81,19 +101,6 @@ enum class ModelFilterChip(val label: String) {
     TOOLS("Tools"),
     VISION("Vision"),
     LONG_CONTEXT("Long context")
-}
-
-private sealed class PickerRow {
-    data class Header(val provider: ProviderConfigEntity, val modelCount: Int) : PickerRow()
-    data class Model(
-        val provider: ProviderConfigEntity,
-        val model: String,
-        val selected: Boolean,
-        val metadata: ModelCacheEntity?
-    ) : PickerRow()
-    object SetupTitle : PickerRow()
-    data class Setup(val provider: ProviderConfigEntity) : PickerRow()
-    object AddCustom : PickerRow()
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -114,21 +121,45 @@ fun ModelPickerDialog(
     var activeFilter by remember { mutableStateOf(ModelFilterChip.ALL) }
     var showAddCustomField by remember { mutableStateOf(false) }
     var customModelInput by remember { mutableStateOf("") }
+    var refreshing by remember { mutableStateOf(false) }
 
-    val readyProviders = providers.filter { isProviderReady(it) }
-        .sortedByDescending { it.id == activeProviderId }
-    val notReady = providers.filter { !isProviderReady(it) }
-    val query = searchQuery.trim()
-    val cacheMap = remember(cachedModels) {
-        cachedModels.associateBy { "${it.providerId}:${it.modelId}" }
+    val readyProviders = remember(providers) { providers.filter { isProviderReady(it) } }
+    var browsingProviderId by remember(activeProviderId, readyProviders.size) {
+        mutableStateOf(
+            readyProviders.firstOrNull { it.id == activeProviderId }?.id
+                ?: activeProviderId
+                ?: readyProviders.firstOrNull()?.id
+        )
     }
 
-    val rows = ArrayList<PickerRow>()
-    for (p in readyProviders) {
-        val rawModels = providerModels(p)
-        val filtered = rawModels.filter { modelId ->
-            val meta = cacheMap["${p.id}:$modelId"]
-            val matchesQuery = query.isEmpty() || modelId.contains(query, ignoreCase = true) || p.name.contains(query, ignoreCase = true)
+    val (selectedProvider, activeModelsRaw) = remember(providers, browsingProviderId) {
+        modelsForActiveProvider(providers, browsingProviderId)
+    }
+
+    // Auto-fetch models if the active provider currently has no models loaded
+    LaunchedEffect(selectedProvider?.id) {
+        val p = selectedProvider ?: return@LaunchedEffect
+        if (activeModelsRaw.isEmpty()) {
+            refreshing = true
+            onRefreshProviderModels(p.id)
+        }
+    }
+    LaunchedEffect(activeModelsRaw.size, selectedProvider?.lastTestedAt) {
+        refreshing = false
+    }
+
+    val query = searchQuery.trim()
+    val cacheMap = remember(cachedModels, selectedProvider?.id) {
+        val pid = selectedProvider?.id
+        cachedModels.filter { it.providerId == pid }.associateBy { it.modelId }
+    }
+
+    val filteredModels = remember(activeModelsRaw, query, activeFilter, cacheMap) {
+        activeModelsRaw.filter { modelId ->
+            val meta = cacheMap[modelId]
+            val matchesQuery = query.isEmpty() ||
+                modelId.contains(query, ignoreCase = true) ||
+                (meta?.displayName?.contains(query, ignoreCase = true) == true)
             val matchesChip = when (activeFilter) {
                 ModelFilterChip.ALL -> true
                 ModelFilterChip.FAVORITES -> meta?.isFavorite == true
@@ -138,23 +169,7 @@ fun ModelPickerDialog(
             }
             matchesQuery && matchesChip
         }
-        rows.add(PickerRow.Header(p, rawModels.size))
-        for (m in filtered) {
-            rows.add(
-                PickerRow.Model(
-                    provider = p,
-                    model = m,
-                    selected = p.id == activeProviderId && m == p.selectedModel,
-                    metadata = cacheMap["${p.id}:$m"]
-                )
-            )
-        }
     }
-    if (notReady.isNotEmpty()) {
-        rows.add(PickerRow.SetupTitle)
-        for (p in notReady) rows.add(PickerRow.Setup(p))
-    }
-    rows.add(PickerRow.AddCustom)
 
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     ModalBottomSheet(
@@ -167,8 +182,9 @@ fun ModelPickerDialog(
             modifier = Modifier
                 .fillMaxWidth()
                 .navigationBarsPadding()
-                .padding(bottom = 12.dp)
+                .padding(bottom = 14.dp)
         ) {
+            // Header: strictly shows the currently selected/active provider
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -177,97 +193,177 @@ fun ModelPickerDialog(
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Column(modifier = Modifier.weight(1f)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (selectedProvider != null) {
+                            ProviderIcon(selectedProvider.id, selectedProvider.name, size = 22.dp)
+                            Spacer(modifier = Modifier.width(8.dp))
+                        }
+                        Text(
+                            text = selectedProvider?.name ?: "Select Model",
+                            fontSize = 18.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = AppColors.textPrimary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        if (selectedProvider != null) {
+                            Spacer(modifier = Modifier.width(8.dp))
+                            val isHealthy = selectedProvider.lastTestStatus == "OK" || selectedProvider.lastTestStatus == "WORKING"
+                            val dotColor = when {
+                                isHealthy -> AppColors.ok
+                                selectedProvider.lastTestStatus == "FAILED" || selectedProvider.lastTestStatus == "INVALID" -> AppColors.error
+                                else -> AppColors.textMuted
+                            }
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .clip(CircleShape)
+                                    .background(dotColor)
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(2.dp))
                     Text(
-                        text = "Select Model",
-                        fontSize = 18.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = AppColors.textPrimary
-                    )
-                    Text(
-                        text = if (readyProviders.isEmpty()) {
-                            "No providers configured yet. Add an API key and tap Test Connection."
+                        text = if (selectedProvider == null) {
+                            "No active provider configured yet. Add an API key in Settings."
                         } else {
-                            "Models fetched live from your configured providers."
+                            "Showing ${activeModelsRaw.size} model(s) from ${selectedProvider.name}"
                         },
                         fontSize = 12.sp,
-                        color = AppColors.textSecondary
+                        color = AppColors.textSecondary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
-                val primaryReady = readyProviders.firstOrNull()
-                if (primaryReady != null) {
-                    IconButton(onClick = { onRefreshProviderModels(primaryReady.id) }) {
-                        Icon(Icons.Default.Refresh, contentDescription = "Refresh models from server", tint = AppColors.accent)
-                    }
-                }
-            }
-
-            OutlinedTextField(
-                value = searchQuery,
-                onValueChange = { searchQuery = it },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 8.dp),
-                singleLine = true,
-                label = { Text("Search server-fetched models") },
-                placeholder = { Text("Filter by model ID or provider") },
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedTextColor = AppColors.textPrimary,
-                    unfocusedTextColor = AppColors.textPrimary,
-                    focusedBorderColor = AppColors.accent,
-                    cursorColor = AppColors.accent
-                )
-            )
-
-            // Filter chips
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState())
-                    .padding(horizontal = 16.dp, vertical = 4.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                for (chip in ModelFilterChip.entries) {
-                    val selected = activeFilter == chip
-                    Surface(
-                        shape = RoundedCornerShape(999.dp),
-                        color = if (selected) AppColors.accentSoft else AppColors.surfaceAlt,
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(999.dp))
-                            .border(
-                                1.dp,
-                                if (selected) AppColors.accent else AppColors.border,
-                                RoundedCornerShape(999.dp)
+                if (selectedProvider != null) {
+                    IconButton(
+                        onClick = {
+                            refreshing = true
+                            onRefreshProviderModels(selectedProvider.id)
+                        },
+                        modifier = Modifier.testTag("refresh_provider_models_button")
+                    ) {
+                        if (refreshing) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                strokeWidth = 2.dp,
+                                color = AppColors.accent
                             )
-                            .clickable { activeFilter = chip }
-                    ) {
-                        Text(
-                            text = chip.label,
-                            fontSize = 12.sp,
-                            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-                            color = if (selected) AppColors.accent else AppColors.textSecondary,
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
-                        )
+                        } else {
+                            Icon(
+                                Icons.Default.Refresh,
+                                contentDescription = "Refresh models from ${selectedProvider.name}",
+                                tint = AppColors.accent
+                            )
+                        }
                     }
                 }
             }
 
-            // Custom model ID entry for endpoints that don't expose /models
-            val targetProvider = readyProviders.firstOrNull()
-            if (targetProvider != null) {
-                if (!showAddCustomField) {
-                    TextButton(
-                        onClick = { showAddCustomField = true },
-                        modifier = Modifier.padding(horizontal = 12.dp)
-                    ) {
-                        Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp), tint = AppColors.accent)
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("Enter custom model ID for ${targetProvider.name}", fontSize = 12.sp, color = AppColors.accent)
+            // Optional compact provider switcher strip if >1 configured providers exist.
+            // Selecting a provider strictly filters the model list below to ONLY that provider.
+            if (readyProviders.size > 1) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState())
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    for (p in readyProviders) {
+                        val isSelectedProvider = p.id == selectedProvider?.id
+                        Surface(
+                            shape = RoundedCornerShape(999.dp),
+                            color = if (isSelectedProvider) AppColors.accentSoft else AppColors.surfaceAlt,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(999.dp))
+                                .border(
+                                    1.dp,
+                                    if (isSelectedProvider) AppColors.accent else AppColors.border,
+                                    RoundedCornerShape(999.dp)
+                                )
+                                .clickable { browsingProviderId = p.id }
+                                .testTag("provider_switch_${p.id}")
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                ProviderIcon(p.id, p.name, size = 14.dp)
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = p.name,
+                                    fontSize = 12.sp,
+                                    fontWeight = if (isSelectedProvider) FontWeight.SemiBold else FontWeight.Medium,
+                                    color = if (isSelectedProvider) AppColors.accent else AppColors.textSecondary,
+                                    maxLines = 1
+                                )
+                            }
+                        }
                     }
-                } else {
+                }
+            }
+
+            if (selectedProvider != null) {
+                OutlinedTextField(
+                    value = searchQuery,
+                    onValueChange = { searchQuery = it },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 6.dp)
+                        .testTag("model_search_input"),
+                    singleLine = true,
+                    shape = RoundedCornerShape(12.dp),
+                    placeholder = { Text("Search ${selectedProvider.name} models…", fontSize = 13.sp) },
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = AppColors.textPrimary,
+                        unfocusedTextColor = AppColors.textPrimary,
+                        focusedBorderColor = AppColors.accent,
+                        unfocusedBorderColor = AppColors.border,
+                        cursorColor = AppColors.accent
+                    )
+                )
+
+                // Filter chips
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState())
+                        .padding(horizontal = 16.dp, vertical = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    for (chip in ModelFilterChip.entries) {
+                        val selected = activeFilter == chip
+                        Surface(
+                            shape = RoundedCornerShape(999.dp),
+                            color = if (selected) AppColors.accentSoft else AppColors.surfaceAlt,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(999.dp))
+                                .border(
+                                    1.dp,
+                                    if (selected) AppColors.accent else AppColors.border,
+                                    RoundedCornerShape(999.dp)
+                                )
+                                .clickable { activeFilter = chip }
+                        ) {
+                            Text(
+                                text = chip.label,
+                                fontSize = 12.sp,
+                                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                                color = if (selected) AppColors.accent else AppColors.textSecondary,
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                            )
+                        }
+                    }
+                }
+
+                // Custom model ID entry for the active provider
+                if (showAddCustomField) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 4.dp),
+                            .padding(horizontal = 16.dp, vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         OutlinedTextField(
@@ -275,159 +371,239 @@ fun ModelPickerDialog(
                             onValueChange = { customModelInput = it },
                             modifier = Modifier.weight(1f),
                             singleLine = true,
-                            label = { Text("Custom model ID") }
+                            shape = RoundedCornerShape(12.dp),
+                            placeholder = { Text("e.g. gpt-4o or deepseek-reasoner", fontSize = 13.sp) }
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         TextButton(
                             onClick = {
                                 val trimmed = customModelInput.trim()
                                 if (trimmed.isNotEmpty()) {
-                                    onAddCustomModelId(targetProvider.id, trimmed)
-                                    onSelect(targetProvider.id, trimmed)
+                                    onAddCustomModelId(selectedProvider.id, trimmed)
+                                    onSelect(selectedProvider.id, trimmed)
                                     customModelInput = ""
                                     showAddCustomField = false
+                                    onDismiss()
                                 }
                             }
                         ) {
-                            Text("Save", color = AppColors.accent, fontWeight = FontWeight.SemiBold)
+                            Text("Use", color = AppColors.accent, fontWeight = FontWeight.SemiBold)
                         }
                     }
                 }
-            }
 
-            LazyColumn(modifier = Modifier.heightIn(max = 420.dp)) {
-                items(rows) { row ->
-                    when (row) {
-                        is PickerRow.Header -> Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(start = 20.dp, end = 20.dp, top = 12.dp, bottom = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            ProviderIcon(row.provider.id, null, size = 16.dp, providerName = row.provider.name)
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = row.provider.name,
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = AppColors.textMuted
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Box(
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 120.dp, max = 420.dp)
+                        .padding(top = 4.dp)
+                ) {
+                    if (filteredModels.isEmpty()) {
+                        item(key = "empty_models") {
+                            Column(
                                 modifier = Modifier
-                                    .size(7.dp)
-                                    .clip(CircleShape)
-                                    .background(
-                                        if (row.provider.lastTestStatus == "OK") AppColors.ok else AppColors.textMuted
-                                    )
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = if (row.modelCount == 0) "Tap Refresh or Test Connection to load models" else "${row.modelCount} models",
-                                fontSize = 11.sp,
-                                color = AppColors.textMuted
-                            )
-                        }
-                        is PickerRow.Model -> Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { onSelect(row.provider.id, row.model) }
-                                .padding(horizontal = 20.dp, vertical = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            ProviderIcon(row.provider.id, row.model, size = 18.dp, providerName = row.provider.name)
-                            Spacer(modifier = Modifier.width(10.dp))
-                            Column(modifier = Modifier.weight(1f)) {
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 20.dp, vertical = 20.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
                                 Text(
-                                    text = row.model,
+                                    text = if (refreshing) {
+                                        "Loading models from ${selectedProvider.name}…"
+                                    } else if (activeModelsRaw.isEmpty()) {
+                                        "No models loaded yet for ${selectedProvider.name}."
+                                    } else {
+                                        "No ${selectedProvider.name} models match \"$query\"."
+                                    },
                                     fontSize = 13.sp,
-                                    fontFamily = FontFamily.Monospace,
-                                    color = if (row.selected) AppColors.accent else AppColors.textPrimary,
-                                    fontWeight = if (row.selected) FontWeight.SemiBold else FontWeight.Normal,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
+                                    color = AppColors.textSecondary
                                 )
-                                val meta = row.metadata
-                                if (meta != null && (meta.contextWindow != null || meta.supportsVision)) {
-                                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                        meta.contextWindow?.let { ctx ->
-                                            Text(
-                                                text = "${ctx / 1000}k ctx",
-                                                fontSize = 10.sp,
-                                                color = AppColors.textMuted
-                                            )
-                                        }
-                                        if (meta.supportsTools) {
-                                            Text("tools", fontSize = 10.sp, color = AppColors.textMuted)
-                                        }
-                                        if (meta.supportsVision) {
-                                            Text("vision", fontSize = 10.sp, color = AppColors.textMuted)
-                                        }
+                                Spacer(modifier = Modifier.height(10.dp))
+                                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                    Surface(
+                                        shape = RoundedCornerShape(999.dp),
+                                        color = AppColors.accentSoft,
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(999.dp))
+                                            .clickable {
+                                                refreshing = true
+                                                onRefreshProviderModels(selectedProvider.id)
+                                            }
+                                    ) {
+                                        Text(
+                                            text = "Fetch Models",
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = AppColors.accent,
+                                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
+                                        )
+                                    }
+                                    Surface(
+                                        shape = RoundedCornerShape(999.dp),
+                                        color = AppColors.surfaceAlt,
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(999.dp))
+                                            .clickable { showAddCustomField = true }
+                                    ) {
+                                        Text(
+                                            text = "+ Custom Model ID",
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.Medium,
+                                            color = AppColors.textPrimary,
+                                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
+                                        )
                                     }
                                 }
                             }
-                            IconButton(
-                                onClick = {
-                                    val fav = !(row.metadata?.isFavorite ?: false)
-                                    onToggleFavorite(row.provider.id, row.model, fav)
+                        }
+                    } else {
+                        items(filteredModels, key = { "${selectedProvider.id}:$it" }) { modelId ->
+                            val isSelected = selectedProvider.id == activeProviderId && modelId == selectedProvider.selectedModel
+                            val meta = cacheMap[modelId]
+                            ModelPickerItemRow(
+                                provider = selectedProvider,
+                                model = modelId,
+                                selected = isSelected,
+                                metadata = meta,
+                                onSelect = {
+                                    onSelect(selectedProvider.id, modelId)
+                                    onDismiss()
                                 },
-                                modifier = Modifier.size(28.dp)
-                            ) {
-                                Icon(
-                                    imageVector = if (row.metadata?.isFavorite == true) Icons.Default.Star else Icons.Default.StarBorder,
-                                    contentDescription = "Favorite",
-                                    tint = if (row.metadata?.isFavorite == true) AppColors.warn else AppColors.textMuted,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                            }
-                            if (row.selected) {
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Icon(
-                                    Icons.Default.Check,
-                                    contentDescription = "Selected",
-                                    tint = AppColors.accent,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                            }
-                        }
-                        is PickerRow.SetupTitle -> Text(
-                            text = "CONFIGURE PROVIDERS",
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = AppColors.textMuted,
-                            modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 16.dp, bottom = 4.dp)
-                        )
-                        is PickerRow.Setup -> Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { onSetupProvider(row.provider.id) }
-                                .padding(horizontal = 20.dp, vertical = 11.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            ProviderIcon(row.provider.id, null, size = 18.dp, providerName = row.provider.name)
-                            Spacer(modifier = Modifier.width(10.dp))
-                            Text(
-                                text = row.provider.name,
-                                fontSize = 14.sp,
-                                color = AppColors.textPrimary,
-                                modifier = Modifier.weight(1f)
+                                onToggleFavorite = {
+                                    onToggleFavorite(selectedProvider.id, modelId, meta?.isFavorite != true)
+                                }
                             )
-                            Text("Add key & test", fontSize = 12.sp, color = AppColors.accent)
                         }
-                        is PickerRow.AddCustom -> Row(
+                    }
+
+                    item(key = "footer_actions") {
+                        Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clickable { onAddProvider() }
-                                .padding(horizontal = 20.dp, vertical = 13.dp),
+                                .padding(horizontal = 16.dp, vertical = 10.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Icon(Icons.Default.Add, contentDescription = null, tint = AppColors.accent, modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(10.dp))
-                            Text("Manage providers & API keys", fontSize = 14.sp, color = AppColors.accent, fontWeight = FontWeight.SemiBold)
+                            TextButton(onClick = { showAddCustomField = !showAddCustomField }) {
+                                Icon(Icons.Default.Add, contentDescription = null, tint = AppColors.accent, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Custom model ID", fontSize = 12.sp, color = AppColors.accent)
+                            }
+                            TextButton(onClick = { onDismiss(); onAddProvider() }) {
+                                Text("Manage providers", fontSize = 12.sp, color = AppColors.textSecondary)
+                            }
                         }
                     }
                 }
+            } else {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(20.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        text = "Configure an AI provider in Settings to see its models here.",
+                        fontSize = 13.sp,
+                        color = AppColors.textSecondary
+                    )
+                    Surface(
+                        shape = RoundedCornerShape(999.dp),
+                        color = AppColors.accent,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(999.dp))
+                            .clickable { onDismiss(); onAddProvider() }
+                    ) {
+                        Text(
+                            text = "Add or Configure Provider",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = AppColors.onAccent,
+                            modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp)
+                        )
+                    }
+                }
             }
+        }
+    }
+}
+
+@Composable
+private fun ModelPickerItemRow(
+    provider: ProviderConfigEntity,
+    model: String,
+    selected: Boolean,
+    metadata: ModelCacheEntity?,
+    onSelect: () -> Unit,
+    onToggleFavorite: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 3.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(if (selected) AppColors.accentSoft else AppColors.surface)
+            .border(
+                1.dp,
+                if (selected) AppColors.accent.copy(alpha = 0.45f) else AppColors.border,
+                RoundedCornerShape(12.dp)
+            )
+            .clickable(onClick = onSelect)
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        IconButton(
+            onClick = onToggleFavorite,
+            modifier = Modifier.size(30.dp)
+        ) {
+            Icon(
+                imageVector = if (metadata?.isFavorite == true) Icons.Default.Star else Icons.Default.StarBorder,
+                contentDescription = "Favorite model",
+                tint = if (metadata?.isFavorite == true) AppColors.warn else AppColors.textMuted,
+                modifier = Modifier.size(16.dp)
+            )
+        }
+        Spacer(modifier = Modifier.width(6.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = model,
+                fontSize = 13.5.sp,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                color = if (selected) AppColors.accent else AppColors.textPrimary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            if (metadata != null) {
+                val badges = buildList {
+                    if (metadata.contextWindow > 0) add("${metadata.contextWindow / 1000}k ctx")
+                    if (metadata.supportsTools) add("Tools")
+                    if (metadata.supportsVision) add("Vision")
+                    if (metadata.inputPricePerMillion == 0.0 && metadata.outputPricePerMillion == 0.0 && model.endsWith(":free")) {
+                        add("Free")
+                    } else if (metadata.inputPricePerMillion > 0.0) {
+                        add("$${"%.2f".format(metadata.inputPricePerMillion)}/1M")
+                    }
+                }
+                if (badges.isNotEmpty()) {
+                    Text(
+                        text = badges.joinToString(" · "),
+                        fontSize = 10.5.sp,
+                        color = AppColors.textMuted,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+        }
+        if (selected) {
+            Spacer(modifier = Modifier.width(8.dp))
+            Icon(
+                imageVector = Icons.Default.Check,
+                contentDescription = "Selected model",
+                tint = AppColors.accent,
+                modifier = Modifier.size(18.dp)
+            )
         }
     }
 }

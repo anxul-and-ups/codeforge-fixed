@@ -77,6 +77,28 @@ data class AttachmentItem(
     val pdfBase64: String? = null
 )
 
+data class CodebaseFileItem(
+    val path: String,
+    val name: String,
+    val relativeDir: String,
+    val modifiedState: com.example.data.agent.WorkingFileState? = null,
+    val diffSummary: String? = null
+) {
+    val isModifiedByAi: Boolean
+        get() = modifiedState == com.example.data.agent.WorkingFileState.CREATED ||
+            modifiedState == com.example.data.agent.WorkingFileState.EDITED
+}
+
+data class CodeFileViewerState(
+    val path: String,
+    val fileName: String,
+    val content: String = "",
+    val isLoading: Boolean = true,
+    val error: String? = null,
+    val modifiedState: com.example.data.agent.WorkingFileState? = null,
+    val diffSummary: String? = null
+)
+
 @OptIn(ExperimentalCoroutinesApi::class)
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -97,6 +119,45 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val streamBuf = StringBuilder()
     private val reasoningBuf = StringBuilder()
     private var flushJob: Job? = null
+
+    private val _rawWorkspaceFiles = MutableStateFlow<List<String>>(emptyList())
+    private val _codebaseLoading = MutableStateFlow(false)
+    val codebaseLoading: StateFlow<Boolean> = _codebaseLoading.asStateFlow()
+
+    val codebaseFiles: StateFlow<List<CodebaseFileItem>> = combine(_rawWorkspaceFiles, workingFiles) { rawPaths, worked ->
+        val workedMap = LinkedHashMap<String, WorkingFileEntry>()
+        for (w in worked) {
+            val norm = w.path.trim().removePrefix("./").trimStart('/')
+            workedMap[norm] = w
+        }
+        val mergedPaths = LinkedHashSet<String>()
+        // Put AI-created/edited files first so green ticks are immediately visible, then all workspace files
+        for (w in worked) {
+            val norm = w.path.trim().removePrefix("./").trimStart('/')
+            if (norm.isNotBlank() && w.state != com.example.data.agent.WorkingFileState.DELETED) {
+                mergedPaths.add(norm)
+            }
+        }
+        for (p in rawPaths) {
+            val norm = p.trim().removePrefix("./").trimStart('/')
+            if (norm.isNotBlank()) mergedPaths.add(norm)
+        }
+        mergedPaths.map { rel ->
+            val w = workedMap[rel] ?: workedMap.entries.firstOrNull { rel.endsWith("/${it.key}") || it.key.endsWith("/$rel") }?.value
+            val name = rel.substringAfterLast('/')
+            val dir = rel.substringBeforeLast('/', "")
+            CodebaseFileItem(
+                path = rel,
+                name = name,
+                relativeDir = dir,
+                modifiedState = w?.state,
+                diffSummary = w?.diffSummary
+            )
+        }
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    private val _openedFileViewer = MutableStateFlow<CodeFileViewerState?>(null)
+    val openedFileViewer: StateFlow<CodeFileViewerState?> = _openedFileViewer.asStateFlow()
 
     private val _uiState = MutableStateFlow(
         ChatUiState(
@@ -160,10 +221,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 when (event) {
                     is AgentEvent.StatusUpdate -> _uiState.update { it.copy(currentAgentStatus = event.statusText) }
                     is AgentEvent.StreamingChunk -> {
+                        val isFirst = streamBuf.isEmpty()
                         streamBuf.append(event.text)
-                        if (flushJob == null) {
+                        if (isFirst) {
+                            // Zero-latency flush for instant Time-to-First-Token in UI
+                            val text = streamBuf.toString()
+                            val reasoning = reasoningBuf.toString()
+                            _uiState.update { it.copy(streamingContent = text, streamingReasoning = reasoning) }
+                        } else if (flushJob == null) {
                             flushJob = viewModelScope.launch {
-                                delay(120)
+                                delay(32)
                                 flushJob = null
                                 val text = streamBuf.toString()
                                 val reasoning = reasoningBuf.toString()
@@ -173,15 +240,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     is AgentEvent.NoteAdded -> refreshTick.update { it + 1 }
                     is AgentEvent.StreamingReset -> {
+                        flushJob?.cancel()
+                        flushJob = null
                         streamBuf.setLength(0)
-                        reasoningBuf.setLength(0)
-                        _uiState.update { it.copy(streamingContent = "", streamingReasoning = "") }
+                        _uiState.update { it.copy(streamingContent = "") }
                     }
                     is AgentEvent.ReasoningChunk -> {
+                        val isFirst = reasoningBuf.isEmpty()
                         reasoningBuf.append(event.text)
-                        if (flushJob == null) {
+                        if (isFirst) {
+                            // Zero-latency flush for instant live Chain of Thought visibility
+                            val text = streamBuf.toString()
+                            val reasoning = reasoningBuf.toString()
+                            _uiState.update { it.copy(streamingContent = text, streamingReasoning = reasoning) }
+                        } else if (flushJob == null) {
                             flushJob = viewModelScope.launch {
-                                delay(120)
+                                delay(32)
                                 flushJob = null
                                 val text = streamBuf.toString()
                                 val reasoning = reasoningBuf.toString()
@@ -194,12 +268,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     is AgentEvent.ToolStarted, is AgentEvent.ToolFinished -> refreshTick.update { it + 1 }
                     is AgentEvent.Finished -> {
+                        flushJob?.cancel()
+                        flushJob = null
                         streamBuf.setLength(0)
                         reasoningBuf.setLength(0)
                         _uiState.update { it.copy(streamingContent = "", streamingReasoning = "") }
                         refreshTick.update { it + 1 }
+                        refreshCodebaseFiles()
                     }
                     is AgentEvent.Error -> {
+                        flushJob?.cancel()
+                        flushJob = null
                         streamBuf.setLength(0)
                         reasoningBuf.setLength(0)
                         _uiState.update {
@@ -314,6 +393,147 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 it.copy(failoverNotice = msg ?: "No checkpoint found to revert.")
             }
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // In-Chat Codebase File Browser & Code Viewer
+    // ---------------------------------------------------------------------------------------
+
+    private suspend fun activeWorkspaceDirPath(): String {
+        val proj = _uiState.value.activeProject
+        return if (proj != null && proj.id != com.example.data.repository.ProjectRepository.SCRATCH_ID) {
+            projectRepo.projectDir(proj.id).absolutePath
+        } else {
+            com.example.data.termux.TermuxBridge.TERMUX_HOME
+        }
+    }
+
+    fun refreshCodebaseFiles() {
+        viewModelScope.launch {
+            _codebaseLoading.value = true
+            try {
+                val proj = _uiState.value.activeProject
+                val hasProject = proj != null && proj.id != com.example.data.repository.ProjectRepository.SCRATCH_ID
+                val rootPath = activeWorkspaceDirPath()
+                val found = mutableListOf<String>()
+
+                if (termuxBridge.status.value.engineRunning) {
+                    val escaped = "'" + rootPath.replace("'", "'\"'\"'") + "'"
+                    val cmd = "if [ -d $escaped ]; then cd $escaped && " +
+                        "if command -v rg >/dev/null 2>&1; then " +
+                        "rg --files --max-depth 6 --glob '!.git' --glob '!node_modules' --glob '!build' --glob '!.gradle' --glob '!__pycache__' --glob '!.venv' --glob '!.cache' 2>/dev/null | head -n 350; " +
+                        "else " +
+                        "find . -maxdepth 5 -not -path '*/.*' -not -path '*/node_modules/*' -not -path '*/build/*' -not -path '*/__pycache__/*' -type f 2>/dev/null | sed 's|^\\./||' | head -n 350; " +
+                        "fi; fi"
+                    val res = termuxBridge.execCommand(cmd, cwd = com.example.data.termux.TermuxBridge.TERMUX_HOME, timeoutSec = 10)
+                    if (res.exitCode == 0 && res.stdout.isNotBlank()) {
+                        res.stdout.lineSequence()
+                            .map { it.trim().removePrefix("./") }
+                            .filter { it.isNotBlank() }
+                            .forEach { found.add(it) }
+                    }
+                }
+
+                // Fallback to local project file tree when Termux bridge returned empty
+                if (found.isEmpty() && hasProject && proj != null) {
+                    withContext(Dispatchers.IO) {
+                        val tree = projectRepo.getFileTree(proj.id)
+                        fun collect(node: com.example.domain.model.FileNode) {
+                            for (c in node.children) {
+                                if (c.isDirectory) collect(c)
+                                else if (c.path.isNotBlank()) found.add(c.path)
+                            }
+                        }
+                        if (tree != null) collect(tree)
+                    }
+                }
+                _rawWorkspaceFiles.value = found.distinct().sorted()
+            } catch (_: Exception) {
+                // Keep existing list on transient scan error
+            } finally {
+                _codebaseLoading.value = false
+            }
+        }
+    }
+
+    fun openCodebaseFile(item: CodebaseFileItem) {
+        _openedFileViewer.value = CodeFileViewerState(
+            path = item.path,
+            fileName = item.name,
+            isLoading = true,
+            modifiedState = item.modifiedState,
+            diffSummary = item.diffSummary
+        )
+        viewModelScope.launch {
+            val proj = _uiState.value.activeProject
+            val hasProject = proj != null && proj.id != com.example.data.repository.ProjectRepository.SCRATCH_ID
+            val rootPath = activeWorkspaceDirPath()
+            val clean = item.path.trim().removePrefix("./")
+            val candidatePaths = buildList {
+                if (clean.startsWith("/")) add(clean)
+                else {
+                    add("$rootPath/$clean")
+                    val homePath = "${com.example.data.termux.TermuxBridge.TERMUX_HOME}/$clean"
+                    if (homePath != "$rootPath/$clean") add(homePath)
+                }
+            }
+
+            var loaded: String? = null
+            var lastErr: String? = null
+
+            if (termuxBridge.status.value.engineRunning) {
+                for (abs in candidatePaths) {
+                    val escaped = "'" + abs.replace("'", "'\"'\"'") + "'"
+                    val pyCmd = "python3 -c \"import base64,pathlib,sys; p=pathlib.Path($escaped); " +
+                        "sys.exit(2) if not p.is_file() else print(base64.b64encode(p.read_bytes()[:262144]).decode('ascii'))\""
+                    val res = termuxBridge.execCommand(pyCmd, cwd = com.example.data.termux.TermuxBridge.TERMUX_HOME, timeoutSec = 15)
+                    if (res.exitCode == 0 && res.stdout.isNotBlank()) {
+                        loaded = try {
+                            String(Base64.decode(res.stdout.trim(), Base64.DEFAULT), Charsets.UTF_8)
+                        } catch (_: Exception) {
+                            res.stdout
+                        }
+                        break
+                    } else if (res.stderr.isNotBlank()) {
+                        lastErr = res.stderr.trim()
+                    }
+                }
+            }
+
+            if (loaded == null && hasProject && proj != null) {
+                loaded = withContext(Dispatchers.IO) {
+                    try {
+                        projectRepo.readFile(proj.id, clean)
+                    } catch (_: Exception) {
+                        null
+                    }
+                }
+            }
+
+            _openedFileViewer.value = if (loaded != null) {
+                CodeFileViewerState(
+                    path = item.path,
+                    fileName = item.name,
+                    content = loaded,
+                    isLoading = false,
+                    modifiedState = item.modifiedState,
+                    diffSummary = item.diffSummary
+                )
+            } else {
+                CodeFileViewerState(
+                    path = item.path,
+                    fileName = item.name,
+                    isLoading = false,
+                    error = lastErr ?: "Could not read file from workspace.",
+                    modifiedState = item.modifiedState,
+                    diffSummary = item.diffSummary
+                )
+            }
+        }
+    }
+
+    fun closeCodebaseFile() {
+        _openedFileViewer.value = null
     }
 
     // ---------------------------------------------------------------------------------------

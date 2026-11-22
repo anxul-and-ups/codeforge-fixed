@@ -106,9 +106,9 @@ enum class ProviderErrorClass(
         suggestedFix = "Rephrase your message to clarify legitimate software development intent."
     ),
     NETWORK_DOWN(
-        label = "No internet connection",
-        plainReason = "Your phone cannot reach the internet right now.",
-        suggestedFix = "Check Wi-Fi or mobile data; CodeForge will pause without penalizing your keys."
+        label = "Could not reach server",
+        plainReason = "DNS lookup failed or the provider host could not be reached.",
+        suggestedFix = "Check the Base URL spelling (e.g. https://api.example.com/v1) and verify your connection."
     ),
     BAD_REQUEST(
         label = "Malformed request",

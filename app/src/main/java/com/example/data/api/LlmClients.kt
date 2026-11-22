@@ -27,9 +27,11 @@ import java.util.concurrent.TimeUnit
  */
 class LlmClient(
     private val okHttpClient: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
+        .connectionPool(okhttp3.ConnectionPool(6, 5, TimeUnit.MINUTES))
+        .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(45, TimeUnit.SECONDS)
         .writeTimeout(15, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
         .build()
 ) {
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
@@ -128,7 +130,21 @@ class LlmClient(
         return ApiException(response.code, "$label error (${response.code}): $detail", response.header("Retry-After"))
     }
 
+    private fun normalizeBaseUrl(rawUrl: String): String {
+        val cleaned = rawUrl.trim().replace("\n", "").replace("\r", "").replace(" ", "").trimEnd('/')
+        if (cleaned.isBlank()) return ""
+        return if (cleaned.startsWith("http://", ignoreCase = true) || cleaned.startsWith("https://", ignoreCase = true)) {
+            cleaned
+        } else {
+            val lower = cleaned.lowercase()
+            val isLocal = lower.startsWith("localhost") || lower.startsWith("127.0.0.1") ||
+                lower.startsWith("10.0.2.2") || lower.startsWith("192.168.") || lower.startsWith("10.")
+            if (isLocal) "http://$cleaned" else "https://$cleaned"
+        }
+    }
+
     private fun applyCustomHeaders(builder: Request.Builder, provider: ProviderConfigEntity) {
+        builder.header("User-Agent", "CodeForge/2.0 (Android)")
         val json = provider.customHeadersJson
         if (json.isNullOrBlank()) return
         try {
@@ -490,7 +506,7 @@ class LlmClient(
         onChunk: ((String) -> Unit)?,
         onReasoning: ((String) -> Unit)?
     ): LlmResponse {
-        val base = provider.baseUrl.trim().trimEnd('/')
+        val base = normalizeBaseUrl(provider.baseUrl)
         val url = if (base.endsWith("/chat/completions")) base else "$base/chat/completions"
         val modelName = provider.selectedModel.lowercase().substringAfterLast('/')
         val isReasoningModel = modelName.contains("reason") || modelName.startsWith("o1") || modelName.startsWith("o3") || modelName.startsWith("o4")
@@ -639,10 +655,31 @@ class LlmClient(
         }
         val first = choices.getJSONObject(0)
         val msg = first.optJSONObject("message") ?: JSONObject()
-        val content = if (msg.isNull("content")) "" else msg.optString("content")
-        val reasoning = if (msg.isNull("reasoning_content")) null else msg.optString("reasoning_content")
-        if (content.isNotEmpty()) onChunk?.invoke(content)
-        if (!reasoning.isNullOrEmpty()) onReasoning?.invoke(reasoning)
+        val rawContent = if (msg.isNull("content")) "" else msg.optString("content")
+        val apiReasoning = if (msg.isNull("reasoning_content")) {
+            if (msg.isNull("reasoning")) null else msg.optString("reasoning")
+        } else msg.optString("reasoning_content")
+
+        val textOut = StringBuilder()
+        val reasoningOut = StringBuilder()
+        if (!apiReasoning.isNullOrEmpty()) {
+            reasoningOut.append(apiReasoning)
+            onReasoning?.invoke(apiReasoning)
+        }
+        if (rawContent.isNotEmpty()) {
+            val splitter = ThinkTagStreamSplitter(
+                onText = { t ->
+                    textOut.append(t)
+                    onChunk?.invoke(t)
+                },
+                onThought = { r ->
+                    reasoningOut.append(r)
+                    onReasoning?.invoke(r)
+                }
+            )
+            splitter.feed(rawContent)
+            splitter.flush()
+        }
 
         val toolCalls = mutableListOf<LlmToolCall>()
         val tcArr = msg.optJSONArray("tool_calls")
@@ -658,8 +695,8 @@ class LlmClient(
         val prompt = usage?.optInt("prompt_tokens") ?: 0
         val cached = usage?.optJSONObject("prompt_tokens_details")?.optInt("cached_tokens") ?: 0
         return LlmResponse(
-            content = content,
-            reasoning = reasoning,
+            content = textOut.toString(),
+            reasoning = reasoningOut.toString().ifEmpty { null },
             toolCalls = toolCalls,
             promptTokens = (prompt - cached).coerceAtLeast(0),
             completionTokens = usage?.optInt("completion_tokens") ?: 0,
@@ -679,6 +716,16 @@ class LlmClient(
         val source = response.body?.source() ?: throw ApiException(502, "Provider returned an empty body")
         val textOut = StringBuilder()
         val reasoningOut = StringBuilder()
+        val thinkSplitter = ThinkTagStreamSplitter(
+            onText = { t ->
+                textOut.append(t)
+                onChunk?.invoke(t)
+            },
+            onThought = { r ->
+                reasoningOut.append(r)
+                onReasoning?.invoke(r)
+            }
+        )
         val tcs = TreeMap<Int, ToolAcc>()
         var promptTokens = 0
         var completionTokens = 0
@@ -714,8 +761,7 @@ class LlmClient(
             if (!delta.isNull("content")) {
                 val t = delta.optString("content")
                 if (t.isNotEmpty()) {
-                    textOut.append(t)
-                    onChunk?.invoke(t)
+                    thinkSplitter.feed(t)
                 }
             }
             val reasoningKey = if (!delta.isNull("reasoning_content")) "reasoning_content" else "reasoning"
@@ -750,6 +796,7 @@ class LlmClient(
             }
             if (!ch.isNull("finish_reason")) finish = ch.optString("finish_reason")
         }
+        thinkSplitter.flush()
         if (!gotAny) throw ApiException(502, "Provider returned an empty stream")
 
         val toolCalls = tcs.values
@@ -1010,142 +1057,184 @@ class LlmClient(
      */
     suspend fun fetchModelsDetailed(provider: ProviderConfigEntity, freeOnly: Boolean): ModelFetch {
         val apiKey = KeyStoreManager.decrypt(provider.encryptedApiKey)
-        val base = provider.baseUrl.trim().trimEnd('/')
+        val base = normalizeBaseUrl(provider.baseUrl)
+        if (base.isBlank()) {
+            throw IllegalArgumentException("Base URL is empty")
+        }
         val format = provider.apiFormat.uppercase()
-        val builder = Request.Builder()
-        when (format) {
+        val candidateUrls: List<String> = when (format) {
             "ANTHROPIC" -> {
                 val rootBase = base.removeSuffix("/v1/messages").removeSuffix("/v1")
-                builder.url("$rootBase/v1/models?limit=100")
-                    .header("x-api-key", apiKey)
-                    .header("anthropic-version", "2023-06-01")
+                listOf("$rootBase/v1/models?limit=100")
             }
             "GEMINI" -> {
                 val rootBase = base.removeSuffix("/v1beta")
-                builder.url("$rootBase/v1beta/models?pageSize=200")
-                    .header("x-goog-api-key", apiKey)
+                listOf("$rootBase/v1beta/models?pageSize=200")
             }
             else -> {
-                val rootBase = base.removeSuffix("/chat/completions")
-                builder.url("$rootBase/models")
-                if (apiKey.isNotEmpty()) builder.header("Authorization", "Bearer $apiKey")
+                val rootBase = base.removeSuffix("/chat/completions").removeSuffix("/models").trimEnd('/')
+                buildList {
+                    add("$rootBase/models")
+                    if (!rootBase.endsWith("/v1") && !rootBase.endsWith("/v1beta")) {
+                        add("$rootBase/v1/models")
+                    }
+                }
             }
         }
-        applyCustomHeaders(builder, provider)
-        return runCall(builder.get().build()) { response ->
-            if (!response.isSuccessful) throw apiError(response, "Model list")
-            val obj = JSONObject(response.body?.string() ?: "{}")
-            val out = mutableListOf<String>()
-            val richList = mutableListOf<ServerModelMetadata>()
-            val freeIds = HashSet<String>()
-            var pricingKnown = false
-            if (format == "GEMINI") {
-                val arr = obj.optJSONArray("models") ?: JSONArray()
-                for (i in 0 until arr.length()) {
-                    val m = arr.getJSONObject(i)
-                    val methods = m.optJSONArray("supportedGenerationMethods")
-                    var ok = methods == null
-                    if (methods != null) {
-                        for (j in 0 until methods.length()) {
-                            if (methods.optString(j) == "generateContent") ok = true
-                        }
+
+        var lastError: Exception? = null
+        for (url in candidateUrls) {
+            val builder = Request.Builder().url(url).header("Accept", "application/json")
+            when (format) {
+                "ANTHROPIC" -> {
+                    builder.header("x-api-key", apiKey).header("anthropic-version", "2023-06-01")
+                }
+                "GEMINI" -> {
+                    builder.header("x-goog-api-key", apiKey)
+                }
+                else -> {
+                    if (apiKey.isNotEmpty()) builder.header("Authorization", "Bearer $apiKey")
+                }
+            }
+            applyCustomHeaders(builder, provider)
+            try {
+                return runCall(builder.get().build()) { response ->
+                    if (!response.isSuccessful) throw apiError(response, "Model list")
+                    val rawBody = response.body?.string()?.trim().orEmpty()
+                    parseModelListPayload(rawBody, format, provider, freeOnly)
+                }
+            } catch (e: ApiException) {
+                lastError = e
+                // Only fall back to /v1/models if /models returned 404 or 405
+                if (e.statusCode != 404 && e.statusCode != 405) throw e
+            }
+        }
+        throw lastError ?: ApiException(404, "Model list endpoint not found")
+    }
+
+    private fun parseModelListPayload(
+        rawBody: String,
+        format: String,
+        provider: ProviderConfigEntity,
+        freeOnly: Boolean
+    ): ModelFetch {
+        val out = mutableListOf<String>()
+        val richList = mutableListOf<ServerModelMetadata>()
+        val freeIds = HashSet<String>()
+        var pricingKnown = false
+
+        val topArray: JSONArray? = if (rawBody.startsWith("[")) {
+            try { JSONArray(rawBody) } catch (_: Exception) { null }
+        } else null
+        val obj = if (topArray == null) {
+            try { JSONObject(rawBody.ifBlank { "{}" }) } catch (_: Exception) { JSONObject() }
+        } else JSONObject()
+
+        if (format == "GEMINI") {
+            val arr = topArray ?: obj.optJSONArray("models") ?: JSONArray()
+            for (i in 0 until arr.length()) {
+                val m = arr.optJSONObject(i) ?: continue
+                val methods = m.optJSONArray("supportedGenerationMethods")
+                var ok = methods == null
+                if (methods != null) {
+                    for (j in 0 until methods.length()) {
+                        if (methods.optString(j) == "generateContent") ok = true
                     }
-                    if (!ok) continue
-                    val id = m.optString("name").removePrefix("models/")
-                    if (id.isBlank() || id.contains("embedding", ignoreCase = true) || id.contains("aqa", ignoreCase = true)) continue
-                    val display = m.optString("displayName").ifBlank { id }
-                    val ctx = m.optInt("inputTokenLimit", 0)
-                    val maxOut = m.optInt("outputTokenLimit", 0)
-                    out.add(id)
-                    richList.add(
-                        ServerModelMetadata(
-                            id = id,
-                            displayName = display,
-                            contextWindow = ctx,
-                            maxOutput = maxOut,
-                            supportsTools = true,
-                            supportsVision = true
-                        )
+                }
+                if (!ok) continue
+                val id = m.optString("name").removePrefix("models/")
+                if (id.isBlank() || id.contains("embedding", ignoreCase = true) || id.contains("aqa", ignoreCase = true)) continue
+                val display = m.optString("displayName").ifBlank { id }
+                val ctx = m.optInt("inputTokenLimit", 0)
+                val maxOut = m.optInt("outputTokenLimit", 0)
+                out.add(id)
+                richList.add(
+                    ServerModelMetadata(
+                        id = id,
+                        displayName = display,
+                        contextWindow = ctx,
+                        maxOutput = maxOut,
+                        supportsTools = true,
+                        supportsVision = true
                     )
-                }
-            } else {
-                val arr = obj.optJSONArray("data") ?: obj.optJSONArray("models") ?: JSONArray()
-                for (i in 0 until arr.length()) {
-                    val item = arr.opt(i)
-                    when (item) {
-                        is JSONObject -> {
-                            val id = item.optString("id").ifEmpty { item.optString("name") }
-                            if (id.isBlank()) continue
-                            val lowerId = id.lowercase()
-                            if (lowerId.contains("embedding") || lowerId.contains("tts") || lowerId.contains("whisper") || lowerId.contains("moderation")) {
-                                continue
+                )
+            }
+        } else {
+            val arr = topArray ?: obj.optJSONArray("data") ?: obj.optJSONArray("models") ?: JSONArray()
+            for (i in 0 until arr.length()) {
+                val item = arr.opt(i)
+                when (item) {
+                    is JSONObject -> {
+                        val id = item.optString("id").ifEmpty { item.optString("name") }
+                        if (id.isBlank()) continue
+                        val lowerId = id.lowercase()
+                        if (lowerId.contains("embedding") || lowerId.contains("tts") || lowerId.contains("whisper") || lowerId.contains("moderation")) {
+                            continue
+                        }
+                        out.add(id)
+                        val display = item.optString("display_name").ifEmpty { item.optString("name").ifEmpty { id } }
+                        val ctx = item.optInt("context_length", item.optInt("context_window", item.optInt("max_input_tokens", 0)))
+                        val topProv = item.optJSONObject("top_provider")
+                        val maxOut = item.optInt("max_output_tokens", topProv?.optInt("max_completion_tokens", 0) ?: 0)
+                        val arch = item.optJSONObject("architecture")
+                        val modality = arch?.optString("modality", "") ?: ""
+                        val hasVision = modality.contains("image") || provider.supportsVision
+                        val supportedParams = item.optJSONArray("supported_parameters")
+                        var hasTools = provider.supportsTools
+                        if (supportedParams != null) {
+                            hasTools = (0 until supportedParams.length()).any {
+                                supportedParams.optString(it).contains("tool", ignoreCase = true)
                             }
-                            out.add(id)
-                            val display = item.optString("display_name").ifEmpty { item.optString("name").ifEmpty { id } }
-                            val ctx = item.optInt("context_length", item.optInt("context_window", item.optInt("max_input_tokens", 0)))
-                            val topProv = item.optJSONObject("top_provider")
-                            val maxOut = item.optInt("max_output_tokens", topProv?.optInt("max_completion_tokens", 0) ?: 0)
-                            val arch = item.optJSONObject("architecture")
-                            val modality = arch?.optString("modality", "") ?: ""
-                            val hasVision = modality.contains("image") || provider.supportsVision
-                            val supportedParams = item.optJSONArray("supported_parameters")
-                            var hasTools = provider.supportsTools
-                            if (supportedParams != null) {
-                                hasTools = (0 until supportedParams.length()).any {
-                                    supportedParams.optString(it).contains("tool", ignoreCase = true)
-                                }
-                            }
-                            var inPrice = 0.0
-                            var outPrice = 0.0
-                            val pricing = item.optJSONObject("pricing")
-                            if (pricing != null) {
-                                pricingKnown = true
-                                val pPrompt = pricing.optString("prompt", "0").toDoubleOrNull() ?: 0.0
-                                val pComp = pricing.optString("completion", "0").toDoubleOrNull() ?: 0.0
-                                // OpenRouter reports price per token; convert to per-million if tiny
-                                inPrice = if (pPrompt in 0.0..0.01) pPrompt * 1_000_000.0 else pPrompt
-                                outPrice = if (pComp in 0.0..0.01) pComp * 1_000_000.0 else pComp
-                                if (pPrompt == 0.0 && pComp == 0.0) freeIds.add(id)
-                            }
-                            if (id.endsWith(":free")) {
-                                pricingKnown = true
-                                freeIds.add(id)
-                            }
-                            richList.add(
-                                ServerModelMetadata(
-                                    id = id,
-                                    displayName = display,
-                                    contextWindow = ctx,
-                                    maxOutput = maxOut,
-                                    supportsTools = hasTools,
-                                    supportsVision = hasVision,
-                                    inputPricePerMillion = inPrice,
-                                    outputPricePerMillion = outPrice
-                                )
+                        }
+                        var inPrice = 0.0
+                        var outPrice = 0.0
+                        val pricing = item.optJSONObject("pricing")
+                        if (pricing != null) {
+                            pricingKnown = true
+                            val pPrompt = pricing.optString("prompt", "0").toDoubleOrNull() ?: 0.0
+                            val pComp = pricing.optString("completion", "0").toDoubleOrNull() ?: 0.0
+                            inPrice = if (pPrompt in 0.0..0.01) pPrompt * 1_000_000.0 else pPrompt
+                            outPrice = if (pComp in 0.0..0.01) pComp * 1_000_000.0 else pComp
+                            if (pPrompt == 0.0 && pComp == 0.0) freeIds.add(id)
+                        }
+                        if (id.endsWith(":free")) {
+                            pricingKnown = true
+                            freeIds.add(id)
+                        }
+                        richList.add(
+                            ServerModelMetadata(
+                                id = id,
+                                displayName = display,
+                                contextWindow = ctx,
+                                maxOutput = maxOut,
+                                supportsTools = hasTools,
+                                supportsVision = hasVision,
+                                inputPricePerMillion = inPrice,
+                                outputPricePerMillion = outPrice
                             )
+                        )
+                    }
+                    is String -> {
+                        out.add(item)
+                        if (item.endsWith(":free")) {
+                            pricingKnown = true
+                            freeIds.add(item)
                         }
-                        is String -> {
-                            out.add(item)
-                            if (item.endsWith(":free")) {
-                                pricingKnown = true
-                                freeIds.add(item)
-                            }
-                            richList.add(ServerModelMetadata(id = item, displayName = item))
-                        }
+                        richList.add(ServerModelMetadata(id = item, displayName = item))
                     }
                 }
             }
-            val all = out.filter { it.isNotBlank() }.distinct().sorted()
-            val shown = if (freeOnly && pricingKnown) all.filter { it in freeIds } else all
-            val filteredRich = richList.filter { it.id in shown }.distinctBy { it.id }
-            ModelFetch(
-                models = shown,
-                total = all.size,
-                freeCount = freeIds.size,
-                pricingKnown = pricingKnown,
-                richModels = filteredRich
-            )
         }
+        val all = out.filter { it.isNotBlank() }.distinct().sorted()
+        val shown = if (freeOnly && pricingKnown) all.filter { it in freeIds } else all
+        val filteredRich = richList.filter { it.id in shown }.distinctBy { it.id }
+        return ModelFetch(
+            models = shown,
+            total = all.size,
+            freeCount = freeIds.size,
+            pricingKnown = pricingKnown,
+            richModels = filteredRich
+        )
     }
 
     /** Returns null on success, otherwise a readable error message. */
@@ -1219,3 +1308,88 @@ class ApiException(
         message.contains("insufficient", ignoreCase = true)
     fun retryAfterSeconds(): Long? = retryAfter?.trim()?.toDoubleOrNull()?.toLong()
 }
+
+/**
+ * Splits streaming OpenAI-compatible text containing inline `<think>...</think>` blocks
+ * into live reasoning chunks (`onThought`) and normal assistant content (`onText`)
+ * without stalling or leaking partial XML tags across SSE boundaries.
+ */
+class ThinkTagStreamSplitter(
+    private val onText: (String) -> Unit,
+    private val onThought: (String) -> Unit
+) {
+    private val openTag = "<think>"
+    private val closeTag = "</think>"
+    private var inThink = false
+    private val buf = StringBuilder()
+
+    fun feed(chunk: String) {
+        if (chunk.isEmpty()) return
+        buf.append(chunk)
+        drain(finalFlush = false)
+    }
+
+    fun flush() {
+        drain(finalFlush = true)
+    }
+
+    private fun drain(finalFlush: Boolean) {
+        while (buf.isNotEmpty()) {
+            val s = buf.toString()
+            if (!inThink) {
+                val idx = s.indexOf(openTag, ignoreCase = true)
+                if (idx >= 0) {
+                    if (idx > 0) onText(s.substring(0, idx))
+                    buf.delete(0, idx + openTag.length)
+                    inThink = true
+                    continue
+                }
+                if (!finalFlush) {
+                    val keep = partialSuffixLen(s, openTag)
+                    val safeLen = s.length - keep
+                    if (safeLen > 0) {
+                        onText(s.substring(0, safeLen))
+                        buf.delete(0, safeLen)
+                    }
+                    return
+                } else {
+                    onText(s)
+                    buf.setLength(0)
+                    return
+                }
+            } else {
+                val idx = s.indexOf(closeTag, ignoreCase = true)
+                if (idx >= 0) {
+                    if (idx > 0) onThought(s.substring(0, idx))
+                    buf.delete(0, idx + closeTag.length)
+                    inThink = false
+                    continue
+                }
+                if (!finalFlush) {
+                    val keep = partialSuffixLen(s, closeTag)
+                    val safeLen = s.length - keep
+                    if (safeLen > 0) {
+                        onThought(s.substring(0, safeLen))
+                        buf.delete(0, safeLen)
+                    }
+                    return
+                } else {
+                    onThought(s)
+                    buf.setLength(0)
+                    return
+                }
+            }
+        }
+    }
+
+    private fun partialSuffixLen(text: String, tag: String): Int {
+        val maxCheck = minOf(text.length, tag.length - 1)
+        for (len in maxCheck downTo 1) {
+            if (text.regionMatches(text.length - len, tag, 0, len, ignoreCase = true)) {
+                return len
+            }
+        }
+        return 0
+    }
+}
+

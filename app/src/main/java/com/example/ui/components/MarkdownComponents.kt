@@ -258,48 +258,82 @@ fun CodeBlockView(
 @Composable
 fun ThinkingBlockView(
     reasoning: String,
+    isStreaming: Boolean = false,
     modifier: Modifier = Modifier
 ) {
-    var expanded by remember { mutableStateOf(false) }
+    // Auto-expand while live streaming so the user watches the Chain of Thought stream in real time;
+    // preserve manual user toggles cleanly.
+    var userToggled by remember { mutableStateOf(false) }
+    var expanded by remember { mutableStateOf(isStreaming) }
+    androidx.compose.runtime.LaunchedEffect(isStreaming) {
+        if (!userToggled) {
+            expanded = isStreaming
+        }
+    }
+
+    val estTokens = (reasoning.length / 4).coerceAtLeast(1)
+    val headerLabel = if (isStreaming) {
+        "Thinking Process · live"
+    } else {
+        "Thinking Process ($estTokens tok)"
+    }
 
     Card(
         colors = CardDefaults.cardColors(
-            containerColor = AppColors.surfaceAlt.copy(alpha = 0.8f)
+            containerColor = if (isStreaming) AppColors.accentSoft.copy(alpha = 0.55f) else AppColors.surfaceAlt
         ),
-        shape = RoundedCornerShape(10.dp),
-        border = androidx.compose.foundation.BorderStroke(1.dp, ReasoningPurple.copy(alpha = 0.4f)),
+        shape = RoundedCornerShape(12.dp),
+        border = androidx.compose.foundation.BorderStroke(
+            1.dp,
+            if (isStreaming) AppColors.accent.copy(alpha = 0.45f) else AppColors.border
+        ),
         modifier = modifier.fillMaxWidth()
     ) {
         Column(
             modifier = Modifier
-                .clickable { expanded = !expanded }
-                .padding(10.dp)
+                .clickable {
+                    userToggled = true
+                    expanded = !expanded
+                }
+                .padding(horizontal = 12.dp, vertical = 9.dp)
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        imageVector = Icons.Default.Psychology,
-                        contentDescription = "Thinking",
-                        tint = ReasoningPurple,
-                        modifier = Modifier.size(18.dp)
-                    )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    if (isStreaming) {
+                        androidx.compose.material3.CircularProgressIndicator(
+                            modifier = Modifier.size(14.dp),
+                            strokeWidth = 2.dp,
+                            color = AppColors.accent
+                        )
+                    } else {
+                        Icon(
+                            imageVector = Icons.Default.Psychology,
+                            contentDescription = "Thinking process",
+                            tint = AppColors.accent,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = "Thinking Process (${reasoning.length / 4} estimated tokens)",
-                        color = ReasoningPurple,
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.SemiBold
+                        text = headerLabel,
+                        color = if (isStreaming) AppColors.accent else AppColors.textSecondary,
+                        fontSize = 12.5.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1
                     )
                 }
                 Icon(
                     imageVector = if (expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
-                    contentDescription = if (expanded) "Collapse" else "Expand",
-                    tint = ReasoningPurple,
-                    modifier = Modifier.size(20.dp)
+                    contentDescription = if (expanded) "Collapse thinking" else "Expand thinking",
+                    tint = AppColors.textMuted,
+                    modifier = Modifier.size(18.dp)
                 )
             }
 
@@ -309,12 +343,13 @@ fun ThinkingBlockView(
                 exit = fadeOut() + shrinkVertically()
             ) {
                 Column(modifier = Modifier.padding(top = 8.dp)) {
+                    androidx.compose.material3.HorizontalDivider(color = AppColors.border)
+                    Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        text = reasoning,
-                        color = AppColors.reasoning,
+                        text = reasoning.trim(),
+                        color = AppColors.textSecondary,
                         fontSize = 12.sp,
-                        lineHeight = 18.sp,
-                        fontStyle = FontStyle.Italic
+                        lineHeight = 17.5.sp
                     )
                 }
             }
