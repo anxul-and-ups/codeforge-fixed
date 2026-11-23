@@ -4,6 +4,7 @@ import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -11,6 +12,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -25,17 +27,20 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Chat
+import androidx.compose.material.icons.filled.ChatBubble
 import androidx.compose.material.icons.filled.CompareArrows
-import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Folder
-import androidx.compose.material.icons.filled.HelpOutline
-import androidx.compose.material.icons.filled.UploadFile
+import androidx.compose.material.icons.filled.FolderZip
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedButton
@@ -54,8 +59,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -65,6 +72,15 @@ import com.example.ui.screens.chat.ChatViewModel
 import com.example.ui.theme.AppColors
 import kotlinx.coroutines.launch
 
+/**
+ * Home / Projects screen strictly matching the obsidian dark + coral reference design:
+ * - Top brand badge (`>_ CodeForge`)
+ * - Hero headline ("Build from your phone") + subtitle
+ * - Dual action buttons: solid coral "Quick project" + dark bordered "+ New project"
+ * - Expandable "Bring an existing project" card (ZIP file, Git repository, or GitHub)
+ * - "Your projects" section with centered empty-state card or dark project list cards
+ * - Warm coral extended Floating Action Button: `[ >_ Terminal ]`
+ */
 @Composable
 fun ProjectsHomeScreen(
     app: CodeForgeApp,
@@ -73,20 +89,23 @@ fun ProjectsHomeScreen(
     onOpenFiles: (ProjectEntity) -> Unit,
     onOpenChanges: (ProjectEntity) -> Unit,
     onOpenGitHub: () -> Unit,
+    onOpenTerminal: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val projects by app.projectRepository.allProjects.collectAsState(initial = emptyList())
     val activeProject by chatViewModel.activeProject.collectAsState()
-    val engineHealth by app.termuxBridge.healthState.collectAsState()
 
-    var showExplainer by remember { mutableStateOf(false) }
+    var expandImportCard by remember { mutableStateOf(false) }
     var showNewProjectDialog by remember { mutableStateOf(false) }
     var newProjectName by remember { mutableStateOf("") }
     var newProjectTemplate by remember { mutableStateOf("Empty") }
     var editingAgentMdProject by remember { mutableStateOf<ProjectEntity?>(null) }
     var agentMdText by remember { mutableStateOf("") }
+
+    val quickAdjectives = remember { listOf("Quiet", "Swift", "Solar", "Bright", "Amber", "Obsidian", "Crisp") }
+    val quickNouns = remember { listOf("Hopper", "Spark", "Forge", "Pulse", "Atlas", "Nova", "Prism") }
 
     val zipPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -101,6 +120,7 @@ fun ProjectsHomeScreen(
                     )
                     chatViewModel.selectProject(p)
                     Toast.makeText(context, "Imported ${p.name} (${p.fileCount} files)", Toast.LENGTH_SHORT).show()
+                    onOpenChat()
                 } catch (e: Exception) {
                     Toast.makeText(context, "Import failed: ${e.message}", Toast.LENGTH_LONG).show()
                 }
@@ -111,14 +131,15 @@ fun ProjectsHomeScreen(
     if (showNewProjectDialog) {
         AlertDialog(
             onDismissRequest = { showNewProjectDialog = false },
-            title = { Text("Create New Project") },
+            containerColor = AppColors.surface,
+            title = { Text("Create New Project", color = AppColors.textPrimary, fontWeight = FontWeight.Bold) },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     OutlinedTextField(
                         value = newProjectName,
                         onValueChange = { newProjectName = it },
                         label = { Text("Project Name") },
-                        placeholder = { Text("e.g. FastAPI Service, My App") },
+                        placeholder = { Text("e.g. au-notes, portfolio-app") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
@@ -127,17 +148,23 @@ fun ProjectsHomeScreen(
                         for (tpl in listOf("Empty", "Android Starter")) {
                             val sel = newProjectTemplate == tpl
                             Surface(
-                                shape = RoundedCornerShape(8.dp),
+                                shape = RoundedCornerShape(10.dp),
                                 color = if (sel) AppColors.accentSoft else AppColors.surfaceAlt,
                                 modifier = Modifier
-                                    .clip(RoundedCornerShape(8.dp))
+                                    .border(
+                                        1.dp,
+                                        if (sel) AppColors.accent.copy(alpha = 0.5f) else AppColors.border,
+                                        RoundedCornerShape(10.dp)
+                                    )
+                                    .clip(RoundedCornerShape(10.dp))
                                     .clickable { newProjectTemplate = tpl }
                             ) {
                                 Text(
                                     text = tpl,
-                                    fontSize = 12.sp,
+                                    fontSize = 12.5.sp,
+                                    fontWeight = if (sel) FontWeight.SemiBold else FontWeight.Normal,
                                     color = if (sel) AppColors.accent else AppColors.textSecondary,
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp)
                                 )
                             }
                         }
@@ -147,19 +174,22 @@ fun ProjectsHomeScreen(
             confirmButton = {
                 Button(
                     onClick = {
-                        val name = newProjectName.trim().ifBlank { "New Project" }
+                        val name = newProjectName.trim().ifBlank { "new-project" }
                         showNewProjectDialog = false
                         newProjectName = ""
                         chatViewModel.newStarterProject(name, newProjectTemplate)
                         onOpenChat()
                     },
+                    shape = RoundedCornerShape(12.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = AppColors.accent, contentColor = AppColors.onAccent)
                 ) {
-                    Text("Create & Open")
+                    Text("Create & Open", fontWeight = FontWeight.SemiBold)
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showNewProjectDialog = false }) { Text("Cancel") }
+                TextButton(onClick = { showNewProjectDialog = false }) {
+                    Text("Cancel", color = AppColors.textSecondary)
+                }
             }
         )
     }
@@ -168,7 +198,8 @@ fun ProjectsHomeScreen(
         val proj = editingAgentMdProject!!
         AlertDialog(
             onDismissRequest = { editingAgentMdProject = null },
-            title = { Text("${proj.name} · AGENT.md") },
+            containerColor = AppColors.surface,
+            title = { Text("${proj.name} · AGENT.md", color = AppColors.textPrimary) },
             text = {
                 Column {
                     Text(
@@ -180,7 +211,9 @@ fun ProjectsHomeScreen(
                     OutlinedTextField(
                         value = agentMdText,
                         onValueChange = { agentMdText = it },
-                        modifier = Modifier.fillMaxWidth().height(260.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(260.dp),
                         textStyle = androidx.compose.ui.text.TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp)
                     )
                 }
@@ -200,164 +233,143 @@ fun ProjectsHomeScreen(
                 }
             },
             dismissButton = {
-                TextButton(onClick = { editingAgentMdProject = null }) { Text("Cancel") }
+                TextButton(onClick = { editingAgentMdProject = null }) {
+                    Text("Cancel", color = AppColors.textSecondary)
+                }
             }
         )
     }
 
-    LazyColumn(
+    Box(
         modifier = modifier
             .fillMaxSize()
             .background(AppColors.bg)
-            .padding(horizontal = 16.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // Greeting + Engine Status
-        item {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column {
-                    Text(
-                        text = "Projects Workspace",
-                        fontSize = 22.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = AppColors.textPrimary
-                    )
-                    Text(
-                        text = "~/forge/projects · ${projects.size} project(s)",
-                        fontSize = 12.sp,
-                        fontFamily = FontFamily.Monospace,
-                        color = AppColors.textMuted
-                    )
-                }
-                Surface(
-                    shape = RoundedCornerShape(999.dp),
-                    color = AppColors.surface,
-                    modifier = Modifier
-                        .border(1.dp, AppColors.border, RoundedCornerShape(999.dp))
-                        .clip(RoundedCornerShape(999.dp))
-                        .clickable { showExplainer = !showExplainer }
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(Icons.Default.HelpOutline, contentDescription = null, tint = AppColors.accent, modifier = Modifier.size(15.dp))
-                        Spacer(modifier = Modifier.width(5.dp))
-                        Text("What is a project?", fontSize = 11.sp, color = AppColors.accent)
-                    }
-                }
-            }
-        }
-
-        // Explainer Card (Section 10.1)
-        if (showExplainer) {
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(start = 18.dp, end = 18.dp, top = 16.dp, bottom = 96.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            // Brand Row: [ >_ ] CodeForge
             item {
-                Card(
-                    colors = CardDefaults.cardColors(containerColor = AppColors.surface),
-                    shape = RoundedCornerShape(16.dp),
-                    border = BorderStroke(1.dp, AppColors.accent)
-                ) {
-                    Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Text("How CodeForge Projects Work", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = AppColors.textPrimary)
-                        Text(
-                            text = "• Every project is a real folder inside `~/forge/projects/<project-slug>`.\n" +
-                                "• It holds your source files, Git repository, automatic checkpoints, and a per-project `AGENT.md` memory file.\n" +
-                                "• When you install a tool or MCP server from GitHub, it is isolated in `~/forge/tools/<tool-name>` so it never pollutes your project tree.\n" +
-                                "• When you analyze an APK or archive, you can choose to save its decompiled output into a new project or into `<project>/reference/`.",
-                            fontSize = 12.sp,
-                            lineHeight = 18.sp,
-                            color = AppColors.textSecondary
-                        )
-                    }
-                }
-            }
-        }
-
-        // Quick Actions Row
-        item {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Button(
-                    onClick = { showNewProjectDialog = true },
-                    colors = ButtonDefaults.buttonColors(containerColor = AppColors.accent, contentColor = AppColors.onAccent),
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("New Project", fontSize = 12.sp)
-                }
-                OutlinedButton(
-                    onClick = { zipPicker.launch(arrayOf("application/zip", "application/x-zip-compressed", "*/*")) },
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Icon(Icons.Default.UploadFile, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("Import ZIP", fontSize = 12.sp)
-                }
-                OutlinedButton(
-                    onClick = onOpenGitHub,
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Text("GitHub Clone", fontSize = 12.sp)
-                }
-            }
-        }
-
-        // Resume Last Chat Banner
-        item {
-            Card(
-                colors = CardDefaults.cardColors(containerColor = AppColors.surface),
-                shape = RoundedCornerShape(16.dp),
-                border = BorderStroke(1.dp, AppColors.border),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(16.dp))
-                    .clickable { onOpenChat() }
-            ) {
                 Row(
-                    modifier = Modifier.padding(14.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(top = 4.dp, bottom = 6.dp)
                 ) {
                     Box(
                         modifier = Modifier
                             .size(38.dp)
-                            .clip(CircleShape)
-                            .background(AppColors.accentSoft),
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(AppColors.accentSoft)
+                            .border(1.dp, AppColors.accent.copy(alpha = 0.25f), RoundedCornerShape(10.dp)),
                         contentAlignment = Alignment.Center
                     ) {
-                        Icon(Icons.Default.Chat, contentDescription = null, tint = AppColors.accent, modifier = Modifier.size(18.dp))
+                        Icon(
+                            imageVector = Icons.Default.Terminal,
+                            contentDescription = "CodeForge",
+                            tint = AppColors.accent,
+                            modifier = Modifier.size(20.dp)
+                        )
                     }
                     Spacer(modifier = Modifier.width(12.dp))
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "Resume Active Session",
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = AppColors.textPrimary
-                        )
-                        Text(
-                            text = if (activeProject != null && activeProject?.id != com.example.data.repository.ProjectRepository.SCRATCH_ID) {
-                                "Working in ${activeProject?.name} · Engine: ${if (engineHealth.engineRunning) "Connected" else "Local Shell"}"
-                            } else {
-                                "Clean chat session · Tap to open workspace"
-                            },
-                            fontSize = 12.sp,
-                            color = AppColors.textSecondary
-                        )
-                    }
-                    Text("Open ›", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = AppColors.accent)
+                    Text(
+                        text = "CodeForge",
+                        fontSize = 22.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = AppColors.textPrimary
+                    )
                 }
             }
-        }
 
-        // Project Cards List
-        if (projects.isEmpty()) {
+            // Hero Headline & Subtitle
+            item {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "Build from your phone",
+                        fontSize = 31.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        letterSpacing = (-0.5).sp,
+                        color = AppColors.textPrimary
+                    )
+                    Text(
+                        text = "Chat, review changes, and preview your project.",
+                        fontSize = 15.5.sp,
+                        lineHeight = 22.sp,
+                        color = AppColors.textSecondary
+                    )
+                }
+            }
+
+            // Dual Action Row: [ Quick project ]  [ + New project ]
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Button(
+                        onClick = {
+                            val name = "${quickAdjectives.random()} ${quickNouns.random()}"
+                            chatViewModel.newStarterProject(name, "Empty")
+                            onOpenChat()
+                        },
+                        shape = RoundedCornerShape(14.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = AppColors.accent,
+                            contentColor = AppColors.onAccent
+                        ),
+                        contentPadding = PaddingValues(vertical = 14.dp, horizontal = 12.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(52.dp)
+                            .testTag("quick_project_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.ChatBubble,
+                            contentDescription = null,
+                            modifier = Modifier.size(17.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Quick project",
+                            fontSize = 14.5.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1
+                        )
+                    }
+
+                    OutlinedButton(
+                        onClick = { showNewProjectDialog = true },
+                        shape = RoundedCornerShape(14.dp),
+                        border = BorderStroke(1.dp, AppColors.border),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = AppColors.surface,
+                            contentColor = AppColors.accent
+                        ),
+                        contentPadding = PaddingValues(vertical = 14.dp, horizontal = 12.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(52.dp)
+                            .testTag("new_project_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Add,
+                            contentDescription = null,
+                            tint = AppColors.accent,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "New project",
+                            fontSize = 14.5.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = AppColors.accent,
+                            maxLines = 1
+                        )
+                    }
+                }
+            }
+
+            // Expandable "Bring an existing project" Card
             item {
                 Surface(
                     shape = RoundedCornerShape(16.dp),
@@ -365,109 +377,315 @@ fun ProjectsHomeScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .border(1.dp, AppColors.border, RoundedCornerShape(16.dp))
-                        .padding(24.dp)
+                        .clip(RoundedCornerShape(16.dp))
+                        .clickable { expandImportCard = !expandImportCard }
+                        .testTag("bring_existing_project_card")
                 ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text("No projects yet", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = AppColors.textPrimary)
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text(
-                            "Create a new project, import a ZIP archive, or clone a GitHub repository to get started.",
-                            fontSize = 12.sp,
-                            color = AppColors.textSecondary
-                        )
-                    }
-                }
-            }
-        } else {
-            items(projects, key = { it.id }) { project ->
-                val isSelected = activeProject?.id == project.id
-                Card(
-                    colors = CardDefaults.cardColors(containerColor = AppColors.surface),
-                    shape = RoundedCornerShape(16.dp),
-                    border = BorderStroke(1.dp, if (isSelected) AppColors.accent else AppColors.border),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(modifier = Modifier.padding(14.dp)) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 14.dp)
+                    ) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    text = "Bring an existing project",
+                                    fontSize = 15.5.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = AppColors.textPrimary
+                                )
+                                Spacer(modifier = Modifier.height(3.dp))
+                                Text(
+                                    text = "ZIP file, Git repository, or GitHub",
+                                    fontSize = 13.sp,
+                                    color = AppColors.textSecondary
+                                )
+                            }
+                            Icon(
+                                imageVector = if (expandImportCard) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                                contentDescription = "Toggle import options",
+                                tint = AppColors.textSecondary,
+                                modifier = Modifier.size(22.dp)
+                            )
+                        }
+
+                        AnimatedVisibility(visible = expandImportCard) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(top = 14.dp),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                OutlinedButton(
+                                    onClick = {
+                                        zipPicker.launch(arrayOf("application/zip", "application/x-zip-compressed", "*/*"))
+                                    },
+                                    shape = RoundedCornerShape(12.dp),
+                                    border = BorderStroke(1.dp, AppColors.border),
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Icon(
+                                        Icons.Default.FolderZip,
+                                        contentDescription = null,
+                                        tint = AppColors.accent,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Import ZIP", fontSize = 12.5.sp, color = AppColors.textPrimary)
+                                }
+                                OutlinedButton(
+                                    onClick = onOpenGitHub,
+                                    shape = RoundedCornerShape(12.dp),
+                                    border = BorderStroke(1.dp, AppColors.border),
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Text("GitHub Repo", fontSize = 12.5.sp, color = AppColors.accent)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Section Heading: "Your projects"
+            item {
+                Text(
+                    text = "Your projects",
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = AppColors.textPrimary,
+                    modifier = Modifier.padding(top = 4.dp)
+                )
+            }
+
+            // Empty State Card OR Populated Project Cards
+            if (projects.isEmpty()) {
+                item {
+                    Surface(
+                        shape = RoundedCornerShape(20.dp),
+                        color = AppColors.surface,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .border(1.dp, AppColors.border, RoundedCornerShape(20.dp))
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 28.dp, vertical = 40.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(60.dp)
+                                    .clip(CircleShape)
+                                    .background(AppColors.accentSoft),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Folder,
+                                    contentDescription = null,
+                                    tint = AppColors.accent,
+                                    modifier = Modifier.size(28.dp)
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "No projects yet",
+                                fontSize = 17.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = AppColors.textPrimary
+                            )
+                            Text(
+                                text = "Create a named project or start instantly with a Quick Project.",
+                                fontSize = 13.5.sp,
+                                lineHeight = 20.sp,
+                                color = AppColors.textSecondary,
+                                textAlign = TextAlign.Center
+                            )
+                        }
+                    }
+                }
+            } else {
+                items(projects, key = { it.id }) { project ->
+                    val isSelected = activeProject?.id == project.id
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = AppColors.surface),
+                        shape = RoundedCornerShape(16.dp),
+                        border = BorderStroke(
+                            1.dp,
+                            if (isSelected) AppColors.accent.copy(alpha = 0.65f) else AppColors.border
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(16.dp))
+                            .clickable {
+                                chatViewModel.attachProjectToChat(project)
+                                onOpenChat()
+                            }
+                            .testTag("project_card_${project.id}")
+                    ) {
+                        Column(modifier = Modifier.padding(14.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(40.dp)
+                                        .clip(RoundedCornerShape(11.dp))
+                                        .background(AppColors.accentSoft),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Folder,
+                                        contentDescription = null,
+                                        tint = AppColors.accent,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
+                                Spacer(modifier = Modifier.width(12.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            text = project.name,
+                                            fontSize = 16.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = AppColors.textPrimary,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        if (isSelected) {
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                            Surface(
+                                                shape = RoundedCornerShape(999.dp),
+                                                color = AppColors.accentSoft
+                                            ) {
+                                                Text(
+                                                    text = "Active",
+                                                    fontSize = 10.sp,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    color = AppColors.accent,
+                                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                                                )
+                                            }
+                                        }
+                                    }
                                     Text(
-                                        text = project.name,
-                                        fontSize = 16.sp,
-                                        fontWeight = FontWeight.SemiBold,
-                                        color = AppColors.textPrimary,
+                                        text = "~/forge/projects/${project.slug.ifBlank { project.name.lowercase() }} · ${project.fileCount} files",
+                                        fontSize = 11.5.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        color = AppColors.textSecondary,
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis
                                     )
-                                    if (isSelected) {
-                                        Spacer(modifier = Modifier.width(8.dp))
-                                        Surface(shape = RoundedCornerShape(999.dp), color = AppColors.accentSoft) {
-                                            Text(
-                                                text = "Active",
-                                                fontSize = 10.sp,
-                                                fontWeight = FontWeight.SemiBold,
-                                                color = AppColors.accent,
-                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
-                                            )
-                                        }
-                                    }
                                 }
-                                Text(
-                                    text = "~/forge/projects/${project.slug.ifBlank { project.name.lowercase() }} · branch:${project.gitBranch} · ${project.fileCount} files",
-                                    fontSize = 11.sp,
-                                    fontFamily = FontFamily.Monospace,
-                                    color = AppColors.textMuted
-                                )
+                                IconButton(
+                                    onClick = {
+                                        scope.launch { app.projectRepository.deleteProject(project.id) }
+                                    },
+                                    modifier = Modifier.size(34.dp)
+                                ) {
+                                    Icon(
+                                        Icons.Default.DeleteOutline,
+                                        contentDescription = "Delete project",
+                                        tint = AppColors.textMuted,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
                             }
-                            IconButton(
-                                onClick = {
-                                    scope.launch { app.projectRepository.deleteProject(project.id) }
-                                },
-                                modifier = Modifier.size(32.dp)
-                            ) {
-                                Icon(Icons.Default.Delete, contentDescription = "Delete project", tint = AppColors.textMuted, modifier = Modifier.size(17.dp))
-                            }
-                        }
 
-                        Spacer(modifier = Modifier.height(10.dp))
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Button(
-                                onClick = {
-                                    chatViewModel.attachProjectToChat(project)
-                                    onOpenChat()
-                                },
-                                colors = ButtonDefaults.buttonColors(containerColor = AppColors.accent, contentColor = AppColors.onAccent)
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Text("Open in Chat", fontSize = 12.sp)
-                            }
-                            OutlinedButton(onClick = { onOpenFiles(project) }) {
-                                Icon(Icons.Default.Folder, contentDescription = null, modifier = Modifier.size(14.dp))
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("Files", fontSize = 12.sp)
-                            }
-                            OutlinedButton(onClick = { onOpenChanges(project) }) {
-                                Icon(Icons.Default.CompareArrows, contentDescription = null, modifier = Modifier.size(14.dp))
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("Diff", fontSize = 12.sp)
-                            }
-                            TextButton(
-                                onClick = {
-                                    scope.launch {
-                                        agentMdText = app.projectRepository.readAgentMemory(project.id)
-                                        editingAgentMdProject = project
+                                Surface(
+                                    shape = RoundedCornerShape(10.dp),
+                                    color = AppColors.accentSoft,
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .clickable { onOpenFiles(project) }
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(Icons.Default.Folder, contentDescription = null, tint = AppColors.accent, modifier = Modifier.size(14.dp))
+                                        Spacer(modifier = Modifier.width(5.dp))
+                                        Text("Files", fontSize = 12.sp, fontWeight = FontWeight.Medium, color = AppColors.accent)
                                     }
                                 }
-                            ) {
-                                Text("AGENT.md", fontSize = 12.sp, fontFamily = FontFamily.Monospace, color = AppColors.accent)
+                                Surface(
+                                    shape = RoundedCornerShape(10.dp),
+                                    color = AppColors.surfaceAlt,
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .clickable { onOpenChanges(project) }
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(Icons.Default.CompareArrows, contentDescription = null, tint = AppColors.textSecondary, modifier = Modifier.size(14.dp))
+                                        Spacer(modifier = Modifier.width(5.dp))
+                                        Text("Diff", fontSize = 12.sp, color = AppColors.textSecondary)
+                                    }
+                                }
+                                Surface(
+                                    shape = RoundedCornerShape(10.dp),
+                                    color = AppColors.surfaceAlt,
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .clickable {
+                                            scope.launch {
+                                                agentMdText = app.projectRepository.readAgentMemory(project.id)
+                                                editingAgentMdProject = project
+                                            }
+                                        }
+                                ) {
+                                    Text(
+                                        text = "AGENT.md",
+                                        fontSize = 11.5.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        color = AppColors.textSecondary,
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                    )
+                                }
                             }
                         }
                     }
                 }
             }
         }
+
+        // Bottom-right Warm Coral Extended FAB: [ >_ Terminal ] matching reference screenshot
+        ExtendedFloatingActionButton(
+            onClick = onOpenTerminal,
+            shape = RoundedCornerShape(16.dp),
+            containerColor = AppColors.accent,
+            contentColor = AppColors.onAccent,
+            icon = {
+                Icon(
+                    imageVector = Icons.Default.Terminal,
+                    contentDescription = "Open Terminal",
+                    modifier = Modifier.size(20.dp)
+                )
+            },
+            text = {
+                Text(
+                    text = "Terminal",
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            },
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(end = 18.dp, bottom = 18.dp)
+                .testTag("home_terminal_fab")
+        )
     }
 }

@@ -32,12 +32,14 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.FolderOpen
@@ -49,6 +51,7 @@ import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Terminal
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
@@ -337,260 +340,91 @@ fun ChatScreen(
                 .background(AppColors.bg)
                 .imePadding()
         ) {
-            // ---------------- Top Header (Matches Screenshot & Video) ----------------
-            Column(
+            // ---------------- Clean Minimal Dark Header (Matches Reference Screenshots) ----------------
+            val headerTitle = if (isScratch) {
+                uiState.activeConversation?.title?.takeIf { it != "New Chat" } ?: "CodeForge"
+            } else {
+                uiState.activeProject?.name ?: "Project"
+            }
+            val modeText = if (uiState.mode == AgentMode.BUILD) "build" else "plan"
+            val providerName = activeProvider?.name ?: "Add provider"
+            val convLabel = uiState.activeConversation?.title?.ifBlank { "New chat" } ?: "New chat"
+            val headerSubtitle = "$providerName · $shortModelLabel · $modeText"
+
+            Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .background(AppColors.bg)
-                    .padding(horizontal = 8.dp, vertical = 6.dp)
+                    .padding(horizontal = 6.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    if (!isScratch) {
-                        IconButton(
-                            onClick = onExitProjectToHome,
-                            modifier = Modifier
-                                .size(38.dp)
-                                .testTag("exit_project_button")
-                        ) {
-                            Icon(
-                                Icons.AutoMirrored.Filled.ArrowBack,
-                                contentDescription = "Back to Projects",
-                                tint = AppColors.textPrimary
-                            )
-                        }
-                    } else {
-                        IconButton(
-                            onClick = { scope.launch { drawerState.open() } },
-                            modifier = Modifier.size(38.dp)
-                        ) {
-                            Icon(
-                                Icons.Default.Menu,
-                                contentDescription = "Conversations",
-                                tint = AppColors.textPrimary
-                            )
-                        }
-                    }
-
-                    Column(modifier = Modifier.weight(1f)) {
-                        // Project title row
-                        Row(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(6.dp))
-                                .clickable {
-                                    if (isScratch) showProjectPicker = true
-                                    else scope.launch { drawerState.open() }
-                                }
-                                .padding(horizontal = 4.dp, vertical = 2.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = if (isScratch) {
-                                    uiState.activeConversation?.title?.takeIf { it != "New Chat" } ?: "CodeForge"
-                                } else {
-                                    uiState.activeProject?.name ?: "Project"
-                                },
-                                fontSize = 16.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = AppColors.textPrimary,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = "~/forge/projects/${if (isScratch) "scratch" else (uiState.activeProject?.slug ?: "app")}",
-                                fontSize = 10.sp,
-                                fontFamily = FontFamily.Monospace,
-                                color = AppColors.textMuted,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-
-                        Spacer(modifier = Modifier.height(4.dp))
-
-                        // Clean minimal pills: [ provider/model ⌄ ]  [ build ⌄ ]  [ Termux status ]
-                        // ("Codebase" button removed from top bar — now cleanly in Bottom Navigation Bar)
-                        Row(
-                            modifier = Modifier.horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            // Model Dropdown Pill
-                            Surface(
-                                shape = RoundedCornerShape(10.dp),
-                                color = AppColors.surface,
-                                modifier = Modifier
-                                    .border(1.dp, AppColors.border, RoundedCornerShape(10.dp))
-                                    .clip(RoundedCornerShape(10.dp))
-                                    .clickable { showModelPicker = true }
-                                    .testTag("model_chip")
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text(
-                                        text = fullModelLabel,
-                                        fontSize = 12.sp,
-                                        fontWeight = FontWeight.Medium,
-                                        color = AppColors.textPrimary,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                        modifier = Modifier.widthIn(max = 195.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Icon(
-                                        Icons.Default.KeyboardArrowDown,
-                                        contentDescription = "Select model",
-                                        tint = AppColors.accent,
-                                        modifier = Modifier.size(16.dp)
-                                    )
-                                }
-                            }
-
-                            // Agent Mode Dropdown Pill (`build ⌄` / `plan ⌄`)
-                            val modeLabel = if (uiState.mode == AgentMode.BUILD) "build" else "plan"
-                            Surface(
-                                shape = RoundedCornerShape(10.dp),
-                                color = AppColors.surface,
-                                modifier = Modifier
-                                    .border(1.dp, AppColors.border, RoundedCornerShape(10.dp))
-                                    .clip(RoundedCornerShape(10.dp))
-                                    .clickable { showAgentPicker = true }
-                                    .testTag("agent_mode_pill")
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text(
-                                        text = modeLabel,
-                                        fontSize = 12.sp,
-                                        fontWeight = FontWeight.Medium,
-                                        color = AppColors.textPrimary
-                                    )
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Icon(
-                                        Icons.Default.KeyboardArrowDown,
-                                        contentDescription = "Choose agent",
-                                        tint = AppColors.accent,
-                                        modifier = Modifier.size(16.dp)
-                                    )
-                                }
-                            }
-
-                            // Live Termux HTTP Bridge Status Pill
-                            val isConnected = engineHealth.engineRunning
-                            val statusColor = if (isConnected) AppColors.ok else AppColors.warn
-                            Surface(
-                                shape = RoundedCornerShape(10.dp),
-                                color = if (isConnected) AppColors.diffAddBg else AppColors.surfaceAlt,
-                                modifier = Modifier
-                                    .border(1.dp, statusColor.copy(alpha = 0.40f), RoundedCornerShape(10.dp))
-                                    .clip(RoundedCornerShape(10.dp))
-                                    .clickable { showTerminalSheet = true }
-                                    .testTag("termux_connection_pill")
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Box(
-                                        modifier = Modifier
-                                            .size(7.dp)
-                                            .clip(CircleShape)
-                                            .background(statusColor)
-                                    )
-                                    Spacer(modifier = Modifier.width(5.dp))
-                                    Text(
-                                        text = if (isConnected) "Termux" else "Direct Mode",
-                                        fontSize = 11.sp,
-                                        fontWeight = FontWeight.SemiBold,
-                                        color = if (isConnected) AppColors.diffAddText else AppColors.textSecondary
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    // Terminal Drawer Button
+                if (!isScratch) {
                     IconButton(
-                        onClick = { showTerminalSheet = true },
-                        modifier = Modifier.size(36.dp)
+                        onClick = onExitProjectToHome,
+                        modifier = Modifier
+                            .size(44.dp)
+                            .testTag("exit_project_button")
                     ) {
                         Icon(
-                            Icons.Default.Terminal,
-                            contentDescription = "Open Terminal Drawer",
-                            tint = if (engineHealth.engineRunning) AppColors.ok else AppColors.textSecondary,
-                            modifier = Modifier.size(19.dp)
+                            Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Back to Projects",
+                            tint = AppColors.textPrimary,
+                            modifier = Modifier.size(22.dp)
                         )
                     }
-
-                    // Outer home Settings button hidden in Distraction-Free Project Mode
-                    if (isScratch) {
-                        IconButton(
-                            onClick = onOpenSettings,
-                            modifier = Modifier.size(36.dp)
-                        ) {
-                            Icon(
-                                Icons.Default.Settings,
-                                contentDescription = "Settings",
-                                tint = AppColors.textSecondary,
-                                modifier = Modifier.size(20.dp)
-                            )
-                        }
+                } else {
+                    IconButton(
+                        onClick = { scope.launch { drawerState.open() } },
+                        modifier = Modifier.size(44.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.Menu,
+                            contentDescription = "Conversations",
+                            tint = AppColors.textPrimary,
+                            modifier = Modifier.size(22.dp)
+                        )
                     }
                 }
-            }
 
-            Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(AppColors.border))
+                Spacer(modifier = Modifier.width(4.dp))
 
-            // ---------------- Non-Blocking Termux Bridge Banner ----------------
-            if (!engineHealth.engineRunning) {
-                Surface(
-                    color = AppColors.surfaceAlt,
+                Column(
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .border(0.5.dp, AppColors.border)
+                        .weight(1f)
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable { showModelPicker = true }
+                        .padding(horizontal = 4.dp, vertical = 2.dp)
+                        .testTag("model_chip")
                 ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 12.dp, vertical = 5.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(7.dp)
-                                .clip(CircleShape)
-                                .background(AppColors.warn)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "Termux Offline · Direct Codebase Mode active",
-                            fontSize = 11.5.sp,
-                            fontWeight = FontWeight.Medium,
-                            color = AppColors.textSecondary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.weight(1f)
-                        )
-                        TextButton(
-                            onClick = { viewModel.repairEngine() },
-                            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 0.dp)
-                        ) {
-                            Text("Connect", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = AppColors.accent)
-                        }
-                        TextButton(
-                            onClick = { showTerminalSheet = true },
-                            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 6.dp, vertical = 0.dp)
-                        ) {
-                            Text("Bridge", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = AppColors.textPrimary)
-                        }
-                    }
+                    Text(
+                        text = headerTitle,
+                        fontSize = 21.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = AppColors.textPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = if (isScratch) headerSubtitle else "$providerName · $convLabel",
+                        fontSize = 12.5.sp,
+                        color = AppColors.textSecondary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+
+                IconButton(
+                    onClick = { scope.launch { drawerState.open() } },
+                    modifier = Modifier
+                        .size(44.dp)
+                        .testTag("chat_history_button")
+                ) {
+                    Icon(
+                        Icons.Default.History,
+                        contentDescription = "Conversation History",
+                        tint = AppColors.textSecondary,
+                        modifier = Modifier.size(22.dp)
+                    )
                 }
             }
 
@@ -876,11 +710,11 @@ fun ChatScreen(
                 )
             }
 
-            // ---------------- Bottom Composer Pill ----------------
+            // ---------------- Bottom Composer Pill (Matches Reference Dark Pill) ----------------
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 10.dp, vertical = 8.dp)
+                    .padding(horizontal = 14.dp, vertical = 10.dp)
             ) {
                 if (uiState.pendingAttachments.isNotEmpty()) {
                     Row(
@@ -901,16 +735,16 @@ fun ChatScreen(
                 }
 
                 Surface(
-                    shape = RoundedCornerShape(28.dp),
+                    shape = RoundedCornerShape(30.dp),
                     color = AppColors.surface,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .border(1.dp, AppColors.border, RoundedCornerShape(28.dp))
+                        .border(1.dp, AppColors.border, RoundedCornerShape(30.dp))
                 ) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(start = 6.dp, end = 6.dp, top = 2.dp, bottom = 2.dp),
+                            .padding(start = 8.dp, end = 8.dp, top = 4.dp, bottom = 4.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Box {
@@ -921,33 +755,35 @@ fun ChatScreen(
                                     .testTag("attach_button")
                             ) {
                                 Icon(
-                                    Icons.Default.Add,
-                                    contentDescription = "Attach",
-                                    tint = AppColors.textPrimary
+                                    Icons.Default.AttachFile,
+                                    contentDescription = "Attach & Tools",
+                                    tint = AppColors.textSecondary,
+                                    modifier = Modifier.size(21.dp)
                                 )
                             }
                             DropdownMenu(
                                 expanded = showAttachMenu,
-                                onDismissRequest = { showAttachMenu = false }
+                                onDismissRequest = { showAttachMenu = false },
+                                containerColor = AppColors.surface
                             ) {
                                 DropdownMenuItem(
-                                    text = { Text("Photo / screenshot") },
-                                    leadingIcon = { Icon(Icons.Default.Image, contentDescription = null) },
+                                    text = { Text("Photo / screenshot", color = AppColors.textPrimary) },
+                                    leadingIcon = { Icon(Icons.Default.Image, contentDescription = null, tint = AppColors.accent) },
                                     onClick = {
                                         showAttachMenu = false
                                         photoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
                                     }
                                 )
                                 DropdownMenuItem(
-                                    text = { Text("File, PDF, Project ZIP, or APK") },
-                                    leadingIcon = { Icon(Icons.Default.AttachFile, contentDescription = null) },
+                                    text = { Text("File, PDF, Project ZIP, or APK", color = AppColors.textPrimary) },
+                                    leadingIcon = { Icon(Icons.Default.AttachFile, contentDescription = null, tint = AppColors.accent) },
                                     onClick = {
                                         showAttachMenu = false
                                         filePicker.launch(arrayOf("*/*"))
                                     }
                                 )
                                 DropdownMenuItem(
-                                    text = { Text("Clone GitHub Repository") },
+                                    text = { Text("Clone GitHub Repository", color = AppColors.textPrimary) },
                                     leadingIcon = {
                                         androidx.compose.foundation.Image(
                                             painter = androidx.compose.ui.res.painterResource(com.example.R.drawable.ic_github),
@@ -959,6 +795,30 @@ fun ChatScreen(
                                     onClick = {
                                         showAttachMenu = false
                                         if (githubConnected) showRepoPicker = true else onOpenGitHub()
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Model: $shortModelLabel", color = AppColors.textPrimary) },
+                                    leadingIcon = { Icon(Icons.Default.Tune, contentDescription = null, tint = AppColors.textSecondary) },
+                                    onClick = {
+                                        showAttachMenu = false
+                                        showModelPicker = true
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Agent Mode: ${if (uiState.mode == AgentMode.BUILD) "Build" else "Plan"}", color = AppColors.textPrimary) },
+                                    leadingIcon = { Icon(Icons.Default.PlayArrow, contentDescription = null, tint = AppColors.textSecondary) },
+                                    onClick = {
+                                        showAttachMenu = false
+                                        showAgentPicker = true
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Terminal (${if (engineHealth.engineRunning) "Connected" else "Offline"})", color = AppColors.textPrimary) },
+                                    leadingIcon = { Icon(Icons.Default.Terminal, contentDescription = null, tint = if (engineHealth.engineRunning) AppColors.ok else AppColors.textSecondary) },
+                                    onClick = {
+                                        showAttachMenu = false
+                                        showTerminalSheet = true
                                     }
                                 )
                             }
@@ -973,12 +833,8 @@ fun ChatScreen(
                             enabled = true,
                             placeholder = {
                                 Text(
-                                    text = if (engineHealth.engineRunning) {
-                                        "Type a message..."
-                                    } else {
-                                        "Build in Codebase or ask anything..."
-                                    },
-                                    fontSize = 14.sp
+                                    text = "Message CodeForge...",
+                                    fontSize = 15.sp
                                 )
                             },
                             maxLines = 5,
@@ -993,8 +849,8 @@ fun ChatScreen(
                                 focusedTextColor = AppColors.textPrimary,
                                 unfocusedTextColor = AppColors.textPrimary,
                                 disabledTextColor = AppColors.textMuted,
-                                focusedPlaceholderColor = AppColors.textMuted,
-                                unfocusedPlaceholderColor = AppColors.textMuted,
+                                focusedPlaceholderColor = AppColors.textSecondary,
+                                unfocusedPlaceholderColor = AppColors.textSecondary,
                                 disabledPlaceholderColor = AppColors.textMuted
                             ),
                             modifier = Modifier
@@ -1005,32 +861,29 @@ fun ChatScreen(
                         val canSend = (inputText.isNotBlank() || uiState.pendingAttachments.isNotEmpty()) &&
                             !uiState.isPreparing
                         if (uiState.isAgentRunning) {
-                            // Stop Button: Warm surface circle with crisp rose-red stop square
                             Box(
                                 modifier = Modifier
-                                    .size(44.dp)
+                                    .size(40.dp)
                                     .clip(CircleShape)
                                     .background(AppColors.diffRemoveBg)
-                                    .border(1.5.dp, AppColors.error.copy(alpha = 0.45f), CircleShape)
+                                    .border(1.dp, AppColors.error.copy(alpha = 0.45f), CircleShape)
                                     .clickable { viewModel.stopAgent() }
                                     .testTag("stop_agent_button"),
                                 contentAlignment = Alignment.Center
                             ) {
                                 Box(
                                     modifier = Modifier
-                                        .size(15.dp)
-                                        .clip(RoundedCornerShape(4.dp))
+                                        .size(14.dp)
+                                        .clip(RoundedCornerShape(3.dp))
                                         .background(AppColors.error)
                                 )
                             }
                         } else {
-                            // Send Button: Burnt rust-orange accent circle (no redundant double spinner)
-                            val sendBg = if (canSend) AppColors.accent else AppColors.accent.copy(alpha = 0.38f)
                             Box(
                                 modifier = Modifier
-                                    .size(44.dp)
+                                    .size(40.dp)
                                     .clip(CircleShape)
-                                    .background(sendBg)
+                                    .background(if (canSend) AppColors.accent else AppColors.surfaceAlt)
                                     .clickable(enabled = canSend) {
                                         val text = inputText
                                         inputText = ""
@@ -1040,10 +893,10 @@ fun ChatScreen(
                                 contentAlignment = Alignment.Center
                             ) {
                                 Icon(
-                                    Icons.Default.Send,
+                                    Icons.Default.ArrowUpward,
                                     contentDescription = "Send",
-                                    tint = AppColors.onAccent,
-                                    modifier = Modifier.size(19.dp)
+                                    tint = if (canSend) AppColors.onAccent else AppColors.textSecondary,
+                                    modifier = Modifier.size(20.dp)
                                 )
                             }
                         }
@@ -1713,50 +1566,22 @@ private fun EmptyChat(projectName: String?, onPrompt: (String) -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(top = 36.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
+            .padding(top = 12.dp, start = 2.dp, end = 24.dp),
+        horizontalAlignment = Alignment.Start
     ) {
-        Text(
-            text = "What should we build or fix?",
-            fontSize = 20.sp,
-            fontWeight = FontWeight.SemiBold,
-            color = AppColors.textPrimary
-        )
-        Spacer(modifier = Modifier.height(6.dp))
-        Text(
-            text = if (projectName != null) {
-                "Active project: $projectName (~/forge/projects)"
-            } else {
-                "Pick a project above, attach a ZIP/APK with +, or clone a GitHub repository"
-            },
-            fontSize = 13.sp,
-            color = AppColors.textMuted
-        )
-        Spacer(modifier = Modifier.height(22.dp))
-        val prompts = listOf(
-            "is code me kya kya hai",
-            "Find and fix bugs in this project and trigger GitHub Actions build",
-            "Inspect all project files and explain the architecture",
-            "Add a new feature and push changes to GitHub"
-        )
-        for (p in prompts) {
-            Surface(
-                shape = RoundedCornerShape(14.dp),
-                color = AppColors.surface,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 4.dp)
-                    .border(1.dp, AppColors.border, RoundedCornerShape(14.dp))
-                    .clip(RoundedCornerShape(14.dp))
-                    .clickable { onPrompt(p) }
-            ) {
-                Text(
-                    text = p,
-                    fontSize = 14.sp,
-                    color = AppColors.textPrimary,
-                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp)
-                )
-            }
+        Surface(
+            shape = RoundedCornerShape(18.dp),
+            color = AppColors.surface,
+            modifier = Modifier
+                .border(1.dp, AppColors.border.copy(alpha = 0.65f), RoundedCornerShape(18.dp))
+        ) {
+            Text(
+                text = "Hi! Tell me what you want to build or change.",
+                fontSize = 15.5.sp,
+                lineHeight = 22.sp,
+                color = AppColors.textPrimary,
+                modifier = Modifier.padding(horizontal = 18.dp, vertical = 14.dp)
+            )
         }
     }
 }

@@ -21,10 +21,12 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
@@ -46,6 +48,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -62,9 +65,11 @@ import com.example.ui.screens.diff.DiffReviewScreen
 import com.example.ui.screens.files.FilesScreen
 import com.example.ui.screens.github.GitHubScreen
 import com.example.ui.screens.onboarding.OnboardingScreen
+import com.example.ui.screens.preview.ProjectPreviewScreen
 import com.example.ui.screens.projects.ProjectsHomeScreen
 import com.example.ui.screens.providers.ProvidersScreen
 import com.example.ui.screens.settings.SettingsScreen
+import com.example.ui.screens.terminal.ProjectTerminalScreen
 import com.example.ui.theme.AppColors
 
 @Composable
@@ -74,17 +79,26 @@ fun MainScreen(
 ) {
     val chatViewModel: ChatViewModel = viewModel()
     val activeProject by chatViewModel.activeProject.collectAsState()
+    val providers by chatViewModel.providers.collectAsState()
+    val hasConfiguredProvider = remember(providers) { providers.any { it.isEnabled && it.selectedModel.isNotBlank() } }
 
     val isInProject = activeProject != null && activeProject?.id != ProjectRepository.SCRATCH_ID
-    var currentScreen by remember { mutableStateOf<Screen>(Screen.Chat) }
+    var currentScreen by remember { mutableStateOf<Screen>(Screen.Projects) }
 
-    BackHandler(enabled = currentScreen != Screen.Chat) {
+    BackHandler(enabled = currentScreen != Screen.Projects) {
         currentScreen = when (currentScreen) {
-            Screen.Codebase, Screen.GhBuild -> Screen.Chat
+            Screen.Codebase, Screen.Terminal, Screen.Preview, Screen.GhBuild ->
+                if (isInProject) Screen.Chat else Screen.Projects
+            Screen.Chat -> {
+                if (isInProject) {
+                    chatViewModel.detachProjectFromChat()
+                }
+                Screen.Projects
+            }
             Screen.Files, Screen.Changes -> if (isInProject) Screen.Codebase else Screen.Projects
             Screen.Analytics, Screen.GitHub, Screen.Providers, Screen.Builds, Screen.Onboarding ->
                 if (isInProject) Screen.Chat else Screen.Settings
-            else -> Screen.Chat
+            else -> Screen.Projects
         }
     }
 
@@ -102,7 +116,8 @@ fun MainScreen(
         val isAskUser = approval.toolName == "ask_user"
         AlertDialog(
             onDismissRequest = { chatViewModel.resolveApproval(false) },
-            title = { Text(approval.title, fontWeight = FontWeight.SemiBold) },
+            containerColor = AppColors.surface,
+            title = { Text(approval.title, fontWeight = FontWeight.SemiBold, color = AppColors.textPrimary) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(approval.summary, fontSize = 14.sp, color = AppColors.textPrimary)
@@ -165,77 +180,99 @@ fun MainScreen(
         )
     }
 
-    // Distraction-Free Project Mode: inside a created project, show ONLY [Chat | Codebase | GH Build]
-    val navItems = if (isInProject) Screen.projectBottomNavItems else Screen.bottomNavItems
+    // Distraction-Free Project Workspace bottom nav: [Chat | Files | Terminal | Preview | GH Build]
+    // Outer Home mode bottom nav: [Projects | Agent | Settings]
+    val showProjectNav = isInProject && currentScreen != Screen.Projects && currentScreen != Screen.Settings &&
+        currentScreen != Screen.Providers && currentScreen != Screen.GitHub && currentScreen != Screen.Analytics
+    val navItems = if (showProjectNav) Screen.projectBottomNavItems else Screen.bottomNavItems
 
     Scaffold(
         modifier = modifier
             .fillMaxSize()
             .background(AppColors.bg)
             .statusBarsPadding(),
+        containerColor = AppColors.bg,
         bottomBar = {
             if (!imeOpen) {
-                Box(
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(AppColors.bg)
+                        .background(AppColors.surface)
                         .navigationBarsPadding()
-                        .padding(horizontal = 20.dp, vertical = 8.dp),
-                    contentAlignment = Alignment.Center
+                        .testTag("bottom_nav_bar")
                 ) {
-                    Surface(
-                        shape = RoundedCornerShape(999.dp),
-                        color = AppColors.surface,
+                    Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .border(1.dp, AppColors.border, RoundedCornerShape(999.dp))
-                            .testTag("bottom_nav_bar")
+                            .height(1.dp)
+                            .background(AppColors.border)
+                    )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 6.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceEvenly,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 8.dp, vertical = 6.dp),
-                            horizontalArrangement = Arrangement.SpaceEvenly,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            for (screen in navItems) {
-                                val isSelected = currentScreen == screen ||
-                                    (screen == Screen.Projects && (currentScreen == Screen.Files || currentScreen == Screen.Changes)) ||
-                                    (screen == Screen.Codebase && (currentScreen == Screen.Files || currentScreen == Screen.Changes)) ||
-                                    (screen == Screen.GhBuild && currentScreen == Screen.Builds) ||
-                                    (screen == Screen.Settings && currentScreen in setOf(Screen.Analytics, Screen.GitHub, Screen.Providers, Screen.Builds, Screen.Onboarding))
-                                Surface(
-                                    shape = RoundedCornerShape(999.dp),
-                                    color = if (isSelected) AppColors.accentSoft else Color.Transparent,
+                        for (screen in navItems) {
+                            val isSelected = currentScreen == screen ||
+                                (screen == Screen.Projects && (currentScreen == Screen.Files || currentScreen == Screen.Changes) && !showProjectNav) ||
+                                (screen == Screen.Codebase && (currentScreen == Screen.Files || currentScreen == Screen.Changes) && showProjectNav) ||
+                                (screen == Screen.GhBuild && currentScreen == Screen.Builds) ||
+                                (screen == Screen.Settings && currentScreen in setOf(Screen.Analytics, Screen.GitHub, Screen.Providers, Screen.Builds, Screen.Onboarding))
+                            val itemLabel = if (!showProjectNav) Screen.homeLabelFor(screen) else screen.title
+                            val itemIcon = if (!showProjectNav) Screen.homeIconFor(screen) else screen.icon
+
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(4.dp),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .clickable {
+                                        providersStartAdd = false
+                                        providersStartEditId = null
+                                        returnToChat = false
+                                        currentScreen = screen
+                                    }
+                                    .padding(vertical = 2.dp)
+                                    .testTag("nav_item_${screen.route}")
+                            ) {
+                                Box(
                                     modifier = Modifier
-                                        .clip(RoundedCornerShape(999.dp))
-                                        .clickable {
-                                            providersStartAdd = false
-                                            providersStartEditId = null
-                                            returnToChat = false
-                                            currentScreen = screen
-                                        }
-                                        .testTag("nav_item_${screen.route}")
+                                        .width(if (showProjectNav) 52.dp else 60.dp)
+                                        .height(30.dp)
+                                        .clip(RoundedCornerShape(15.dp))
+                                        .background(if (isSelected) AppColors.accentSoft else Color.Transparent),
+                                    contentAlignment = Alignment.Center
                                 ) {
-                                    Row(
-                                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
+                                    Box {
                                         Icon(
-                                            imageVector = screen.icon,
-                                            contentDescription = screen.title,
-                                            tint = if (isSelected) AppColors.accent else AppColors.textMuted,
-                                            modifier = Modifier.size(18.dp)
+                                            imageVector = itemIcon,
+                                            contentDescription = itemLabel,
+                                            tint = if (isSelected) AppColors.accent else AppColors.textSecondary,
+                                            modifier = Modifier.size(21.dp)
                                         )
-                                        Spacer(modifier = Modifier.width(6.dp))
-                                        Text(
-                                            text = screen.title,
-                                            fontSize = 12.sp,
-                                            fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
-                                            color = if (isSelected) AppColors.accent else AppColors.textMuted
-                                        )
+                                        if (screen == Screen.Settings && !hasConfiguredProvider && !showProjectNav) {
+                                            Box(
+                                                modifier = Modifier
+                                                    .size(7.dp)
+                                                    .align(Alignment.TopEnd)
+                                                    .offset(x = 3.dp, y = (-2).dp)
+                                                    .clip(CircleShape)
+                                                    .background(AppColors.error)
+                                            )
+                                        }
                                     }
                                 }
+                                Text(
+                                    text = itemLabel,
+                                    fontSize = if (showProjectNav) 10.5.sp else 11.5.sp,
+                                    fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
+                                    color = if (isSelected) AppColors.accent else AppColors.textSecondary,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
                             }
                         }
                     }
@@ -253,9 +290,9 @@ fun MainScreen(
                 targetState = currentScreen,
                 modifier = Modifier.fillMaxSize(),
                 transitionSpec = {
-                    val dur = if (app.settingsStore.reduceMotion) 0 else 200
+                    val dur = if (app.settingsStore.reduceMotion) 0 else 180
                     (fadeIn(animationSpec = tween(durationMillis = dur)) +
-                        slideInVertically(animationSpec = tween(durationMillis = dur)) { it / 32 }) togetherWith
+                        slideInVertically(animationSpec = tween(durationMillis = dur)) { it / 40 }) togetherWith
                         fadeOut(animationSpec = tween(durationMillis = dur / 2))
                 },
                 label = "screen_transition"
@@ -275,6 +312,7 @@ fun MainScreen(
                                 currentScreen = Screen.Changes
                             },
                             onOpenGitHub = { currentScreen = Screen.GitHub },
+                            onOpenTerminal = { currentScreen = Screen.Terminal },
                             modifier = Modifier.fillMaxSize()
                         )
                     }
@@ -317,6 +355,41 @@ fun MainScreen(
                                 chatViewModel.sendMessage(prompt)
                             },
                             onOpenGitHubSettings = { currentScreen = Screen.GitHub },
+                            onBack = {
+                                chatViewModel.detachProjectFromChat()
+                                currentScreen = Screen.Projects
+                            },
+                            onOpenPreview = { currentScreen = Screen.Preview },
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    }
+                    Screen.Terminal -> {
+                        ProjectTerminalScreen(
+                            app = app,
+                            chatViewModel = chatViewModel,
+                            onBack = {
+                                if (isInProject) {
+                                    chatViewModel.detachProjectFromChat()
+                                }
+                                currentScreen = Screen.Projects
+                            },
+                            onOpenChatHistory = { currentScreen = Screen.Chat },
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    }
+                    Screen.Preview -> {
+                        ProjectPreviewScreen(
+                            app = app,
+                            chatViewModel = chatViewModel,
+                            onBack = {
+                                chatViewModel.detachProjectFromChat()
+                                currentScreen = Screen.Projects
+                            },
+                            onOpenChatHistory = { currentScreen = Screen.Chat },
+                            onSendErrorsToAgent = { prompt ->
+                                currentScreen = Screen.Chat
+                                chatViewModel.sendMessage(prompt)
+                            },
                             modifier = Modifier.fillMaxSize()
                         )
                     }
@@ -397,7 +470,7 @@ fun MainScreen(
                         OnboardingScreen(
                             app = app,
                             onOpenProviders = { currentScreen = Screen.Providers },
-                            onFinish = { currentScreen = Screen.Chat },
+                            onFinish = { currentScreen = Screen.Projects },
                             modifier = Modifier.fillMaxSize()
                         )
                     }

@@ -37,6 +37,7 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
@@ -80,24 +81,16 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.compose.ui.text.style.TextAlign
 import com.example.CodeForgeApp
 import com.example.data.local.entity.ProjectEntity
+import com.example.ui.components.ProjectWorkspaceTopBar
 import com.example.ui.screens.chat.ChatViewModel
 import com.example.ui.screens.chat.CodeFileViewerState
 import com.example.ui.screens.chat.CodebaseClipboardItem
 import com.example.ui.screens.chat.CodebaseFileItem
 import com.example.ui.theme.AppColors
 
-/**
- * Dedicated full-screen Codebase tab (bottom nav in Project Mode) featuring:
- *  - Inline editable Code Viewer/Editor (saves automatically record Manual Edits & sync to AI Agent)
- *  - Upload files & ZIP extraction/replacement (zero-permission SAF)
- *  - Long-press context menu on every file: Edit, Replace via picker, Copy, Download single file, Delete
- *  - Multi-Codebase Split Mode for opening/creating a second Codebase and Copy/Pasting files across projects
- *  - Full Codebase ZIP Download (zero-permission SAF CreateDocument)
- *  - Live WebView HTML/CSS/JS Preview with console error capture
- *  - Push to GitHub dialog
- */
 @Composable
 fun CodebaseScreen(
     app: CodeForgeApp,
@@ -105,6 +98,8 @@ fun CodebaseScreen(
     onOpenGhBuild: () -> Unit,
     onSendToAgent: (String) -> Unit,
     onOpenGitHubSettings: () -> Unit,
+    onBack: () -> Unit = {},
+    onOpenPreview: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val uiState by chatViewModel.uiState.collectAsState()
@@ -115,7 +110,13 @@ fun CodebaseScreen(
     val secondaryProject by chatViewModel.secondaryProject.collectAsState()
     val secondaryFiles by chatViewModel.secondaryFiles.collectAsState()
     val allProjects by chatViewModel.projectsList.collectAsState()
+    val providers by chatViewModel.providers.collectAsState()
+    val preferredId by chatViewModel.preferredProviderId.collectAsState()
     val activeProject = uiState.activeProject
+    val activeProvider = providers.firstOrNull { it.id == preferredId } ?: providers.firstOrNull()
+    val providerLabel = activeProvider?.name ?: "Provider"
+    val convLabel = uiState.activeConversation?.title?.ifBlank { "New chat" } ?: "New chat"
+    var showPlusMenu by remember { mutableStateOf(false) }
 
     var searchQuery by remember { mutableStateOf("") }
     var activeUploadTargetProjectId by remember { mutableStateOf<String?>(null) }
@@ -450,76 +451,189 @@ fun CodebaseScreen(
         )
     }
 
-    // Main Codebase Layout
+    // Main Files / Codebase Layout matching reference dark Files screen
     Column(
         modifier = modifier
             .fillMaxSize()
             .background(AppColors.bg)
     ) {
-        // Header bar
-        Column(
+        ProjectWorkspaceTopBar(
+            title = activeProject?.name ?: "Codebase",
+            subtitle = "$providerLabel · $convLabel",
+            onBack = onBack,
+            onHistoryClick = { showPushDialog = true }
+        )
+
+        // Rounded "Files" Action Card matching reference screenshot (`Files          +   ↻`)
+        Surface(
+            shape = RoundedCornerShape(16.dp),
+            color = AppColors.surface,
             modifier = Modifier
                 .fillMaxWidth()
-                .background(AppColors.surface)
-                .padding(horizontal = 12.dp, vertical = 10.dp)
+                .padding(horizontal = 14.dp, vertical = 6.dp)
+                .border(1.dp, AppColors.border, RoundedCornerShape(16.dp))
         ) {
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 16.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = activeProject?.name ?: "Codebase",
-                        fontSize = 17.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = AppColors.textPrimary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Text(
-                        text = "${primaryFiles.size} file(s) · Long-press any file for options",
-                        fontSize = 11.sp,
-                        color = AppColors.textMuted
-                    )
-                }
+                Text(
+                    text = if (primaryFiles.isEmpty()) "Files" else "Files (${primaryFiles.size})",
+                    fontSize = 16.5.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = AppColors.textPrimary,
+                    modifier = Modifier.weight(1f)
+                )
 
-                // Live HTML Preview CTA (shown whenever HTML exists)
                 if (htmlFiles.isNotEmpty()) {
                     Surface(
                         shape = RoundedCornerShape(10.dp),
-                        color = AppColors.accent,
+                        color = AppColors.accentSoft,
                         modifier = Modifier
                             .clip(RoundedCornerShape(10.dp))
-                            .clickable { showWebPreview = true }
+                            .clickable { onOpenPreview() }
                             .testTag("codebase_live_preview_button")
                     ) {
                         Row(
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                            modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Icon(Icons.Default.PlayArrow, contentDescription = "Live Preview", tint = AppColors.onAccent, modifier = Modifier.size(16.dp))
+                            Icon(Icons.Default.PlayArrow, contentDescription = "Preview", tint = AppColors.accent, modifier = Modifier.size(15.dp))
                             Spacer(modifier = Modifier.width(3.dp))
-                            Text("Preview", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = AppColors.onAccent)
+                            Text("Preview", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = AppColors.accent)
                         }
                     }
-                    Spacer(modifier = Modifier.width(6.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                }
+
+                Box {
+                    IconButton(
+                        onClick = { showPlusMenu = true },
+                        modifier = Modifier
+                            .size(40.dp)
+                            .testTag("codebase_plus_menu_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Add,
+                            contentDescription = "File Actions",
+                            tint = AppColors.textPrimary,
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
+                    DropdownMenu(
+                        expanded = showPlusMenu,
+                        onDismissRequest = { showPlusMenu = false },
+                        containerColor = AppColors.surface
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("New File", color = AppColors.textPrimary) },
+                            leadingIcon = { Icon(Icons.Default.Add, contentDescription = null, tint = AppColors.accent) },
+                            onClick = {
+                                showPlusMenu = false
+                                showNewFileDialogForProjectId = activeProject?.id
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Upload File / Extract ZIP", color = AppColors.textPrimary) },
+                            leadingIcon = { Icon(Icons.Default.UploadFile, contentDescription = null, tint = AppColors.accent) },
+                            onClick = {
+                                showPlusMenu = false
+                                activeUploadTargetProjectId = activeProject?.id
+                                uploadPicker.launch(arrayOf("*/*"))
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text(if (secondaryProject != null) "Close Split Codebase" else "Open Split Codebase", color = AppColors.textPrimary) },
+                            leadingIcon = { Icon(Icons.Default.ViewAgenda, contentDescription = null, tint = AppColors.textSecondary) },
+                            onClick = {
+                                showPlusMenu = false
+                                if (secondaryProject != null) chatViewModel.closeSecondaryCodebase()
+                                else showSplitPicker = true
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Download Full ZIP", color = AppColors.textPrimary) },
+                            leadingIcon = { Icon(Icons.Default.FolderZip, contentDescription = null, tint = AppColors.textSecondary) },
+                            onClick = {
+                                showPlusMenu = false
+                                val safeName = (activeProject?.slug ?: "codebase").ifBlank { "codebase" }
+                                zipExportLauncher.launch("${safeName}.zip")
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Push to GitHub", color = AppColors.textPrimary) },
+                            leadingIcon = { Icon(Icons.Default.CloudUpload, contentDescription = null, tint = AppColors.accent) },
+                            onClick = {
+                                showPlusMenu = false
+                                showPushDialog = true
+                            }
+                        )
+                    }
                 }
 
                 IconButton(
                     onClick = { chatViewModel.refreshCodebaseFiles() },
-                    modifier = Modifier.size(36.dp).testTag("codebase_refresh_button")
+                    modifier = Modifier
+                        .size(40.dp)
+                        .testTag("codebase_refresh_button")
                 ) {
-                    Icon(Icons.Default.Refresh, contentDescription = "Refresh files", tint = AppColors.textSecondary, modifier = Modifier.size(19.dp))
+                    Icon(
+                        imageVector = Icons.Default.Refresh,
+                        contentDescription = "Refresh files",
+                        tint = AppColors.textPrimary,
+                        modifier = Modifier.size(21.dp)
+                    )
                 }
             }
+        }
 
-            Spacer(modifier = Modifier.height(8.dp))
+        // Clipboard banner when a file is copied
+        clipboardItem?.let { clip ->
+            Surface(
+                shape = RoundedCornerShape(12.dp),
+                color = AppColors.accentSoft,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 4.dp)
+                    .border(1.dp, AppColors.accent.copy(alpha = 0.35f), RoundedCornerShape(12.dp))
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Default.ContentPaste, contentDescription = null, tint = AppColors.accent, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "Clipboard: ${clip.fileName}",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = AppColors.textPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    TextButton(
+                        onClick = { pasteTargetProjectId = activeProject?.id },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                    ) {
+                        Text("Paste Here", fontSize = 11.5.sp, fontWeight = FontWeight.Bold, color = AppColors.accent)
+                    }
+                    IconButton(onClick = { chatViewModel.clearClipboard() }, modifier = Modifier.size(28.dp)) {
+                        Icon(Icons.Default.Close, contentDescription = "Clear clipboard", tint = AppColors.textMuted, modifier = Modifier.size(15.dp))
+                    }
+                }
+            }
+        }
 
-            // Action chips row: Upload/Unzip, New File, Download ZIP, Split Codebase, Push GitHub
+        // Show compact filter bar & quick chips only when project has files so empty state stays clean like reference
+        if (primaryFiles.isNotEmpty()) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState()),
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 14.dp, vertical = 4.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -532,13 +646,6 @@ fun CodebaseScreen(
                     uploadPicker.launch(arrayOf("*/*"))
                 }
                 CodebaseActionChip(
-                    icon = Icons.Default.Add,
-                    label = "New File",
-                    testTag = "codebase_new_file_button"
-                ) {
-                    showNewFileDialogForProjectId = activeProject?.id
-                }
-                CodebaseActionChip(
                     icon = Icons.Default.FolderZip,
                     label = "Download ZIP",
                     testTag = "codebase_download_zip_button"
@@ -548,7 +655,7 @@ fun CodebaseScreen(
                 }
                 CodebaseActionChip(
                     icon = Icons.Default.ViewAgenda,
-                    label = if (secondaryProject != null) "Close Split" else "Split Codebase",
+                    label = if (secondaryProject != null) "Close Split" else "Split",
                     highlighted = secondaryProject != null,
                     testTag = "codebase_split_button"
                 ) {
@@ -564,54 +671,16 @@ fun CodebaseScreen(
                 }
             }
 
-            // Clipboard banner when a file is copied
-            clipboardItem?.let { clip ->
-                Spacer(modifier = Modifier.height(8.dp))
-                Surface(
-                    shape = RoundedCornerShape(10.dp),
-                    color = AppColors.accentSoft,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .border(1.dp, AppColors.accent.copy(alpha = 0.35f), RoundedCornerShape(10.dp))
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(Icons.Default.ContentPaste, contentDescription = null, tint = AppColors.accent, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = "Clipboard: ${clip.fileName}",
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Medium,
-                            color = AppColors.textPrimary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.weight(1f)
-                        )
-                        TextButton(
-                            onClick = { pasteTargetProjectId = activeProject?.id },
-                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
-                        ) {
-                            Text("Paste Here", fontSize = 11.5.sp, fontWeight = FontWeight.Bold, color = AppColors.accent)
-                        }
-                        IconButton(onClick = { chatViewModel.clearClipboard() }, modifier = Modifier.size(28.dp)) {
-                            Icon(Icons.Default.Close, contentDescription = "Clear clipboard", tint = AppColors.textMuted, modifier = Modifier.size(15.dp))
-                        }
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(8.dp))
-
-            // Search bar
             OutlinedTextField(
                 value = searchQuery,
                 onValueChange = { searchQuery = it },
-                modifier = Modifier.fillMaxWidth().testTag("codebase_search_input"),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 4.dp)
+                    .testTag("codebase_search_input"),
                 singleLine = true,
                 leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, tint = AppColors.textMuted, modifier = Modifier.size(18.dp)) },
-                placeholder = { Text("Filter files by name or path…", fontSize = 13.sp) },
+                placeholder = { Text("Filter files…", fontSize = 13.sp, color = AppColors.textMuted) },
                 shape = RoundedCornerShape(12.dp),
                 colors = OutlinedTextFieldDefaults.colors(
                     focusedBorderColor = AppColors.accent,
@@ -619,8 +688,6 @@ fun CodebaseScreen(
                 )
             )
         }
-
-        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(AppColors.border))
 
         // Primary Codebase Pane
         val filteredPrimary = remember(primaryFiles, searchQuery) {
@@ -782,11 +849,31 @@ private fun CodebaseFileListPane(
         return
     }
     if (files.isEmpty()) {
-        Box(modifier = modifier.padding(24.dp), contentAlignment = Alignment.Center) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text("No files in ${project?.name ?: "Codebase"} yet", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = AppColors.textPrimary)
-                Spacer(modifier = Modifier.height(4.dp))
-                Text("Ask the AI Agent to build directly here, or tap Upload / New File above.", fontSize = 12.sp, color = AppColors.textMuted)
+        Box(modifier = modifier.padding(32.dp), contentAlignment = Alignment.Center) {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Folder,
+                    contentDescription = null,
+                    tint = AppColors.textSecondary,
+                    modifier = Modifier.size(52.dp)
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    text = "No files yet",
+                    fontSize = 17.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = AppColors.textPrimary
+                )
+                Text(
+                    text = "Ask your coding agent to create something in this project.",
+                    fontSize = 14.sp,
+                    lineHeight = 20.sp,
+                    color = AppColors.textSecondary,
+                    textAlign = TextAlign.Center
+                )
             }
         }
         return

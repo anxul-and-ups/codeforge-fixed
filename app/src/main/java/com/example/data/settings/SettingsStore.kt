@@ -138,19 +138,19 @@ class SettingsStore(context: Context) {
     // ---- Appearance & Display (Section 13 & 14.7) ----
     var themeMode: ThemeMode
         get() = try {
-            ThemeMode.valueOf(prefs.getString("theme_mode_v3", ThemeMode.LIGHT.name) ?: ThemeMode.LIGHT.name)
+            ThemeMode.valueOf(prefs.getString("theme_mode_v4", ThemeMode.DARK.name) ?: ThemeMode.DARK.name)
         } catch (e: Exception) {
-            ThemeMode.LIGHT
+            ThemeMode.DARK
         }
-        set(value) { prefs.edit().putString("theme_mode_v3", value.name).apply() }
+        set(value) { prefs.edit().putString("theme_mode_v4", value.name).apply() }
 
     var accentPreset: AccentPreset
         get() = try {
-            AccentPreset.valueOf(prefs.getString("accent_preset_v3", AccentPreset.AMBER.name) ?: AccentPreset.AMBER.name)
+            AccentPreset.valueOf(prefs.getString("accent_preset_v4", AccentPreset.AMBER.name) ?: AccentPreset.AMBER.name)
         } catch (e: Exception) {
             AccentPreset.AMBER
         }
-        set(value) { prefs.edit().putString("accent_preset_v3", value.name).apply() }
+        set(value) { prefs.edit().putString("accent_preset_v4", value.name).apply() }
 
     var codeFontSizeSp: Int
         get() = prefs.getInt("code_font_size_sp", 13)
