@@ -128,7 +128,8 @@ data class ExecResult(
 class TermuxBridge(
     private val context: Context,
     private val settings: SettingsStore,
-    private val scope: CoroutineScope
+    private val scope: CoroutineScope,
+    val executionTracker: TerminalExecutionTracker = TerminalExecutionTracker()
 ) {
     companion object {
         const val TERMUX_PACKAGE = "com.termux"
@@ -472,7 +473,9 @@ class TermuxBridge(
         val termuxCwd = toTermuxPath(cwd)
         val timeoutSec = timeoutSeconds.coerceIn(1L, 3600L)
 
-        appendTerminal("\n$ $command  (cwd: $termuxCwd)\n")
+        executionTracker.onQueued(execId, command, termuxCwd)
+        appendTerminal("\n$ ${TerminalExecutionTracker.redactSecrets(command)}  (cwd: $termuxCwd)\n")
+        executionTracker.onRunning(execId)
 
         val payload = JSONObject()
             .put("command", command)
@@ -512,7 +515,8 @@ class TermuxBridge(
             if (markDisconnected) {
                 _status.update { it.copy(connectionState = EngineConnectionState.DISCONNECTED, lastError = msg) }
             }
-            appendTerminal("ERROR: $msg\n")
+            executionTracker.onFinished(execId, "", msg, code, dur, cancelled = false)
+            appendTerminal("ERROR: ${TerminalExecutionTracker.redactSecrets(msg)}\n")
             recordAudit(command, termuxCwd, code, dur, msg)
             return ExecResult(execId, command, termuxCwd, "", msg, code, dur, bridgeError = true)
         }
@@ -533,7 +537,8 @@ class TermuxBridge(
                             it.copy(connectionState = EngineConnectionState.ERROR, lastError = errDetail)
                         }
                     }
-                    appendTerminal("ERROR: $errDetail\n")
+                    executionTracker.onFinished(execId, "", errDetail, resp.code, dur, cancelled = false)
+                    appendTerminal("ERROR: ${TerminalExecutionTracker.redactSecrets(errDetail)}\n")
                     recordAudit(command, termuxCwd, resp.code, dur, errDetail)
                     return@withContext ExecResult(execId, command, termuxCwd, "", errDetail, resp.code, dur, bridgeError = true)
                 }
@@ -560,17 +565,24 @@ class TermuxBridge(
                         append(err)
                     }
                 }
+                executionTracker.onFinished(execId, out, err, code, dur, cancelled = code == 137)
                 if (combined.isNotEmpty()) {
                     onOutputChunk?.invoke(combined)
-                    appendTerminal(combined + "\n")
+                    appendTerminal(TerminalExecutionTracker.redactSecrets(combined) + "\n")
                 }
                 recordAudit(command, actualCwd, code, dur, combined)
                 return@withContext ExecResult(execId, command, actualCwd, out, err, code, dur)
             }
         } catch (e: Exception) {
             // Stop pressed: propagate cancellation, do NOT report a fake "disconnected".
-            if (e is CancellationException) throw e
-            if (call.isCanceled() || !isActive) throw CancellationException("Command stopped by user")
+            if (e is CancellationException) {
+                executionTracker.onFinished(execId, "", "Cancelled by user.", 137, (System.currentTimeMillis() - startMs).coerceAtLeast(1L), cancelled = true)
+                throw e
+            }
+            if (call.isCanceled() || !isActive) {
+                executionTracker.onFinished(execId, "", "Cancelled by user.", 137, (System.currentTimeMillis() - startMs).coerceAtLeast(1L), cancelled = true)
+                throw CancellationException("Command stopped by user")
+            }
             when (e) {
                 is ConnectException -> bridgeFail(
                     111,
@@ -581,6 +593,7 @@ class TermuxBridge(
                     killRemote(execId)
                     val dur = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
                     val msg = "TIMEOUT: command exceeded ${timeoutSec}s and was killed. For long tasks pass a bigger `timeout` or run it in the background (nohup … &) and poll its log."
+                    executionTracker.onFinished(execId, "", msg, 124, dur, cancelled = false)
                     appendTerminal("ERROR: $msg\n")
                     recordAudit(command, termuxCwd, 124, dur, msg)
                     ExecResult(execId, command, termuxCwd, "", msg, 124, dur)
@@ -622,10 +635,12 @@ class TermuxBridge(
     /** Called by the Stop button: abort every in-flight call and kill everything on the Termux side. */
     fun killAllRunningCommands() {
         activeExecs.values.forEach { it.cancel() }
+        executionTracker.markAllRunningCancelled()
         killRemote(null)
     }
 
     fun clearTerminal() {
+        executionTracker.clear()
         _terminalOutput.value = "CodeForge Termux HTTP Bridge Terminal — Cleared\n"
     }
 

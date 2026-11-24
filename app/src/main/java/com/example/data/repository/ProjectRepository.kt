@@ -542,8 +542,15 @@ class ProjectRepository(
     }
 
     private fun resolveSafePath(rootDir: File, relativePath: String): File {
-        val file = File(rootDir, relativePath)
         val canonicalDest = rootDir.canonicalPath
+        var clean = relativePath.trim().replace('\\', '/')
+        if (clean.startsWith(canonicalDest)) {
+            clean = clean.removePrefix(canonicalDest)
+        } else if (clean.startsWith(rootDir.absolutePath)) {
+            clean = clean.removePrefix(rootDir.absolutePath)
+        }
+        clean = clean.removePrefix("./").trimStart('/')
+        val file = if (clean.isEmpty()) rootDir else File(rootDir, clean)
         val canonicalFile = file.canonicalPath
         if (canonicalFile != canonicalDest && !canonicalFile.startsWith(canonicalDest + File.separator)) {
             throw SecurityException("Path traversal prohibited: $relativePath")
@@ -1223,5 +1230,41 @@ class ProjectRepository(
             srcFile.inputStream().use { inp -> inp.copyTo(out) }
         } ?: throw IllegalStateException("Could not open destination URI for file download.")
     }
+
+    /** Creates a directory (and missing parents) inside the project safely. */
+    suspend fun createDirectory(projectId: String, relativePath: String): String = withContext(Dispatchers.IO) {
+        val project = projectDao.getProjectById(projectId) ?: throw IllegalArgumentException("Project not found")
+        val targetDir = resolveSafePath(File(project.rootPath), relativePath)
+        if (!targetDir.exists()) {
+            targetDir.mkdirs()
+        }
+        updateProjectStats(project)
+        "Created directory $relativePath"
+    }
+
+    /** Copies a file or directory recursively inside the same project safely. */
+    suspend fun copyPath(projectId: String, sourceRelPath: String, destRelPath: String): String = withContext(Dispatchers.IO) {
+        val project = projectDao.getProjectById(projectId) ?: throw IllegalArgumentException("Project not found")
+        val root = File(project.rootPath)
+        val src = resolveSafePath(root, sourceRelPath)
+        val dst = resolveSafePath(root, destRelPath)
+        if (!src.exists()) throw NoSuchFileException(src, reason = "Source does not exist: $sourceRelPath")
+        if (src.isDirectory) {
+            dst.mkdirs()
+            copyDirectoryFiltered(src, dst)
+        } else {
+            dst.parentFile?.mkdirs()
+            src.copyTo(dst, overwrite = true)
+        }
+        updateProjectStats(project)
+        "Copied $sourceRelPath to $destRelPath"
+    }
+
+    /** Recomputes file count and timestamp for [projectId] after external/binary operations. */
+    suspend fun refreshProjectStats(projectId: String) = withContext(Dispatchers.IO) {
+        val project = projectDao.getProjectById(projectId) ?: return@withContext
+        updateProjectStats(project)
+    }
 }
+
 

@@ -98,6 +98,8 @@ fun ProjectsHomeScreen(
     val activeProject by chatViewModel.activeProject.collectAsState()
 
     var expandImportCard by remember { mutableStateOf(false) }
+    var showClonedDialog by remember { mutableStateOf(false) }
+    val clonedRepos by app.clonedRepoManager.repos.collectAsState()
     var showNewProjectDialog by remember { mutableStateOf(false) }
     var newProjectName by remember { mutableStateOf("") }
     var newProjectTemplate by remember { mutableStateOf("Empty") }
@@ -238,6 +240,60 @@ fun ProjectsHomeScreen(
                 }
             }
         )
+    }
+
+    if (showClonedDialog) {
+        androidx.compose.ui.window.Dialog(
+            onDismissRequest = { showClonedDialog = false },
+            properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)
+        ) {
+            Surface(
+                shape = RoundedCornerShape(20.dp),
+                color = AppColors.bg,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 36.dp)
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(14.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "CLONED Repositories",
+                            fontSize = 17.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = AppColors.textPrimary,
+                            modifier = Modifier.weight(1f)
+                        )
+                        TextButton(onClick = { showClonedDialog = false }) {
+                            Text("Close", color = AppColors.textSecondary)
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    LazyColumn(modifier = Modifier.weight(1f, fill = false)) {
+                        item {
+                            com.example.ui.screens.github.ClonedReposSection(
+                                app = app,
+                                chatViewModel = chatViewModel,
+                                onOpenInCodeEditor = {
+                                    showClonedDialog = false
+                                    activeProject?.let { onOpenFiles(it) } ?: onOpenChat()
+                                },
+                                onOpenInChat = {
+                                    showClonedDialog = false
+                                    onOpenChat()
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+        }
     }
 
     Box(
@@ -413,36 +469,56 @@ fun ProjectsHomeScreen(
                         }
 
                         AnimatedVisibility(visible = expandImportCard) {
-                            Row(
+                            Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .padding(top = 14.dp),
-                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
-                                OutlinedButton(
-                                    onClick = {
-                                        zipPicker.launch(arrayOf("application/zip", "application/x-zip-compressed", "*/*"))
-                                    },
-                                    shape = RoundedCornerShape(12.dp),
-                                    border = BorderStroke(1.dp, AppColors.border),
-                                    modifier = Modifier.weight(1f)
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                                 ) {
-                                    Icon(
-                                        Icons.Default.FolderZip,
-                                        contentDescription = null,
-                                        tint = AppColors.accent,
-                                        modifier = Modifier.size(16.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text("Import ZIP", fontSize = 12.5.sp, color = AppColors.textPrimary)
+                                    OutlinedButton(
+                                        onClick = {
+                                            zipPicker.launch(arrayOf("application/zip", "application/x-zip-compressed", "*/*"))
+                                        },
+                                        shape = RoundedCornerShape(12.dp),
+                                        border = BorderStroke(1.dp, AppColors.border),
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Icon(
+                                            Icons.Default.FolderZip,
+                                            contentDescription = null,
+                                            tint = AppColors.accent,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text("Import ZIP", fontSize = 12.5.sp, color = AppColors.textPrimary)
+                                    }
+                                    OutlinedButton(
+                                        onClick = onOpenGitHub,
+                                        shape = RoundedCornerShape(12.dp),
+                                        border = BorderStroke(1.dp, AppColors.border),
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Text("GitHub Repo", fontSize = 12.5.sp, color = AppColors.accent)
+                                    }
                                 }
                                 OutlinedButton(
-                                    onClick = onOpenGitHub,
+                                    onClick = { showClonedDialog = true },
                                     shape = RoundedCornerShape(12.dp),
-                                    border = BorderStroke(1.dp, AppColors.border),
-                                    modifier = Modifier.weight(1f)
+                                    border = BorderStroke(1.dp, AppColors.accent.copy(alpha = 0.45f)),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("home_cloned_repos_button")
                                 ) {
-                                    Text("GitHub Repo", fontSize = 12.5.sp, color = AppColors.accent)
+                                    Text(
+                                        text = "CLONED (${clonedRepos.size})",
+                                        fontSize = 13.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = AppColors.accent
+                                    )
                                 }
                             }
                         }

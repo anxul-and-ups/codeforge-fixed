@@ -36,7 +36,11 @@ class LlmClient(
 ) {
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
 
-    private data class Flags(val reasoning: Boolean = true, val streamOptions: Boolean = true)
+    private data class Flags(
+        val reasoning: Boolean = true,
+        val streamOptions: Boolean = true,
+        val nativeTools: Boolean = true
+    )
 
     suspend fun execute(
         provider: ProviderConfigEntity,
@@ -45,14 +49,18 @@ class LlmClient(
         onReasoning: ((String) -> Unit)? = null
     ): LlmResponse {
         val apiKey = KeyStoreManager.decrypt(provider.encryptedApiKey)
-        var flags = Flags()
+        var flags = Flags(nativeTools = provider.supportsTools)
         var attempt = 0
         while (true) {
             try {
-                return dispatch(provider, apiKey, request, flags, onChunk, onReasoning)
+                val resp = dispatch(provider, apiKey, request, flags, onChunk, onReasoning)
+                // If native tool calling wasn't used (or model emitted text <tool_call> blocks), extract them seamlessly!
+                return if (resp.toolCalls.isEmpty() && request.tools.isNotEmpty()) {
+                    extractTextFallbackToolCalls(resp, request.tools)
+                } else resp
             } catch (e: ApiException) {
                 val m = e.message.lowercase()
-                if (e.statusCode == 400 && attempt < 3) {
+                if ((e.statusCode == 400 || e.statusCode == 422) && attempt < 4) {
                     if (flags.streamOptions && m.contains("stream_options")) {
                         flags = flags.copy(streamOptions = false)
                         attempt++
@@ -61,6 +69,12 @@ class LlmClient(
                     val mentionsReasoning = m.contains("thinking") || m.contains("reasoning") || m.contains("thinkingconfig")
                     if (flags.reasoning && request.reasoningLevel != ReasoningLevel.OFF && mentionsReasoning) {
                         flags = flags.copy(reasoning = false)
+                        attempt++
+                        continue
+                    }
+                    val mentionsTools = m.contains("tool") || m.contains("function") || m.contains("schema")
+                    if (flags.nativeTools && request.tools.isNotEmpty() && mentionsTools) {
+                        flags = flags.copy(nativeTools = false)
                         attempt++
                         continue
                     }
@@ -78,16 +92,86 @@ class LlmClient(
         onChunk: ((String) -> Unit)?,
         onReasoning: ((String) -> Unit)?
     ): LlmResponse {
-        val req = if (provider.supportsVision) request else request.copy(
+        var req = if (provider.supportsVision) request else request.copy(
             messages = request.messages.map {
                 if (it.imagesBase64.isEmpty() && it.docs.isEmpty()) it else it.copy(imagesBase64 = emptyList(), docs = emptyList())
             }
         )
+        // Universal Coding Capabilities: if native JSON tool calling is disabled/rejected by this endpoint,
+        // automatically inject structured <tool_call> instructions so ANY model can still edit files & run tools!
+        if (!flags.nativeTools && req.tools.isNotEmpty()) {
+            val toolGuide = buildTextToolProtocolPrompt(req.tools)
+            val normalizedMsgs = req.messages.map { msg ->
+                when (msg.role) {
+                    "tool" -> LlmMessage(
+                        role = "user",
+                        content = "[TOOL RESULT: ${msg.toolName ?: "tool"}]\n${msg.content}"
+                    )
+                    "assistant" -> {
+                        val callsText = msg.toolCalls.orEmpty().joinToString("\n") { tc ->
+                            "<tool_call>{\"name\":\"${tc.name}\",\"arguments\":${tc.argumentsJson.ifBlank { "{}" }}}</tool_call>"
+                        }
+                        val combined = listOf(msg.content, callsText).filter { it.isNotBlank() }.joinToString("\n")
+                        LlmMessage(role = "assistant", content = combined)
+                    }
+                    else -> msg
+                }
+            }
+            req = req.copy(
+                systemPrompt = req.systemPrompt + "\n\n" + toolGuide,
+                messages = normalizedMsgs
+            )
+        }
         return when (provider.apiFormat.uppercase()) {
             "ANTHROPIC" -> executeAnthropic(provider, apiKey, req, flags, onChunk, onReasoning)
             "GEMINI" -> executeGemini(provider, apiKey, req, flags, onChunk, onReasoning)
             else -> executeOpenAiCompatible(provider, apiKey, req, flags, onChunk, onReasoning)
         }
+    }
+
+    private fun buildTextToolProtocolPrompt(tools: List<LlmTool>): String = buildString {
+        appendLine("UNIVERSAL TOOL CALLING PROTOCOL (TEXT FALLBACK MODE):")
+        appendLine("You have FULL coding agent capabilities on this endpoint. To invoke any tool, output one or more blocks in this EXACT format:")
+        appendLine("<tool_call>{\"name\":\"tool_name\",\"arguments\":{...}}</tool_call>")
+        appendLine("Wait for the [TOOL RESULT] before continuing. Available tools:")
+        for (t in tools) {
+            appendLine("- ${t.name}: ${t.description.take(160)} | schema=${t.parametersJsonSchema}")
+        }
+    }.trim()
+
+    private fun extractTextFallbackToolCalls(resp: LlmResponse, allowedTools: List<LlmTool>): LlmResponse {
+        val text = resp.content
+        if (!text.contains("<tool_call>", ignoreCase = true)) return resp
+        val allowed = allowedTools.map { it.name }.toSet()
+        val regex = Regex("""<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>""", RegexOption.IGNORE_CASE)
+        val matches = regex.findAll(text).toList()
+        if (matches.isEmpty()) return resp
+        val parsed = mutableListOf<LlmToolCall>()
+        for (m in matches) {
+            try {
+                val obj = JSONObject(m.groupValues[1])
+                val name = obj.optString("name").trim()
+                if (name in allowed) {
+                    val argsVal = obj.opt("arguments")
+                    val argsJson = when (argsVal) {
+                        is JSONObject -> argsVal.toString()
+                        is String -> argsVal.ifBlank { "{}" }
+                        else -> "{}"
+                    }
+                    parsed.add(LlmToolCall("tc_${UUID.randomUUID().toString().replace("-", "").take(16)}", name, argsJson))
+                }
+            } catch (_: Exception) {
+                // ignore malformed block
+            }
+        }
+        if (parsed.isEmpty()) return resp
+        val cleanedText = regex.replace(text, "").trim()
+        return resp.copy(content = cleanedText, toolCalls = parsed)
+    }
+
+    private fun sanitizeAnthropicToolId(rawId: String?): String {
+        val clean = (rawId ?: "").replace(Regex("[^a-zA-Z0-9_-]"), "_")
+        return if (clean.isNotBlank()) clean.take(64) else "toolu_${UUID.randomUUID().toString().replace("-", "").take(16)}"
     }
 
     // ---------------------------------------------------------------------------------------
@@ -237,7 +321,7 @@ class LlmClient(
                 "tool" -> {
                     val block = JSONObject()
                         .put("type", "tool_result")
-                        .put("tool_use_id", m.toolCallId ?: "")
+                        .put("tool_use_id", sanitizeAnthropicToolId(m.toolCallId))
                         .put("content", m.content.ifEmpty { "(empty)" })
                     val target = lastToolResultMsg
                     if (target != null) {
@@ -267,7 +351,7 @@ class LlmClient(
                             content.put(
                                 JSONObject()
                                     .put("type", "tool_use")
-                                    .put("id", tc.id)
+                                    .put("id", sanitizeAnthropicToolId(tc.id))
                                     .put("name", tc.name)
                                     .put("input", parseObj(tc.argumentsJson))
                             )
@@ -322,7 +406,7 @@ class LlmClient(
         }
         root.put("messages", msgs)
 
-        if (provider.supportsTools && req.tools.isNotEmpty()) {
+        if (flags.nativeTools && req.tools.isNotEmpty()) {
             val toolsArr = JSONArray()
             for (t in req.tools) {
                 toolsArr.put(
@@ -607,7 +691,7 @@ class LlmClient(
         }
         root.put("messages", messagesArr)
 
-        if (provider.supportsTools && req.tools.isNotEmpty()) {
+        if (flags.nativeTools && req.tools.isNotEmpty()) {
             val toolsArr = JSONArray()
             for (t in req.tools) {
                 toolsArr.put(
@@ -909,7 +993,7 @@ class LlmClient(
         }
         root.put("contents", contents)
 
-        if (provider.supportsTools && req.tools.isNotEmpty()) {
+        if (flags.nativeTools && req.tools.isNotEmpty()) {
             val decls = JSONArray()
             for (t in req.tools) {
                 decls.put(

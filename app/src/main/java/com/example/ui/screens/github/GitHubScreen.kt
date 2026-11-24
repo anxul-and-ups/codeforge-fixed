@@ -82,13 +82,19 @@ fun GitHubScreen(
     chatViewModel: ChatViewModel,
     projectRepository: com.example.data.repository.ProjectRepository,
     onOpenBuilds: () -> Unit,
+    app: com.example.CodeForgeApp? = null,
+    onOpenCodebase: () -> Unit = {},
+    onOpenChat: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val resolvedApp = app ?: (context.applicationContext as com.example.CodeForgeApp)
     val scope = rememberCoroutineScope()
     val uiState by chatViewModel.uiState.collectAsState()
     val project = uiState.activeProject
     val logLines by manager.log.lines.collectAsState()
+    val clonedRepos by resolvedApp.clonedRepoManager.repos.collectAsState()
+    var activeSection by remember { mutableIntStateOf(0) } // 0 = GitHub, 1 = CLONED
 
     // account state
     var accountsVersion by remember { mutableIntStateOf(0) }
@@ -176,7 +182,45 @@ fun GitHubScreen(
             )
         }
 
-        if (accounts.isEmpty()) {
+        // ------------- Section Switcher: GitHub | CLONED -------------
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .background(AppColors.surface)
+                .border(1.dp, AppColors.border, RoundedCornerShape(12.dp))
+                .padding(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            listOf("GitHub", "CLONED (${clonedRepos.size})").forEachIndexed { idx, label ->
+                val selected = activeSection == idx
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(9.dp))
+                        .background(if (selected) AppColors.accentSoft else Color.Transparent)
+                        .clickable { activeSection = idx }
+                        .padding(vertical = 8.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = label,
+                        fontSize = 13.sp,
+                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                        color = if (selected) AppColors.accent else AppColors.textSecondary
+                    )
+                }
+            }
+        }
+
+        if (activeSection == 1) {
+            ClonedReposSection(
+                app = resolvedApp,
+                chatViewModel = chatViewModel,
+                onOpenInCodeEditor = onOpenCodebase,
+                onOpenInChat = onOpenChat
+            )
+        } else if (accounts.isEmpty()) {
             ConnectForm(
                 manager = manager,
                 title = null,

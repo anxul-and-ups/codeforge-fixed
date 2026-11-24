@@ -25,7 +25,8 @@ class GitHubManager(
     private val projects: ProjectRepository,
     val log: GitLogStore,
     private val buildLogs: BuildLogStore,
-    private val scope: CoroutineScope
+    private val scope: CoroutineScope,
+    private val clonedRepoManager: com.example.data.repository.ClonedRepoManager? = null
 ) {
     private val profileCache = HashMap<String, GhUser>()
 
@@ -121,6 +122,14 @@ class GitHubManager(
                 projects.createProject(repo.name, "Empty")
             }
             settings.linkRepo(project.id, repo.fullName)
+            clonedRepoManager?.registerClonedRepo(
+                name = repo.name,
+                url = "https://github.com/${repo.fullName}",
+                localPath = project.rootPath,
+                description = repo.description,
+                branch = repo.defaultBranch.ifBlank { "main" },
+                projectId = project.id
+            )
             log.ok("Cloned ${repo.fullName} (${project.fileCount} files)")
             return project
         } catch (e: Exception) {

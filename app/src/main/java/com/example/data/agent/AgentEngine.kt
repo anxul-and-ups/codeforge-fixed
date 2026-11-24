@@ -65,7 +65,8 @@ enum class AgentMode { CHAT, BUILD }
 
 private val READ_ONLY_TOOLS = setOf(
     "list_files", "find_files", "read_file", "search_code", "discover_skills_and_repos",
-    "web_search", "list_localhost_servers", "run_command", "ask_user"
+    "web_search", "list_localhost_servers", "run_command", "ask_user",
+    "list_uploaded_files", "index_codebase", "list_cloned_repos"
 )
 
 enum class WorkingFileState(val label: String) {
@@ -149,8 +150,32 @@ class AgentEngine(
     private val githubManager: GitHubManager,
     private val manualEditTracker: ManualEditTracker = ManualEditTracker(),
     private val webSearchClient: com.example.data.api.WebSearchClient = com.example.data.api.WebSearchClient(),
-    private val localhostServerManager: com.example.data.termux.LocalhostServerManager = com.example.data.termux.LocalhostServerManager()
+    private val localhostServerManager: com.example.data.termux.LocalhostServerManager = com.example.data.termux.LocalhostServerManager(),
+    private val globalMemoryStore: GlobalMemoryStore = GlobalMemoryStore(appContext),
+    private val uploadedFileManager: com.example.data.repository.UploadedFileManager = com.example.data.repository.UploadedFileManager(appContext),
+    private val clonedRepoManager: com.example.data.repository.ClonedRepoManager = com.example.data.repository.ClonedRepoManager(appContext)
 ) {
+    companion object {
+        private val STOP_PHRASES = setOf(
+            "stop", "cancel", "abort", "halt", "stop now", "stop working", "stop it", "stop please",
+            "stop agent", "stop task", "cancel task", "cancel this task", "cancel it", "abort task",
+            "ruk", "ruk jao", "ruko", "roko", "band karo", "bas karo", "bas", "chhod do", "mat karo",
+            "stop karo", "cancel karo", "abort karo", "/stop", "/cancel"
+        )
+
+        /** Detects explicit user stop/cancel intent (English & Hinglish) immediately. */
+        fun isStopCommand(rawText: String): Boolean {
+            val clean = rawText.trim().lowercase()
+                .replace(Regex("[!.?,]+$"), "")
+                .replace(Regex("\\s+"), " ")
+            if (clean.isEmpty()) return false
+            if (clean in STOP_PHRASES) return true
+            return clean.startsWith("stop ") && clean.length <= 28 &&
+                (clean.contains("task") || clean.contains("working") || clean.contains("now") || clean.contains("everything") || clean.contains("this")) ||
+                clean.startsWith("cancel ") && clean.length <= 28 &&
+                (clean.contains("task") || clean.contains("this") || clean.contains("now") || clean.contains("everything") || clean.contains("run"))
+        }
+    }
     private val _agentEvents = MutableSharedFlow<AgentEvent>(extraBufferCapacity = 8192)
     val agentEvents = _agentEvents.asSharedFlow()
 
@@ -251,6 +276,43 @@ class AgentEngine(
         // Kill whatever is running inside Termux right now, otherwise the command keeps running
         // after Stop and the cancelled run waits for the blocking HTTP call to return.
         termuxBridge.killAllRunningCommands()
+    }
+
+    /** Immediately cancels any active task, clears pending approvals, marks task CANCELLED, and reports preserved work. */
+    suspend fun cancelAndConfirmStop(projectId: String, conversationId: String, userText: String) {
+        val wasRunning = _isRunning.value
+        val preserved = _workingFiles.value.map { it.path }.distinct()
+        if (wasRunning) {
+            stop()
+        } else {
+            pendingDecision?.cancel()
+            pendingDecision = null
+            _approvalRequest.value = null
+            termuxBridge.killAllRunningCommands()
+        }
+        globalMemoryStore.finishTask(projectId, conversationId, GlobalTaskStatus.CANCELLED)
+        val reply = buildString {
+            if (wasRunning) {
+                append("⏹ **Task stopped.** Cancelled active execution, pending approvals, and running commands.")
+            } else {
+                append("⏹ **Stopped.** No active task is running.")
+            }
+            if (preserved.isNotEmpty()) {
+                append("\n\nAlready-completed file changes preserved: ")
+                append(preserved.take(10).joinToString(", ") { "`$it`" })
+            }
+            append("\n\nTell me your next instruction whenever you're ready.")
+        }
+        messageDao.insertMessage(
+            MessageEntity(
+                id = UUID.randomUUID().toString(),
+                conversationId = conversationId,
+                sender = "ASSISTANT",
+                content = reply,
+                status = "SUCCESS"
+            )
+        )
+        _agentEvents.tryEmit(AgentEvent.Finished("Stopped by user", 0))
     }
 
     fun resolveApproval(approved: Boolean) {
@@ -774,6 +836,7 @@ PYEOF
 
     private suspend fun buildSystemPrompt(
         projectId: String,
+        conversationId: String,
         projectName: String,
         projectPrompt: String?,
         mode: AgentMode,
@@ -800,6 +863,9 @@ HOW TO UNDERSTAND THE USER
         val termuxOnline = termuxBridge.status.value.engineRunning
         val manualEditsBlock = manualEditTracker.buildAgentContextBlock(projectId)
         val activeServersSummary = localhostServerManager.formatActiveServers()
+        val globalMemoryBlock = globalMemoryStore.buildSharedContextPrompt(projectId, conversationId)
+        val uploadedFilesBlock = uploadedFileManager.buildAgentContextBlock(projectId, conversationId)
+        val clonedReposBlock = clonedRepoManager.buildAgentSummary()
         val projectFilesPreview = try {
             val rels = projectRepository.listAllRelativeFiles(projectId)
             if (rels.isEmpty()) "" else {
@@ -839,6 +905,14 @@ CLAUDE CODE-LEVEL ENGINEERING & DEBUGGING ARCHITECTURE
   - You have deep Termux ARM64 expertise (pkg/apt, python, node, git, build tools, storage permissions, non-interactive flags `-y`).
   - LOCALHOST WEB HOSTING: When asked to host/serve a site locally in Termux, create/verify the files, call `start_localhost_server(port=..., cwd=...)` which launches in the background and tracks its PID, and return the active `http://localhost:<port>` URL. When the user asks to stop the server, call `stop_localhost_server` to cleanly terminate the tracked PID.
   - NETWORK & MIRROR AUTO-FIX: If Termux encounters connection errors with GitHub or package repositories (IPv6 stalls, DNS failures, `Failed to connect`, dead apt/pkg mirrors), FIRST call `ask_user` to ask the user's permission to apply a network/mirror fix, and once approved, automatically force IPv4 (`curl -4`, `git -c http.version=HTTP/1.1` / `-4`), switch Termux mirrors (`termux-change-repo` or update `${'$'}PREFIX/etc/apt/sources.list`), or fix DNS settings.
+- UPLOADED FILES & ASSET REPLACEMENT (CRITICAL):
+  - Every file/image uploaded by the user is persisted to real internal storage and listed under UPLOADED USER FILES below.
+  - NEVER invent fake Termux paths for uploaded images/files.
+  - Use `import_uploaded_file(file_id_or_name, dest_path)` to copy exact bytes (PNG/JPG/WEBP/SVG/fonts/code/assets) into ANY nested path inside the active project.
+  - Use `replace_app_icon(file_id_or_name)` when asked to replace an Android project's app launcher icon with an uploaded image — it automatically updates adaptive foreground/background XMLs and all 5 density mipmap icons using the EXACT uploaded image!
+- CODEBASE INDEXING & CLONED REPOSITORIES:
+  - Call `index_codebase` to discover the real build system, entry points, dependencies, and class/function symbols without guessing paths.
+  - Call `list_cloned_repos` or `import_cloned_repo` to inspect and integrate cloned repositories directly into the active project.
 - NON-BLOCKING EXECUTION:
   - Never run interactive prompts (`read`, `vim`, `nano`, `less`) or foreground servers in `run_command`.
   - If a path, repo, or requirement is ambiguous, call `ask_user` instead of guessing or looping.
@@ -889,6 +963,15 @@ RULES
             """.trimIndent()
         )
 
+        if (globalMemoryBlock.isNotBlank()) {
+            sb.append("\n\n").append(globalMemoryBlock)
+        }
+        if (uploadedFilesBlock.isNotBlank()) {
+            sb.append("\n\n").append(uploadedFilesBlock)
+        }
+        if (clonedReposBlock.isNotBlank()) {
+            sb.append("\n\n").append(clonedReposBlock)
+        }
         if (projectFilesPreview.isNotBlank()) {
             sb.append("\n\nACTIVE WORKSPACE SNAPSHOT:\n").append(projectFilesPreview)
         }
@@ -1023,7 +1106,17 @@ RULES
             }
         }
 
-        val systemPrompt = buildSystemPrompt(project.id, project.name, project.systemPrompt, req.mode, hasProject)
+        globalMemoryStore.beginTask(
+            projectId = project.id,
+            projectName = project.name,
+            projectRootPath = project.rootPath,
+            conversationId = req.conversationId,
+            userPrompt = prompt,
+            modelName = settings.preferredProviderId.orEmpty(),
+            linkedRepo = settings.repoFor(project.id).orEmpty()
+        )
+
+        val systemPrompt = buildSystemPrompt(project.id, req.conversationId, project.name, project.systemPrompt, req.mode, hasProject)
         val activeTools = if (req.mode == AgentMode.CHAT) {
             toolsList.filter { it.name in READ_ONLY_TOOLS }
         } else {
@@ -1302,6 +1395,20 @@ RULES
                     var toolText = result.text
                     if (toolText.length > 14_000) toolText = toolText.take(14_000) + "\n[result truncated]"
 
+                    // Persist tool outcome into model-independent GlobalMemoryStore
+                    globalMemoryStore.recordToolAction(
+                        projectId = req.projectId,
+                        projectName = project.name,
+                        projectRootPath = project.rootPath,
+                        conversationId = req.conversationId,
+                        modelUsed = modelName ?: providerName ?: "",
+                        toolName = call.name,
+                        targetPath = result.filePath ?: "",
+                        summary = result.diffSummary ?: result.text.lineSequence().firstOrNull().orEmpty(),
+                        isError = result.isError,
+                        modifiedPaths = result.touched
+                    )
+
                     // Post-execution LoopGuard check with the REAL result of every tool
                     if (settings.loopGuardEnabled && call.name != "finish" && call.name != "ask_user" && call.name != "plan") {
                         val d = loopGuard.recordStep(
@@ -1316,13 +1423,17 @@ RULES
                             _agentEvents.tryEmit(AgentEvent.NoteAdded(d.activityNote.ifBlank { "Trying a different approach…" }))
                             val reread = d.forceReadFile
                             if (reread != null) {
-                                val targetPath = resolveTermuxCwd(reread)
-                                val rereadRes = termuxBridge.execCommand(
-                                    command = "nl -ba ${shellEscapeSingleQuotes(targetPath)} | sed -n '1,250p'",
-                                    cwd = TermuxBridge.TERMUX_HOME,
-                                    timeoutSec = 20
-                                )
-                                val fullFileNow = if (rereadRes.exitCode == 0) rereadRes.stdout.take(8000) else ""
+                                val fullFileNow = if (shouldUseLocalCodebase(req.projectId, reread)) {
+                                    try { projectRepository.readFile(req.projectId, cleanPath(reread), 1, 250).take(8000) } catch (_: Exception) { "" }
+                                } else {
+                                    val targetPath = resolveTermuxCwd(reread)
+                                    val rereadRes = termuxBridge.execCommand(
+                                        command = "nl -ba ${shellEscapeSingleQuotes(targetPath)} | sed -n '1,250p'",
+                                        cwd = TermuxBridge.TERMUX_HOME,
+                                        timeoutSec = 20
+                                    )
+                                    if (rereadRes.exitCode == 0) rereadRes.stdout.take(8000) else ""
+                                }
                                 toolText += "\n\n${d.systemInjection}\nCurrent file content with line numbers:\n$fullFileNow"
                             } else {
                                 toolText += "\n\n${d.systemInjection}"
@@ -1368,6 +1479,7 @@ RULES
             }
         } catch (e: CancellationException) {
             withContext(NonCancellable) {
+                globalMemoryStore.finishTask(req.projectId, req.conversationId, GlobalTaskStatus.CANCELLED, modelName.orEmpty())
                 finalizeMessage(
                     assistantId, req.conversationId,
                     (fullText.toString() + "\n\n⏹ Stopped by user.").trim(),
@@ -1388,6 +1500,7 @@ RULES
             } else {
                 rawMsg
             }
+            globalMemoryStore.finishTask(req.projectId, req.conversationId, GlobalTaskStatus.FAILED, modelName.orEmpty(), msg)
             val displayContent = if (isRateLimit) {
                 msg
             } else {
@@ -1417,6 +1530,13 @@ RULES
         }
         errorText?.let { body.append("\n\n⚠️ ").append(it) }
 
+        globalMemoryStore.finishTask(
+            req.projectId,
+            req.conversationId,
+            if (errorText != null) GlobalTaskStatus.FAILED else GlobalTaskStatus.COMPLETED,
+            modelName.orEmpty(),
+            errorText
+        )
         finalizeMessage(
             assistantId, req.conversationId, body.toString().trim().ifEmpty { "(no response)" },
             reasoningAll.toString(), if (errorText != null) "ERROR" else "SUCCESS",
@@ -2026,7 +2146,7 @@ PYEOF
                     val targetPath = resolveTermuxCwd(rawPath)
                     val t0 = System.currentTimeMillis()
                     val originalContent: String? = if (useLocal) {
-                        try { projectRepository.readFile(projectId, path) } catch (_: Exception) { null }
+                        try { projectRepository.readFileRaw(projectId, path) } catch (_: Exception) { null }
                     } else {
                         val (c, readRes) = readTermuxFileRaw(targetPath)
                         if (c == null) {
@@ -2067,12 +2187,19 @@ PYEOF
                     }
                     val syntaxWarn: String?
                     if (useLocal) {
-                        projectRepository.writeFile(projectId, path, patchedContent)
+                        globalMemoryStore.withFileLock(projectId, path) {
+                            projectRepository.writeFile(projectId, path, patchedContent)
+                        }
                         syntaxWarn = null
                     } else {
                         val writeRes = writeTermuxFileAtomic(targetPath, patchedContent)
                         if (writeRes.exitCode != 0) {
                             return formatBridgeToolResult(writeRes, stepType = "EDIT", filePath = path)
+                        }
+                        runCatching {
+                            globalMemoryStore.withFileLock(projectId, path) {
+                                projectRepository.writeFile(projectId, path, patchedContent)
+                            }
                         }
                         syntaxWarn = validatePatchedSyntax(targetPath)
                     }
@@ -2125,7 +2252,7 @@ PYEOF
                     val replaceAll = args.optBoolean("replace_all", false)
                     val t0 = System.currentTimeMillis()
                     val originalContent: String? = if (useLocal) {
-                        try { projectRepository.readFile(projectId, path) } catch (_: Exception) { null }
+                        try { projectRepository.readFileRaw(projectId, path) } catch (_: Exception) { null }
                     } else {
                         val (c, readRes) = readTermuxFileRaw(targetPath)
                         if (c == null) {
@@ -2171,12 +2298,19 @@ PYEOF
                     }
                     val syntaxWarn: String?
                     if (useLocal) {
-                        projectRepository.writeFile(projectId, path, updatedContent)
+                        globalMemoryStore.withFileLock(projectId, path) {
+                            projectRepository.writeFile(projectId, path, updatedContent)
+                        }
                         syntaxWarn = null
                     } else {
                         val writeRes = writeTermuxFileAtomic(targetPath, updatedContent)
                         if (writeRes.exitCode != 0) {
                             return formatBridgeToolResult(writeRes, stepType = "EDIT", filePath = path)
+                        }
+                        runCatching {
+                            globalMemoryStore.withFileLock(projectId, path) {
+                                projectRepository.writeFile(projectId, path, updatedContent)
+                            }
                         }
                         syntaxWarn = validatePatchedSyntax(targetPath)
                     }
@@ -2226,7 +2360,7 @@ PYEOF
                     val content = args.getString("content")
                     val t0 = System.currentTimeMillis()
                     val originalContent: String? = if (useLocal) {
-                        try { projectRepository.readFile(projectId, path) } catch (_: Exception) { null }
+                        try { projectRepository.readFileRaw(projectId, path) } catch (_: Exception) { null }
                     } else {
                         val (c, readRes) = readTermuxFileRaw(targetPath)
                         if (c == null) return formatBridgeToolResult(readRes, stepType = "EDIT", filePath = path)
@@ -2242,11 +2376,18 @@ PYEOF
                         insertAfterLine = lineNum
                     )
                     if (useLocal) {
-                        projectRepository.writeFile(projectId, path, updatedContent)
+                        globalMemoryStore.withFileLock(projectId, path) {
+                            projectRepository.writeFile(projectId, path, updatedContent)
+                        }
                     } else {
                         val writeRes = writeTermuxFileAtomic(targetPath, updatedContent)
                         if (writeRes.exitCode != 0) {
                             return formatBridgeToolResult(writeRes, stepType = "EDIT", filePath = path)
+                        }
+                        runCatching {
+                            globalMemoryStore.withFileLock(projectId, path) {
+                                projectRepository.writeFile(projectId, path, updatedContent)
+                            }
                         }
                     }
                     val unifiedDiff = SurgicalPatchEngine.generateUnifiedDiff(path, originalContent, updatedContent)
@@ -2290,7 +2431,7 @@ PYEOF
                     val content = args.getString("content")
                     val t0 = System.currentTimeMillis()
                     val originalContent: String? = if (useLocal) {
-                        try { projectRepository.readFile(projectId, path) } catch (_: Exception) { null }
+                        try { projectRepository.readFileRaw(projectId, path) } catch (_: Exception) { null }
                     } else {
                         val (c, readRes) = readTermuxFileRaw(targetPath)
                         if (c == null) return formatBridgeToolResult(readRes, stepType = "EDIT", filePath = path)
@@ -2307,11 +2448,18 @@ PYEOF
                         replaceEndLine = endLine
                     )
                     if (useLocal) {
-                        projectRepository.writeFile(projectId, path, updatedContent)
+                        globalMemoryStore.withFileLock(projectId, path) {
+                            projectRepository.writeFile(projectId, path, updatedContent)
+                        }
                     } else {
                         val writeRes = writeTermuxFileAtomic(targetPath, updatedContent)
                         if (writeRes.exitCode != 0) {
                             return formatBridgeToolResult(writeRes, stepType = "EDIT", filePath = path)
+                        }
+                        runCatching {
+                            globalMemoryStore.withFileLock(projectId, path) {
+                                projectRepository.writeFile(projectId, path, updatedContent)
+                            }
                         }
                     }
                     val unifiedDiff = SurgicalPatchEngine.generateUnifiedDiff(path, originalContent, updatedContent)
@@ -2354,7 +2502,7 @@ PYEOF
                     val t0 = System.currentTimeMillis()
 
                     val existingContent: String? = if (useLocal) {
-                        try { projectRepository.readFile(projectId, path) } catch (_: Exception) { null }
+                        try { projectRepository.readFileRaw(projectId, path) } catch (_: Exception) { null }
                     } else {
                         readTermuxFileRaw(targetPath).first
                     }
@@ -2362,12 +2510,19 @@ PYEOF
 
                     val syntaxWarn: String?
                     if (useLocal) {
-                        projectRepository.writeFile(projectId, path, content)
+                        globalMemoryStore.withFileLock(projectId, path) {
+                            projectRepository.writeFile(projectId, path, content)
+                        }
                         syntaxWarn = null
                     } else {
                         val writeRes = writeTermuxFileAtomic(targetPath, content)
                         if (writeRes.exitCode != 0) {
                             return formatBridgeToolResult(writeRes, stepType = "EDIT", filePath = path)
+                        }
+                        runCatching {
+                            globalMemoryStore.withFileLock(projectId, path) {
+                                projectRepository.writeFile(projectId, path, content)
+                            }
                         }
                         syntaxWarn = validatePatchedSyntax(targetPath)
                     }
@@ -2495,6 +2650,15 @@ PYEOF
                         cwd = TermuxBridge.TERMUX_HOME,
                         timeoutSec = 120
                     )
+                    if (cloneRes.exitCode == 0) {
+                        clonedRepoManager.registerClonedRepo(
+                            name = repoName,
+                            url = url,
+                            localPath = destPath,
+                            description = "Cloned via git_clone",
+                            branch = "main"
+                        )
+                    }
                     formatBridgeToolResult(
                         cloneRes,
                         stepType = "CMD",
@@ -2726,6 +2890,135 @@ PYEOF
                     val note = args.getString("note")
                     projectRepository.appendLearnedProjectNote(projectId, note)
                     ToolResult("Updated AGENT.md with: $note", stepType = "EDIT", filePath = "AGENT.md")
+                }
+                "create_directory" -> {
+                    val rawPath = args.getString("path")
+                    val path = cleanPath(rawPath)
+                    if (shouldUseLocalCodebase(projectId, rawPath)) {
+                        val msg = projectRepository.createDirectory(projectId, path)
+                        return ToolResult(msg, changed = true, filePath = path, stepType = "EDIT")
+                    }
+                    val targetPath = resolveTermuxCwd(rawPath)
+                    val execRes = termuxBridge.execCommand("mkdir -p ${shellEscapeSingleQuotes(targetPath)}", cwd = TermuxBridge.TERMUX_HOME, timeoutSec = 30)
+                    formatBridgeToolResult(execRes, stepType = "EDIT", filePath = path, changed = true)
+                }
+                "copy_path" -> {
+                    val rawSrc = args.getString("source_path")
+                    val rawDst = args.getString("dest_path")
+                    val src = cleanPath(rawSrc)
+                    val dst = cleanPath(rawDst)
+                    if (shouldUseLocalCodebase(projectId, rawSrc) && shouldUseLocalCodebase(projectId, rawDst)) {
+                        val msg = globalMemoryStore.withFileLock(projectId, dst) {
+                            projectRepository.copyPath(projectId, src, dst)
+                        }
+                        recordWorkingFile(dst, WorkingFileState.CREATED)
+                        return ToolResult(msg, changed = true, touched = listOf(dst), filePath = dst, stepType = "EDIT")
+                    }
+                    val s = resolveTermuxCwd(rawSrc)
+                    val d = resolveTermuxCwd(rawDst)
+                    val execRes = termuxBridge.execCommand(
+                        "mkdir -p \$(dirname ${shellEscapeSingleQuotes(d)}) && cp -r ${shellEscapeSingleQuotes(s)} ${shellEscapeSingleQuotes(d)}",
+                        cwd = TermuxBridge.TERMUX_HOME,
+                        timeoutSec = 60
+                    )
+                    if (execRes.exitCode == 0) recordWorkingFile(dst, WorkingFileState.CREATED)
+                    formatBridgeToolResult(execRes, stepType = "EDIT", filePath = dst, changed = true, touched = listOf(dst))
+                }
+                "list_uploaded_files" -> {
+                    val block = uploadedFileManager.buildAgentContextBlock(projectId)
+                    ToolResult(
+                        text = block.ifBlank { "No uploaded files found yet. The user can attach images, code, ZIPs, or binary assets using the paperclip button." },
+                        stepType = "SEARCH"
+                    )
+                }
+                "import_uploaded_file" -> {
+                    val idOrName = args.optString("file_id_or_name", "").trim()
+                    val destPath = cleanPath(args.getString("dest_path"))
+                    val record = uploadedFileManager.resolve(idOrName, projectId)
+                        ?: return ToolResult(
+                            "Uploaded file '$idOrName' not found. Call `list_uploaded_files` to inspect available uploaded files.",
+                            isError = true,
+                            stepType = "EDIT"
+                        )
+                    val rootDir = projectRepository.getRootDir(projectId)
+                        ?: return ToolResult("Active project root directory not found.", isError = true, stepType = "EDIT")
+                    globalMemoryStore.withFileLock(projectId, destPath) {
+                        uploadedFileManager.copyIntoProject(record, rootDir, destPath)
+                        projectRepository.refreshProjectStats(projectId)
+                    }
+                    recordWorkingFile(destPath, WorkingFileState.CREATED, "Imported ${record.originalName}")
+                    ToolResult(
+                        text = "Copied exact uploaded file `${record.originalName}` (${record.sizeBytes} bytes, ${record.mimeType}) -> `$destPath`.",
+                        changed = true,
+                        touched = listOf(destPath),
+                        filePath = destPath,
+                        diffSummary = "Imported binary/file",
+                        commandText = "import_uploaded_file ${record.originalName} -> $destPath",
+                        stepType = "EDIT"
+                    )
+                }
+                "replace_app_icon" -> {
+                    val idOrName = args.optString("file_id_or_name", "").trim()
+                    val record = uploadedFileManager.resolve(idOrName, projectId)
+                        ?: return ToolResult(
+                            "Uploaded image '$idOrName' not found. Call `list_uploaded_files` to inspect available uploaded images.",
+                            isError = true,
+                            stepType = "EDIT"
+                        )
+                    val rootDir = projectRepository.getRootDir(projectId)
+                        ?: return ToolResult("Active project root directory not found.", isError = true, stepType = "EDIT")
+                    val updatedPaths = uploadedFileManager.replaceAndroidLauncherIcons(rootDir, record.file)
+                    projectRepository.refreshProjectStats(projectId)
+                    updatedPaths.forEach { recordWorkingFile(it, WorkingFileState.EDITED, "Launcher icon") }
+                    ToolResult(
+                        text = "Replaced Android launcher icons using the EXACT uploaded image `${record.originalName}`.\nUpdated ${updatedPaths.size} resource files:\n" +
+                            updatedPaths.joinToString("\n") { "- $it" },
+                        changed = true,
+                        touched = updatedPaths,
+                        diffSummary = "${updatedPaths.size} icon files",
+                        commandText = "replace_app_icon ${record.originalName}",
+                        stepType = "EDIT"
+                    )
+                }
+                "index_codebase" -> {
+                    val query = args.optString("symbol_query", "").trim().ifBlank { null }
+                    val rootDir = projectRepository.getRootDir(projectId)
+                        ?: return ToolResult("Active project directory not found.", isError = true, stepType = "SEARCH")
+                    val report = com.example.data.repository.CodebaseIndexer.indexProject(rootDir, query)
+                    ToolResult(
+                        text = report.formatForAgent(),
+                        commandText = if (query != null) "index_codebase \"$query\"" else "index_codebase",
+                        stepType = "SEARCH"
+                    )
+                }
+                "list_cloned_repos" -> {
+                    clonedRepoManager.refreshAll()
+                    val summary = clonedRepoManager.buildAgentSummary()
+                    ToolResult(
+                        text = summary.ifBlank { "No cloned repositories registered yet. Use `git_clone` or clone via the GitHub tab." },
+                        stepType = "SEARCH"
+                    )
+                }
+                "import_cloned_repo" -> {
+                    val repoQuery = args.getString("repo_id_or_name").trim()
+                    val targetSubdir = args.optString("target_subdir", "").trim()
+                    val overwrite = args.optBoolean("overwrite", true)
+                    val rootDir = projectRepository.getRootDir(projectId)
+                        ?: return ToolResult("Active project root not found.", isError = true, stepType = "EDIT")
+                    if (!awaitApproval("import_cloned_repo", "Import cloned repository '$repoQuery' into `${targetSubdir.ifBlank { "project root" }}`?")) {
+                        return ToolResult("User cancelled repository import.", isError = true, stepType = "EDIT")
+                    }
+                    val report = clonedRepoManager.importIntoProject(repoQuery, rootDir, targetSubdir, overwrite)
+                    projectRepository.refreshProjectStats(projectId)
+                    report.samplePaths.forEach { recordWorkingFile(it, WorkingFileState.CREATED, "Imported repo") }
+                    ToolResult(
+                        text = report.toSummary(),
+                        changed = (report.copiedCount + report.overwrittenCount) > 0,
+                        touched = report.samplePaths,
+                        diffSummary = "+${report.copiedCount} / ~${report.overwrittenCount}",
+                        commandText = "import_cloned_repo $repoQuery",
+                        stepType = "EDIT"
+                    )
                 }
                 else -> ToolResult("Error: unknown tool '${call.name}'", true)
             }
@@ -2970,6 +3263,62 @@ PYEOF
             description = "Push the active project Codebase directly to a GitHub repository and watch GitHub Actions builds.",
             parametersJsonSchema = """
                 {"type":"object","properties":{"repo":{"type":"string","description":"GitHub repository as 'owner/repo' (uses linked repo if omitted)"},"message":{"type":"string","description":"Commit message"}},"required":[]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "create_directory",
+            description = "Create a directory (and any missing parent directories) inside the active project codebase.",
+            parametersJsonSchema = """
+                {"type":"object","properties":{"path":{"type":"string","description":"Relative directory path to create"}},"required":["path"]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "copy_path",
+            description = "Copy a file or folder recursively to a new path inside the active project codebase.",
+            parametersJsonSchema = """
+                {"type":"object","properties":{"source_path":{"type":"string"},"dest_path":{"type":"string"}},"required":["source_path","dest_path"]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "list_uploaded_files",
+            description = "List all user-uploaded files, images, and assets stored in persistent internal app storage with their exact file IDs and local paths.",
+            parametersJsonSchema = """
+                {"type":"object","properties":{},"required":[]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "import_uploaded_file",
+            description = "Copy an uploaded user file or binary image/asset (exact original bytes) from persistent upload storage directly into any path inside the active project.",
+            parametersJsonSchema = """
+                {"type":"object","properties":{"file_id_or_name":{"type":"string","description":"Uploaded file ID (e.g. up_xxxx) or original filename"},"dest_path":{"type":"string","description":"Destination relative path inside the active project (e.g. app/src/main/res/drawable/logo.png)"}},"required":["file_id_or_name","dest_path"]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "replace_app_icon",
+            description = "Replace an Android project's launcher icon across drawable-nodpi, adaptive icon XMLs, and all 5 density mipmap folders (square + round PNGs) using an EXACT uploaded image.",
+            parametersJsonSchema = """
+                {"type":"object","properties":{"file_id_or_name":{"type":"string","description":"Uploaded image ID or filename (leave blank to use the most recently uploaded image)"}},"required":[]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "index_codebase",
+            description = "Index the real project directory to return verified stack/build system, entry points, config manifests, top directories, and class/function/export symbol locations.",
+            parametersJsonSchema = """
+                {"type":"object","properties":{"symbol_query":{"type":"string","description":"Optional class, function, composable, or symbol name to search for"}},"required":[]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "list_cloned_repos",
+            description = "List all cloned repositories stored in the CLONED Repositories Manager with local paths, branches, file counts, and sizes.",
+            parametersJsonSchema = """
+                {"type":"object","properties":{},"required":[]}
+            """.trimIndent()
+        ),
+        LlmTool(
+            name = "import_cloned_repo",
+            description = "Import files from a cloned repository directly into the active project (root or target subdirectory).",
+            parametersJsonSchema = """
+                {"type":"object","properties":{"repo_id_or_name":{"type":"string","description":"Cloned repo ID or name"},"target_subdir":{"type":"string","description":"Optional relative destination folder inside active project"},"overwrite":{"type":"boolean","description":"Overwrite existing matching files (default true)"}},"required":["repo_id_or_name"]}
             """.trimIndent()
         ),
         LlmTool(

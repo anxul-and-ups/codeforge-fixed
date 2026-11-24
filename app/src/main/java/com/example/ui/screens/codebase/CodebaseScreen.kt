@@ -106,6 +106,7 @@ fun CodebaseScreen(
     val primaryFiles by chatViewModel.codebaseFiles.collectAsState()
     val isLoading by chatViewModel.codebaseLoading.collectAsState()
     val openedFile by chatViewModel.openedFileViewer.collectAsState()
+    val openFileTabs by chatViewModel.openFileTabs.collectAsState()
     val clipboardItem by chatViewModel.clipboardItem.collectAsState()
     val secondaryProject by chatViewModel.secondaryProject.collectAsState()
     val secondaryFiles by chatViewModel.secondaryFiles.collectAsState()
@@ -169,10 +170,13 @@ fun CodebaseScreen(
         primaryFiles.map { it.path }.filter { it.endsWith(".html", ignoreCase = true) || it.endsWith(".htm", ignoreCase = true) }
     }
 
-    // Editable Code Viewer / Editor Dialog
+    // High-Performance Multi-Tab Syntax-Highlighted Code Viewer & Inline Editor
     openedFile?.let { viewer ->
-        EditableCodeFileDialog(
+        AdvancedCodeEditorDialog(
             state = viewer,
+            openTabs = openFileTabs,
+            onSelectTab = { chatViewModel.selectOpenFileTab(it) },
+            onCloseTab = { chatViewModel.closeOpenFileTab(it) },
             onSave = { updated ->
                 val pid = viewer.projectId.ifBlank { activeProject?.id.orEmpty() }
                 if (pid.isNotBlank()) {
@@ -1029,9 +1033,7 @@ private fun CodebaseFileListPane(
 }
 
 /**
- * Full-screen Code Viewer & Inline Editor.
- * Tapping "Edit" unlocks inline editing; tapping "Save" persists to disk and automatically records
- * a Manual Edit entry so the AI agent knows the exact user diff on the very next turn.
+ * Compatibility delegate forwarding to [AdvancedCodeEditorDialog].
  */
 @Composable
 fun EditableCodeFileDialog(
@@ -1040,178 +1042,13 @@ fun EditableCodeFileDialog(
     onDownload: () -> Unit,
     onClose: () -> Unit
 ) {
-    val clipboard = LocalClipboardManager.current
-    var isEditing by remember(state.path) { mutableStateOf(false) }
-    var draftText by remember(state.path, state.content) { mutableStateOf(state.content) }
-    val hasUnsaved = isEditing && draftText != state.content
-
-    Dialog(
-        onDismissRequest = onClose,
-        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)
-    ) {
-        Surface(
-            color = AppColors.bg,
-            modifier = Modifier
-                .fillMaxSize()
-                .statusBarsPadding()
-        ) {
-            Column(modifier = Modifier.fillMaxSize()) {
-                // Header
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(AppColors.surface)
-                        .padding(horizontal = 10.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = state.fileName,
-                            fontSize = 15.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = AppColors.textPrimary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        Text(
-                            text = state.path,
-                            fontSize = 11.sp,
-                            fontFamily = FontFamily.Monospace,
-                            color = AppColors.textMuted,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-
-                    if (!state.isLoading && state.error == null) {
-                        if (isEditing) {
-                            Surface(
-                                shape = RoundedCornerShape(9.dp),
-                                color = if (hasUnsaved) AppColors.accent else AppColors.surfaceAlt,
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(9.dp))
-                                    .clickable {
-                                        onSave(draftText)
-                                        isEditing = false
-                                    }
-                                    .testTag("code_editor_save_button")
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Icon(
-                                        Icons.Default.Save,
-                                        contentDescription = "Save",
-                                        tint = if (hasUnsaved) AppColors.onAccent else AppColors.textSecondary,
-                                        modifier = Modifier.size(15.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text(
-                                        text = "Save",
-                                        fontSize = 12.sp,
-                                        fontWeight = FontWeight.SemiBold,
-                                        color = if (hasUnsaved) AppColors.onAccent else AppColors.textSecondary
-                                    )
-                                }
-                            }
-                        } else {
-                            IconButton(
-                                onClick = { isEditing = true },
-                                modifier = Modifier.size(38.dp).testTag("code_editor_edit_button")
-                            ) {
-                                Icon(Icons.Default.Edit, contentDescription = "Edit file", tint = AppColors.accent, modifier = Modifier.size(19.dp))
-                            }
-                            IconButton(
-                                onClick = { clipboard.setText(AnnotatedString(state.content)) },
-                                modifier = Modifier.size(38.dp)
-                            ) {
-                                Icon(Icons.Default.ContentCopy, contentDescription = "Copy all", tint = AppColors.textSecondary, modifier = Modifier.size(18.dp))
-                            }
-                            IconButton(
-                                onClick = onDownload,
-                                modifier = Modifier.size(38.dp)
-                            ) {
-                                Icon(Icons.Default.Download, contentDescription = "Download", tint = AppColors.textSecondary, modifier = Modifier.size(18.dp))
-                            }
-                        }
-                    }
-
-                    IconButton(onClick = onClose, modifier = Modifier.size(38.dp)) {
-                        Icon(Icons.Default.Close, contentDescription = "Close editor", tint = AppColors.textPrimary, modifier = Modifier.size(20.dp))
-                    }
-                }
-
-                Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(AppColors.border))
-
-                when {
-                    state.isLoading -> {
-                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                            CircularProgressIndicator(modifier = Modifier.size(28.dp), color = AppColors.accent)
-                        }
-                    }
-                    state.error != null -> {
-                        Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
-                            Text(state.error, fontSize = 13.sp, color = AppColors.error)
-                        }
-                    }
-                    isEditing -> {
-                        TextField(
-                            value = draftText,
-                            onValueChange = { draftText = it },
-                            textStyle = TextStyle(
-                                fontFamily = FontFamily.Monospace,
-                                fontSize = 12.5.sp,
-                                lineHeight = 19.sp,
-                                color = AppColors.textPrimary
-                            ),
-                            colors = TextFieldDefaults.colors(
-                                focusedContainerColor = AppColors.codeBg,
-                                unfocusedContainerColor = AppColors.codeBg,
-                                focusedIndicatorColor = Color.Transparent,
-                                unfocusedIndicatorColor = Color.Transparent,
-                                cursorColor = AppColors.accent
-                            ),
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .testTag("code_editor_textfield")
-                        )
-                    }
-                    else -> {
-                        val lines = remember(state.content) { state.content.lines() }
-                        val hScroll = rememberScrollState()
-                        LazyColumn(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .background(AppColors.codeBg),
-                            contentPadding = PaddingValues(vertical = 10.dp)
-                        ) {
-                            items(lines.size) { idx ->
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .horizontalScroll(hScroll)
-                                        .padding(horizontal = 10.dp, vertical = 1.dp)
-                                ) {
-                                    Text(
-                                        text = "${idx + 1}".padStart(4, ' '),
-                                        fontFamily = FontFamily.Monospace,
-                                        fontSize = 11.5.sp,
-                                        color = AppColors.textMuted
-                                    )
-                                    Spacer(modifier = Modifier.width(10.dp))
-                                    Text(
-                                        text = lines[idx],
-                                        fontFamily = FontFamily.Monospace,
-                                        fontSize = 12.sp,
-                                        color = AppColors.textPrimary
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    AdvancedCodeEditorDialog(
+        state = state,
+        openTabs = listOf(state),
+        onSelectTab = {},
+        onCloseTab = { onClose() },
+        onSave = onSave,
+        onDownload = onDownload,
+        onClose = onClose
+    )
 }

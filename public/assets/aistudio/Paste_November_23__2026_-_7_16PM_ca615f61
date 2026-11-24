@@ -1,0 +1,1113 @@
+# 🚀 MASTER DIRECTIVE: COMPLETE AI AGENT & CODEBASE UPGRADE
+
+## OBJECTIVE
+
+I want you to perform a complete technical overhaul of this application.
+
+The application still contains numerous bugs, limitations, broken workflows, and architectural problems that prevent the AI agent from working like a professional autonomous coding agent.
+
+Your task is to investigate the ENTIRE existing codebase, identify all existing problems, fix them, and implement the upgrades described below.
+
+IMPORTANT:
+- Do not just explain what needs to be changed.
+- Actually inspect and modify the existing source code.
+- Do not implement superficial workarounds.
+- Fix the root causes of problems.
+- Preserve all existing working features.
+- Do not remove existing functionality unnecessarily.
+- Maintain compatibility with the existing application architecture.
+
+This is a complete engineering upgrade, not a minor bug-fixing task.
+
+---
+
+# 1. GLOBAL MEMORY & MULTI-MODEL CONTEXT SYSTEM
+
+## Current Problem
+
+Every AI model currently appears to have its own separate memory inside the same conversation.
+
+For example:
+
+1. I asked Model A to change my application icon.
+2. I provided the correct file path.
+3. Model A understood the project and its directory structure.
+4. I switched to Model B in the same conversation.
+5. Model B started searching for the old file path or used outdated project information.
+
+This creates serious problems when switching models during an ongoing project.
+
+## Required Implementation
+
+Create a centralized, persistent conversation and project context system.
+
+### Requirements:
+
+- Every model must share the same conversation context.
+- All models must access the latest project information.
+- Model switching must never reset project memory.
+- Every model must receive the latest user instructions.
+- File paths must remain synchronized across models.
+- Previous tool results must be available to subsequent models.
+- Project modifications must be reflected immediately in shared context.
+- Uploaded files and their actual storage locations must remain accessible.
+- Repository information must be shared between all models.
+
+### Shared Context Should Include:
+
+1. Complete conversation history.
+2. Current project information.
+3. Current repository location.
+4. Project directory structure.
+5. Recently modified files.
+6. Uploaded file references.
+7. Active tasks.
+8. Previous tool executions.
+9. Latest file paths.
+10. User instructions and preferences.
+11. Current task progress.
+12. Pending operations.
+13. Error information.
+
+### Important:
+
+Implement a model-independent memory layer.
+
+The memory should belong to the conversation/project session, NOT to an individual AI model.
+
+If I switch between Gemini, GPT, Claude, DeepSeek, Groq, or any other model, the new model must continue exactly where the previous model stopped.
+
+Never allow outdated paths or stale project information to override newer information.
+
+---
+
+# 2. ADVANCED FILESYSTEM ACCESS & PROJECT FILE EDITING
+
+## Current Problem
+
+The AI agent cannot reliably edit files inside the actual project codebase.
+
+Even when I explicitly instruct it to modify an existing file, it sometimes fails to locate or edit it.
+
+## Required Implementation
+
+Give the agent reliable, permission-controlled access to the actual project filesystem.
+
+It must be capable of:
+
+- Reading files.
+- Creating new files.
+- Editing existing files.
+- Replacing complete file contents.
+- Deleting files when explicitly authorized.
+- Renaming files.
+- Moving files.
+- Creating directories.
+- Importing files.
+- Copying directories.
+- Extracting archives.
+- Modifying multiple files.
+- Working with nested directories.
+- Updating project configurations.
+- Updating dependencies and source code.
+
+### File Editing Capabilities
+
+If I say:
+
+"Replace the code in this file with the new code."
+
+The agent must:
+
+1. Identify the correct file.
+2. Read its existing contents.
+3. Understand its purpose.
+4. Apply the requested changes.
+5. Preserve unrelated functionality.
+6. Save the changes to the actual file.
+7. Verify that the file was modified successfully.
+
+It must not simply generate replacement code in the chat.
+
+The actual codebase must be updated.
+
+### Multi-file Editing
+
+If a feature requires modifications across multiple files, the agent must identify all relevant dependencies and update them consistently.
+
+Do not restrict the agent to editing only one file at a time.
+
+---
+
+# 3. UPLOADED FILES: REAL FILESYSTEM INTEGRATION
+
+## Current Problem
+
+When I upload an image or file inside the conversation, the agent sometimes receives an incorrect or transformed file path.
+
+For example:
+
+I upload an application icon.
+
+The agent receives the uploaded image but tries to locate it using an unrelated path through Termux.
+
+That path does not even exist on my phone.
+
+This breaks the entire workflow.
+
+## Required Implementation
+
+Create a reliable uploaded-file management system.
+
+### Requirements:
+
+- Every uploaded file must have a persistent file reference.
+- Maintain its original filename.
+- Maintain its MIME type.
+- Maintain its actual storage location.
+- Maintain its file ID.
+- Maintain its size.
+- Maintain its upload timestamp.
+- Provide the agent with a valid filesystem-accessible reference.
+
+### Critical Rule
+
+Never invent file paths.
+
+Never assume that a file exists inside Termux.
+
+Never convert an internal attachment reference into an unrelated Android filesystem path.
+
+The agent must use the actual file reference provided by the application.
+
+### Uploaded File Operations
+
+The agent must support:
+
+- Import uploaded files into the project.
+- Replace existing project files with uploaded files.
+- Extract code from uploaded files.
+- Replace existing file contents.
+- Add uploaded source files to the codebase.
+- Import images and assets.
+- Import ZIP archives.
+- Import cloned repositories.
+- Handle multiple uploaded files together.
+
+If I upload an icon and say:
+
+"Replace my application icon with this."
+
+The agent must use the EXACT uploaded image.
+
+It must not regenerate the icon, modify its appearance, or use another image.
+
+It should locate the Android application icon resources, identify all required icon variants, and replace them while maintaining the existing project configuration.
+
+---
+
+# 4. ADVANCED REPOSITORY MANAGEMENT
+
+## Current Problem
+
+The agent cannot properly work with cloned repositories or import external repositories into the existing project.
+
+Even when I provide a cloned repository, it fails to integrate it into the actual codebase.
+
+## Required Implementation
+
+Build a complete repository management system.
+
+### Repository Operations
+
+The agent must be capable of:
+
+- Cloning repositories.
+- Opening cloned repositories.
+- Reading repository structures.
+- Importing repository files.
+- Integrating cloned code into an existing project.
+- Merging selected directories.
+- Resolving file conflicts.
+- Understanding repository dependencies.
+- Reading README files.
+- Understanding package configurations.
+- Working with Git branches.
+- Understanding commits.
+- Managing repository changes.
+
+### Import Existing Repository
+
+If I provide a cloned repository and say:
+
+"Import this repository into my current codebase."
+
+The agent must:
+
+1. Identify the repository location.
+2. Read its directory structure.
+3. Understand its framework and architecture.
+4. Identify the files required for integration.
+5. Inspect dependencies and configurations.
+6. Identify conflicts with the existing project.
+7. Integrate the required files.
+8. Update necessary configurations.
+9. Preserve existing application functionality.
+
+Do not merely display the repository contents.
+
+Actually integrate the requested code.
+
+---
+
+# 5. NEW FEATURE: CLONED REPOSITORIES MANAGER
+
+Wherever repositories are cloned in the application, create a new dedicated option named:
+
+## CLONED
+
+This section should display all repositories cloned by the user.
+
+### Repository Cards
+
+Each cloned repository should have:
+
+- Repository name.
+- Repository URL.
+- Repository description (if available).
+- Local storage location.
+- Total repository size.
+- Clone date.
+- Clone time.
+- Last modified date.
+- Current Git branch (if available).
+
+### Repository Actions
+
+Each repository should support:
+
+1. Open.
+2. View files.
+3. Import into current project.
+4. Delete.
+5. Rename.
+6. Refresh.
+7. Copy path.
+8. Open in code editor.
+
+### UI Requirements
+
+Create a modern, professional repository management interface.
+
+Include:
+
+- Search functionality.
+- Sorting.
+- Repository count.
+- Total storage usage.
+- Empty state.
+- Loading states.
+- Error handling.
+
+Repository information must persist after restarting the application.
+
+Do not lose cloned repository metadata.
+
+---
+
+# 6. UNLOCK FULL AVAILABLE CODING CAPABILITIES FOR ALL MODELS
+
+## Current Problem
+
+Custom models do not appear to use their actual coding capabilities.
+
+They behave like ordinary chat models instead of professional coding agents.
+
+## Required Implementation
+
+Enable the full coding workflow for every supported model and provider.
+
+Supported providers may include:
+
+- OpenAI / GPT.
+- Google Gemini.
+- Anthropic / Claude.
+- DeepSeek.
+- Groq.
+- OpenRouter.
+- Qwen.
+- Mistral.
+- Cohere.
+- xAI.
+- Custom OpenAI-compatible APIs.
+- Any future custom provider.
+
+### Important
+
+Do not create separate, limited coding systems for different providers.
+
+Implement a unified coding-agent architecture.
+
+Every compatible model should receive access to the tools and capabilities supported by its provider and the application.
+
+### Coding Tools
+
+Provide the following capabilities wherever technically supported:
+
+- Filesystem access.
+- Code reading.
+- Code writing.
+- File editing.
+- Multi-file editing.
+- Repository exploration.
+- Terminal execution.
+- Git operations.
+- File imports.
+- Project analysis.
+- Dependency management.
+- Error analysis.
+- Code refactoring.
+- Architecture understanding.
+- Documentation generation.
+- HTML/CSS/JS development.
+- Android development.
+- Python development.
+- Java/Kotlin development.
+
+### Provider Compatibility
+
+Implement a common tool-calling interface.
+
+Handle differences in:
+
+- Tool calling formats.
+- Function calling.
+- Streaming responses.
+- Structured outputs.
+- Context windows.
+- Provider-specific API formats.
+- Tool execution responses.
+
+If a model does not support native tool calling, implement an appropriate compatible orchestration mechanism where feasible.
+
+Never falsely report that a model has capabilities its provider does not support.
+
+### Most Important
+
+The model must not be artificially restricted by the application when its provider supports the required functionality.
+
+The application should expose the maximum legitimate coding capabilities available through each model and provider.
+
+Never bypass provider restrictions, API permissions, or safety controls.
+
+---
+
+# 7. STOP COMMAND & TASK CANCELLATION SYSTEM
+
+## Current Problem
+
+When the agent is working on a project and I send a STOP message, it sometimes continues executing the previous task.
+
+This is unacceptable.
+
+## Required Implementation
+
+Build a reliable task cancellation system.
+
+### STOP Command
+
+When I send messages such as:
+
+- Stop.
+- Cancel.
+- Abort.
+- Ruk jao.
+- Band karo.
+- Stop working.
+- Cancel this task.
+
+The agent must immediately recognize the cancellation intent.
+
+### Cancellation Workflow
+
+1. Stop generating new tool calls.
+2. Cancel the active model generation if supported.
+3. Cancel pending operations.
+4. Terminate cancellable terminal processes.
+5. Stop queued file operations.
+6. Prevent new modifications.
+7. Preserve already completed work.
+8. Report the current task status.
+
+Do not silently continue the previous task.
+
+### Important
+
+The agent must understand messages contextually.
+
+If it is working on Project A and I write something unrelated, it must understand whether I am:
+
+- Giving a new instruction.
+- Asking a question.
+- Modifying the current task.
+- Changing the task.
+- Asking it to stop.
+- Providing additional project information.
+
+Do not interpret every new message as an instruction to continue the previous operation.
+
+Implement task-state management with proper cancellation tokens and execution control.
+
+---
+
+# 8. ADVANCED TERMINAL & EXECUTION TRANSPARENCY
+
+## Current Problem
+
+I cannot properly understand what the agent is executing in the terminal.
+
+I want to see the complete coding process.
+
+## Required Implementation
+
+Create an advanced live execution interface.
+
+Whenever the agent performs terminal operations, show the execution process.
+
+### Display:
+
+- Command being executed.
+- Working directory.
+- Execution status.
+- Process ID where available.
+- Start time.
+- Execution duration.
+- Standard output.
+- Standard error.
+- Exit code.
+- Completion status.
+
+### Execution States
+
+Use clear states:
+
+- Queued.
+- Running.
+- Waiting.
+- Completed.
+- Failed.
+- Cancelled.
+
+### Live Terminal
+
+Provide:
+
+- Live output streaming.
+- Expandable terminal view.
+- Command history.
+- Copy command.
+- Copy output.
+- Error highlighting.
+- Clear terminal.
+- Process status.
+
+### Important
+
+Do not fake terminal output.
+
+Show actual commands and their real execution results.
+
+The agent must also understand which directory it is currently working in.
+
+Never execute commands against an incorrect project directory.
+
+Sensitive information such as API keys, passwords, and tokens must be redacted from displayed logs.
+
+---
+
+# 9. FIX REPOSITORY EXPLORATION & CODEBASE UNDERSTANDING
+
+## Current Problem
+
+The agent is not using the actual repository properly.
+
+It sometimes fails to understand the project structure and makes incorrect assumptions.
+
+## Required Implementation
+
+Create a robust codebase exploration system.
+
+### Before Modifying Any Project:
+
+The agent should be capable of understanding:
+
+1. Project root.
+2. Directory structure.
+3. Main entry points.
+4. Source directories.
+5. Dependencies.
+6. Configuration files.
+7. Build system.
+8. Existing architecture.
+9. Related components.
+10. Existing implementations.
+
+### Repository Indexing
+
+Implement efficient project indexing.
+
+The agent should be able to search:
+
+- Files.
+- Classes.
+- Functions.
+- Variables.
+- Imports.
+- Components.
+- Dependencies.
+- Configuration references.
+- Related implementations.
+
+### Context Optimization
+
+Do not unnecessarily load the entire repository into every model request.
+
+Use intelligent context retrieval to provide relevant files and dependencies.
+
+However, never omit important dependencies when performing multi-file changes.
+
+### Critical Rule
+
+Always use the actual repository as the source of truth.
+
+Do not hallucinate file structures, filenames, or existing implementations.
+
+---
+
+# 10. HTML VIEWER — COMPLETE FIX
+
+## Current Problem
+
+The HTML viewer is not working properly.
+
+## Required Implementation
+
+Fix the entire HTML viewing system.
+
+Support:
+
+- HTML files.
+- CSS.
+- JavaScript.
+- Local assets.
+- Images.
+- Fonts.
+- Relative file paths.
+- Multiple HTML pages.
+- Responsive layouts.
+
+### Viewer Features
+
+Implement:
+
+- Live HTML preview.
+- Refresh.
+- Full-screen mode.
+- Desktop/mobile preview.
+- Zoom controls.
+- Error handling.
+- JavaScript console where supported.
+- Local asset resolution.
+
+### Important
+
+HTML files should render like actual webpages.
+
+Do not simply display raw HTML source code inside the viewer.
+
+Preserve the security restrictions of the WebView while supporting legitimate local project assets.
+
+---
+
+# 11. ADVANCED CODEBASE FILE VIEWER
+
+## Current Problem
+
+Files inside the codebase do not display smoothly.
+
+There is noticeable lag, scrolling problems, and an incomplete viewing experience.
+
+## Required Implementation
+
+Completely improve the code editor and file viewer.
+
+### Features
+
+- Smooth scrolling.
+- Syntax highlighting.
+- Line numbers.
+- Proper indentation.
+- Code folding.
+- Search inside files.
+- Find and replace.
+- Word wrapping.
+- Horizontal scrolling.
+- Vertical scrolling.
+- File tabs.
+- Multiple open files.
+- File modification indicators.
+- Dark theme.
+- Proper text selection.
+- Copy/paste support.
+
+### Syntax Highlighting
+
+Enable syntax highlighting for:
+
+- HTML.
+- CSS.
+- JavaScript.
+- TypeScript.
+- JSON.
+- XML.
+- Markdown.
+- Python.
+- Java.
+- Kotlin.
+- Java/C++.
+- PHP.
+- SQL.
+- YAML.
+- Shell.
+- Dart.
+- And other commonly used programming languages.
+
+### Performance
+
+The editor must remain responsive even when opening large source files.
+
+Avoid unnecessary full-screen re-rendering.
+
+Use efficient rendering and virtualization where appropriate.
+
+Fix scrolling issues at their root cause.
+
+---
+
+# 12. UNIVERSAL FILE IMPORT & REPLACEMENT SYSTEM
+
+The agent must be capable of working with files uploaded through chat, files already present in the project, and files imported from repositories.
+
+### Supported Operations
+
+If I say:
+
+"Add this file to the codebase."
+
+It must actually add the file.
+
+If I say:
+
+"Replace this existing file with the uploaded file."
+
+It must replace the correct file.
+
+If I say:
+
+"Replace the code inside this file."
+
+It must update the actual source contents.
+
+If I say:
+
+"Import all files from this ZIP."
+
+It must extract and import the relevant files.
+
+### Supported File Types
+
+Support common project file types, including:
+
+- TXT.
+- MD.
+- HTML.
+- CSS.
+- JS.
+- TS.
+- JSON.
+- XML.
+- YAML.
+- Python.
+- Java.
+- Kotlin.
+- SVG.
+- PNG.
+- JPG.
+- WEBP.
+- ZIP.
+- And other supported project assets.
+
+### Important
+
+File operations must work across nested project directories.
+
+Do not assume all files belong in the project root.
+
+Preserve the original directory structure when importing directories or archives.
+
+---
+
+# 13. APPLICATION ICON REPLACEMENT
+
+## IMPORTANT: USE THE EXACT ICON I UPLOADED IN THIS CHAT.
+
+I have already provided the application icon image.
+
+Your task is to replace the existing application icon with that exact image.
+
+### Requirements
+
+1. Locate the existing application icon resources.
+2. Identify all relevant launcher icon configurations.
+3. Use the exact uploaded image.
+4. Generate required Android icon sizes and variants from the same source image.
+5. Maintain image quality.
+6. Preserve the original design.
+7. Update adaptive icons where applicable.
+8. Update foreground/background resources where required.
+9. Update relevant manifest references if necessary.
+10. Remove obsolete icon references only when safe.
+
+### Strict Instructions
+
+- Do not generate a different icon.
+- Do not redesign it.
+- Do not change its visual identity.
+- Do not substitute another image.
+- Do not invent its file path.
+- Use the actual uploaded image reference.
+
+The final application launcher icon must match the image I provided.
+
+---
+
+# 14. ADVANCED TASK MANAGEMENT & AGENT ORCHESTRATION
+
+Build a proper task execution architecture.
+
+The agent should maintain a clear understanding of:
+
+- What task is currently running.
+- Which project is active.
+- Which model is executing the task.
+- Which files are being modified.
+- Which commands are running.
+- What has already been completed.
+- What remains pending.
+- Whether the user has cancelled the task.
+
+### Task Management
+
+Support:
+
+- Task creation.
+- Task updates.
+- Task cancellation.
+- Task resumption where safe.
+- Task history.
+- Execution logs.
+- Error recovery.
+- Multi-step workflows.
+
+### Context Synchronization
+
+If I switch models during a running or paused task, the new model must receive the latest task state.
+
+Never allow two models to unknowingly overwrite each other's work.
+
+Implement proper locking or conflict detection for concurrent file modifications.
+
+---
+
+# 15. ADDITIONAL BUG DISCOVERY & CODE AUDIT
+
+Apart from the bugs mentioned above, I want you to investigate the entire application for other problems.
+
+Do not restrict your investigation to the features listed in this prompt.
+
+Inspect:
+
+- UI components.
+- Navigation.
+- State management.
+- API integrations.
+- Model switching.
+- Conversation management.
+- Memory handling.
+- File management.
+- Repository management.
+- Terminal integration.
+- HTML viewer.
+- Code editor.
+- File uploads.
+- File downloads.
+- Permissions.
+- Background processes.
+- Error handling.
+- Data persistence.
+- Performance.
+- Android-specific behavior.
+
+### Look for:
+
+- Broken functionality.
+- Incorrect file paths.
+- Race conditions.
+- Memory synchronization issues.
+- State inconsistencies.
+- UI freezes.
+- Unnecessary re-rendering.
+- Memory leaks.
+- Unhandled exceptions.
+- Incorrect API responses.
+- Broken tool execution.
+- Missing error handling.
+- Incorrect permission handling.
+- Data loss.
+- Incomplete implementations.
+- Features that appear functional but do not actually work.
+
+Fix the root causes of every issue you identify.
+
+Do not limit yourself to the explicitly mentioned bugs.
+
+---
+
+# 16. UI/UX & PERFORMANCE IMPROVEMENTS
+
+Maintain the existing application design language while improving the overall experience.
+
+The application should feel like a professional AI-powered development environment.
+
+### Requirements
+
+- Smooth interactions.
+- No unnecessary UI lag.
+- Proper loading indicators.
+- Clear execution states.
+- Consistent navigation.
+- Responsive layouts.
+- Proper empty states.
+- Useful error messages.
+- Optimized file rendering.
+- Efficient memory usage.
+
+Do not introduce unnecessary visual changes to unrelated screens.
+
+Focus on functionality, usability, and performance.
+
+---
+
+# 17. TESTING RESTRICTIONS — VERY IMPORTANT
+
+I DO NOT WANT YOU TO RUN TESTS OR BUILDS.
+
+Do not execute:
+
+- Unit tests.
+- Integration tests.
+- UI tests.
+- Instrumentation tests.
+- Full application builds.
+- Gradle build commands.
+- APK generation.
+- Emulator runs.
+- Device installation.
+- Long-running automated test suites.
+
+These operations take too much time.
+
+### What You CAN Do
+
+You may:
+
+- Read source code.
+- Inspect project architecture.
+- Search for bugs.
+- Analyze dependencies.
+- Inspect configurations.
+- Perform static code analysis through source inspection.
+- Review modified files.
+- Check imports and references.
+- Identify potential compilation issues without running builds.
+
+### Strict Rule
+
+Do not run expensive commands or long-running processes.
+
+Do not start any test suite automatically.
+
+Do not generate an APK.
+
+Focus entirely on implementing the requested upgrades and fixing bugs.
+
+---
+
+# 18. IMPLEMENTATION STRATEGY
+
+Do not attempt random modifications.
+
+Follow a structured engineering workflow.
+
+### PHASE 1 — COMPLETE CODEBASE INSPECTION
+
+- Understand the application architecture.
+- Identify important modules.
+- Locate existing implementations.
+- Identify broken workflows.
+- Find root causes.
+- Prepare an internal implementation plan.
+
+### PHASE 2 — CORE ARCHITECTURE FIXES
+
+Prioritize:
+
+1. Shared memory across models.
+2. Project context synchronization.
+3. Reliable filesystem access.
+4. Uploaded file management.
+5. Repository access.
+6. Task cancellation.
+7. Terminal execution.
+
+These are foundational systems.
+
+### PHASE 3 — CODING ENVIRONMENT
+
+Implement:
+
+1. Universal file editing.
+2. Repository integration.
+3. Cloned repositories manager.
+4. Codebase indexing.
+5. Syntax highlighting.
+6. Smooth file viewer.
+7. HTML viewer.
+
+### PHASE 4 — MODEL CAPABILITY UPGRADES
+
+- Unified coding-agent architecture.
+- Provider compatibility.
+- Tool calling.
+- File operations.
+- Terminal access.
+- Context management.
+
+### PHASE 5 — ADDITIONAL BUG FIXES
+
+Inspect the complete application and fix all other identified issues.
+
+### PHASE 6 — ICON REPLACEMENT
+
+Replace the current launcher icon with the exact image uploaded in this conversation.
+
+### PHASE 7 — FINAL STATIC REVIEW
+
+Review all modified files.
+
+Check for:
+
+- Missing imports.
+- Incorrect references.
+- Broken paths.
+- Incomplete implementations.
+- Duplicate logic.
+- Incorrect state handling.
+- Potential compilation problems.
+
+DO NOT RUN TESTS OR BUILDS.
+
+---
+
+# 19. FINAL EXECUTION RULES
+
+These rules are mandatory.
+
+1. Actually modify the source code.
+2. Never pretend that an operation succeeded.
+3. Never invent file paths.
+4. Never use outdated project information.
+5. Never ignore uploaded files.
+6. Never ignore STOP commands.
+7. Never silently continue cancelled tasks.
+8. Never assume repository contents.
+9. Never limit coding capabilities unnecessarily.
+10. Never overwrite unrelated project files.
+11. Never remove existing functionality without justification.
+12. Never perform expensive builds or tests.
+13. Never hide actual terminal execution.
+14. Never report incomplete work as completed.
+
+If a feature requires an architectural change, implement the correct architecture rather than adding temporary patches.
+
+If something is technically impossible because of Android restrictions, provider limitations, or missing permissions, explain the actual limitation and implement the best legitimate alternative.
+
+---
+
+# 20. FINAL EXPECTED RESULT
+
+I want this application to become a genuinely advanced AI-powered autonomous coding environment.
+
+The agent should be able to:
+
+- Understand the entire project.
+- Remember everything across model switches.
+- Work with actual project files.
+- Import uploaded files.
+- Modify complete codebases.
+- Clone and integrate repositories.
+- Execute terminal commands.
+- Display its complete execution process.
+- Understand and obey STOP commands.
+- Work with all compatible AI providers.
+- Use available coding tools.
+- Preview HTML projects.
+- Browse source code smoothly.
+- Highlight programming syntax.
+- Manage cloned repositories.
+- Replace application assets correctly.
+- Discover and fix additional bugs.
+
+The application should behave like a professional AI coding environment rather than a simple chatbot with limited file access.
+
+## FINAL INSTRUCTION
+
+Start by inspecting the existing codebase.
+
+Identify the root causes of the problems.
+
+Then implement the upgrades directly in the actual source code.
+
+Do not stop after creating a plan.
+
+Do not just provide recommendations.
+
+Do not ask me to manually perform operations that the agent can perform itself.
+
+Complete as much of the implementation as possible while respecting the testing restrictions.
+
+At the end, provide a detailed implementation report containing:
+
+1. Bugs discovered.
+2. Root causes identified.
+3. Files modified.
+4. New files created.
+5. Features implemented.
+6. Existing features improved.
+7. Features that could not be implemented and why.
+8. Any remaining issues.
+9. Confirmation that no tests or builds were executed.
+
+REMEMBER:
+
+I want REAL IMPLEMENTATION, NOT JUST EXPLANATIONS.

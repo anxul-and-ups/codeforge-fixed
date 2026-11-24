@@ -74,7 +74,10 @@ data class AttachmentItem(
     val isZip: Boolean = false,
     val isApk: Boolean = false,
     val localArchivePath: String? = null,
-    val pdfBase64: String? = null
+    val pdfBase64: String? = null,
+    val uploadedFileId: String? = null,
+    val uploadedLocalPath: String? = null,
+    val mimeType: String? = null
 )
 
 data class CodebaseFileItem(
@@ -145,6 +148,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _openedFileViewer = MutableStateFlow<CodeFileViewerState?>(null)
     val openedFileViewer: StateFlow<CodeFileViewerState?> = _openedFileViewer.asStateFlow()
+
+    private val _openFileTabs = MutableStateFlow<List<CodeFileViewerState>>(emptyList())
+    val openFileTabs: StateFlow<List<CodeFileViewerState>> = _openFileTabs.asStateFlow()
 
     private val _uiState = MutableStateFlow(
         ChatUiState(
@@ -294,7 +300,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     is AgentEvent.FailoverNotice -> _uiState.update {
                         it.copy(failoverNotice = "Switched to ${event.toProvider} (${event.reason.take(100)})")
                     }
-                    is AgentEvent.ToolStarted, is AgentEvent.ToolFinished -> refreshTick.update { it + 1 }
+                    is AgentEvent.ToolStarted -> refreshTick.update { it + 1 }
+                    is AgentEvent.ToolFinished -> {
+                        refreshTick.update { it + 1 }
+                        if (!event.isError && event.toolName in setOf(
+                                "write_file", "edit_file", "apply_patch", "replace_line_range",
+                                "insert_after_line", "delete_file", "rename_file", "copy_path",
+                                "create_directory", "extract_zip", "import_uploaded_file",
+                                "replace_app_icon", "import_cloned_repo", "git_clone"
+                            )
+                        ) {
+                            refreshCodebaseFiles()
+                        }
+                    }
                     is AgentEvent.Finished -> {
                         flushJob?.cancel()
                         flushJob = null
@@ -479,8 +497,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun openCodebaseFile(item: CodebaseFileItem, projectIdOverride: String? = null) {
-        val targetProjId = projectIdOverride ?: _uiState.value.activeProject?.id ?: com.example.data.repository.ProjectRepository.SCRATCH_ID
-        _openedFileViewer.value = CodeFileViewerState(
+        val activeProj = _uiState.value.activeProject
+        val targetProjId = projectIdOverride ?: activeProj?.id ?: com.example.data.repository.ProjectRepository.SCRATCH_ID
+        val isPrimaryProject = projectIdOverride == null || projectIdOverride == activeProj?.id
+        val loadingState = CodeFileViewerState(
             projectId = targetProjId,
             path = item.path,
             fileName = item.name,
@@ -488,46 +508,113 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             modifiedState = item.modifiedState,
             diffSummary = item.diffSummary
         )
+        _openedFileViewer.value = loadingState
+        _openFileTabs.update { tabs ->
+            val filtered = tabs.filterNot { it.projectId == targetProjId && it.path == item.path }
+            (filtered + loadingState).takeLast(8)
+        }
         viewModelScope.launch {
-            val clean = item.path.trim().removePrefix("./")
+            val rawPath = item.path.trim()
+            val clean = rawPath.removePrefix("./").trimStart('/')
+            var lastErr: String? = null
+
+            // 1. Direct local project read using raw content (no line numbers!)
             var loaded: String? = withContext(Dispatchers.IO) {
                 try {
-                    projectRepo.readFile(targetProjId, clean)
-                } catch (_: Exception) {
+                    projectRepo.readFileRaw(targetProjId, clean)
+                } catch (e: Exception) {
+                    lastErr = e.message
                     null
                 }
             }
-            var lastErr: String? = null
 
-            if (loaded == null && projectIdOverride == null && termuxBridge.status.value.engineRunning) {
+            // 2. Local project directory fallback (handles nested folder or case/prefix mismatch)
+            if (loaded == null) {
+                loaded = withContext(Dispatchers.IO) {
+                    try {
+                        val projRoot = projectRepo.projectDir(targetProjId)
+                        val directFile = java.io.File(projRoot, clean)
+                        val matchedFile = when {
+                            directFile.exists() && directFile.isFile -> directFile
+                            rawPath.startsWith("/") && java.io.File(rawPath).let { f ->
+                                f.exists() && f.isFile && f.canonicalPath.startsWith(app.filesDir.canonicalPath)
+                            } -> java.io.File(rawPath)
+                            else -> {
+                                val skip = setOf(".git", ".gradle", "build", "node_modules")
+                                projRoot.walkTopDown()
+                                    .onEnter { it == projRoot || it.name !in skip }
+                                    .firstOrNull { f ->
+                                        if (!f.isFile) return@firstOrNull false
+                                        val rel = f.relativeTo(projRoot).path.replace(java.io.File.separatorChar, '/')
+                                        rel.equals(clean, ignoreCase = true) ||
+                                            rel.endsWith("/$clean", ignoreCase = true) ||
+                                            f.name.equals(item.name, ignoreCase = true)
+                                    }
+                            }
+                        }
+                        if (matchedFile != null && matchedFile.exists() && matchedFile.isFile) {
+                            if (matchedFile.length() > 2_000_000L) {
+                                "[File is too large to show (${matchedFile.length() / 1024} KB)]"
+                            } else {
+                                matchedFile.readText()
+                            }
+                        } else null
+                    } catch (e: Exception) {
+                        lastErr = e.message ?: lastErr
+                        null
+                    }
+                }
+            }
+
+            // 3. Termux fallback (works even when CodebaseScreen passes activeProject.id AND without requiring python3!)
+            if (loaded == null && isPrimaryProject && termuxBridge.status.value.engineRunning) {
                 val rootPath = activeWorkspaceDirPath()
-                val candidatePaths = buildList {
-                    if (clean.startsWith("/")) add(clean)
-                    else {
-                        add("$rootPath/$clean")
-                        val homePath = "${com.example.data.termux.TermuxBridge.TERMUX_HOME}/$clean"
-                        if (homePath != "$rootPath/$clean") add(homePath)
+                val home = com.example.data.termux.TermuxBridge.TERMUX_HOME
+                val slug = activeProj?.slug?.ifBlank { null }
+                val candidatePaths = linkedSetOf<String>().apply {
+                    if (rawPath.startsWith("/")) add(rawPath)
+                    if (clean.startsWith("data/data/com.termux/") || clean.startsWith("sdcard/") || clean.startsWith("storage/")) {
+                        add("/$clean")
+                    }
+                    add("$rootPath/$clean")
+                    add("$home/$clean")
+                    if (slug != null) {
+                        add("$home/forge/projects/$slug/$clean")
+                        add("$home/$slug/$clean")
                     }
                 }
                 for (abs in candidatePaths) {
                     val escaped = "'" + abs.replace("'", "'\"'\"'") + "'"
-                    val pyCmd = "python3 -c \"import base64,pathlib,sys; p=pathlib.Path($escaped); " +
-                        "sys.exit(2) if not p.is_file() else print(base64.b64encode(p.read_bytes()[:262144]).decode('ascii'))\""
-                    val res = termuxBridge.execCommand(pyCmd, cwd = com.example.data.termux.TermuxBridge.TERMUX_HOME, timeoutSec = 15)
-                    if (res.exitCode == 0 && res.stdout.isNotBlank()) {
-                        loaded = try {
-                            String(Base64.decode(res.stdout.trim(), Base64.DEFAULT), Charsets.UTF_8)
-                        } catch (_: Exception) {
-                            res.stdout
+                    // Pure POSIX shell + base64 (never requires python3 to be installed in Termux!)
+                    val readCmd = "if [ -f $escaped ]; then head -c 524288 $escaped | base64 | tr -d '\\n\\r'; else exit 2; fi"
+                    val res = termuxBridge.execCommand(readCmd, cwd = home, timeoutSec = 15)
+                    if (res.exitCode == 0) {
+                        val b64 = res.stdout.trim()
+                        loaded = if (b64.isEmpty()) {
+                            ""
+                        } else {
+                            try {
+                                String(Base64.decode(b64, Base64.DEFAULT), Charsets.UTF_8)
+                            } catch (_: Exception) {
+                                res.stdout
+                            }
+                        }
+                        // Mirror into local project storage so future opens, edits, and WebView preview work instantly
+                        if (loaded != null && !clean.startsWith("data/data/com.termux/")) {
+                            runCatching {
+                                withContext(Dispatchers.IO) {
+                                    projectRepo.writeFile(targetProjId, clean, loaded!!)
+                                }
+                            }
                         }
                         break
-                    } else if (res.stderr.isNotBlank()) {
+                    } else if (res.stderr.isNotBlank() && res.exitCode != 2) {
                         lastErr = res.stderr.trim()
                     }
                 }
             }
 
-            _openedFileViewer.value = if (loaded != null) {
+            val resolvedState = if (loaded != null) {
                 CodeFileViewerState(
                     projectId = targetProjId,
                     path = item.path,
@@ -543,11 +630,28 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     path = item.path,
                     fileName = item.name,
                     isLoading = false,
-                    error = lastErr ?: "Could not read file from workspace.",
+                    error = lastErr ?: "Could not read file '$clean' from workspace.",
                     modifiedState = item.modifiedState,
                     diffSummary = item.diffSummary
                 )
             }
+            _openedFileViewer.value = resolvedState
+            _openFileTabs.update { tabs ->
+                tabs.map { if (it.projectId == targetProjId && it.path == item.path) resolvedState else it }
+            }
+        }
+    }
+
+    fun selectOpenFileTab(tab: CodeFileViewerState) {
+        _openedFileViewer.value = tab
+    }
+
+    fun closeOpenFileTab(tab: CodeFileViewerState) {
+        val remaining = _openFileTabs.value.filterNot { it.projectId == tab.projectId && it.path == tab.path }
+        _openFileTabs.value = remaining
+        val cur = _openedFileViewer.value
+        if (cur != null && cur.projectId == tab.projectId && cur.path == tab.path) {
+            _openedFileViewer.value = remaining.lastOrNull()
         }
     }
 
@@ -555,14 +659,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         _openedFileViewer.value = null
     }
 
-    /** Saves a user's manual edit inside the Codebase file viewer and records it in ManualEditTracker. */
+    /** Saves a user's manual edit inside the Codebase file viewer and records it in ManualEditTracker + GlobalMemoryStore. */
     fun saveManualFileEdit(projectId: String, relativePath: String, newContent: String) {
         viewModelScope.launch {
             try {
                 val oldContent = withContext(Dispatchers.IO) {
-                    try { projectRepo.readFile(projectId, relativePath) } catch (_: Exception) { null }
+                    try { projectRepo.readFileRaw(projectId, relativePath) } catch (_: Exception) { null }
                 }
-                projectRepo.writeFile(projectId, relativePath, newContent)
+                app.globalMemoryStore.withFileLock(projectId, relativePath) {
+                    projectRepo.writeFile(projectId, relativePath, newContent)
+                }
                 manualEditTracker.recordManualEdit(
                     projectId = projectId,
                     relativePath = relativePath,
@@ -570,10 +676,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     oldContent = oldContent,
                     newContent = newContent
                 )
+                app.globalMemoryStore.recordManualFileChange(projectId, relativePath)
                 _openedFileViewer.update { cur ->
                     if (cur != null && cur.path == relativePath && cur.projectId == projectId) {
                         cur.copy(content = newContent)
                     } else cur
+                }
+                _openFileTabs.update { tabs ->
+                    tabs.map { if (it.path == relativePath && it.projectId == projectId) it.copy(content = newContent) else it }
                 }
                 refreshCodebaseFiles()
                 _uiState.update { it.copy(failoverNotice = "✓ Saved manual edit to $relativePath (synced to agent)") }
@@ -642,7 +752,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             try {
                 val oldContent = withContext(Dispatchers.IO) {
-                    try { projectRepo.readFile(projectId, relativePath) } catch (_: Exception) { null }
+                    try { projectRepo.readFileRaw(projectId, relativePath) } catch (_: Exception) { null }
                 }
                 projectRepo.deleteFile(projectId, relativePath)
                 manualEditTracker.recordManualEdit(
@@ -1092,15 +1202,32 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             resolverType == "application/x-zip-compressed")
         val isPdf = !isImage && (lower.endsWith(".pdf") || resolverType == "application/pdf")
 
+        val curProjId = _uiState.value.activeProject?.id.orEmpty()
+        val curConvId = activeConversationId.value.orEmpty()
+
         viewModelScope.launch {
+            val persisted = app.uploadedFileManager.persistUpload(
+                uri = uri,
+                originalName = displayName,
+                mimeType = resolverType,
+                projectId = curProjId,
+                conversationId = curConvId
+            )
             val item = withContext(Dispatchers.IO) {
                 when {
                     isImage -> {
                         val b64 = encodeImage(uri)
-                        if (b64 == null) null else AttachmentItem(uri, displayName, true, base64Data = b64)
+                        if (b64 == null && persisted == null) null else AttachmentItem(
+                            uri = uri,
+                            name = displayName,
+                            isImage = true,
+                            base64Data = b64,
+                            uploadedFileId = persisted?.id,
+                            uploadedLocalPath = persisted?.localPath,
+                            mimeType = persisted?.mimeType
+                        )
                     }
                     isApk -> {
-                        // Copy APK to outputs dir so RepoToolInstaller can analyze & trigger "Save this source to a project?"
                         val outFile = File(projectRepo.outputsRootDir, "${System.currentTimeMillis()}_$displayName")
                         val copied = try {
                             resolver.openInputStream(uri)?.use { inp ->
@@ -1109,15 +1236,26 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         } catch (_: Exception) {
                             false
                         }
-                        if (!copied) null else AttachmentItem(
+                        if (!copied && persisted == null) null else AttachmentItem(
                             uri = uri,
                             name = displayName,
                             isImage = false,
                             isApk = true,
-                            localArchivePath = outFile.absolutePath
+                            localArchivePath = if (copied) outFile.absolutePath else persisted?.localPath,
+                            uploadedFileId = persisted?.id,
+                            uploadedLocalPath = persisted?.localPath,
+                            mimeType = persisted?.mimeType
                         )
                     }
-                    isZip -> AttachmentItem(uri, displayName, false, isZip = true)
+                    isZip -> AttachmentItem(
+                        uri = uri,
+                        name = displayName,
+                        isImage = false,
+                        isZip = true,
+                        uploadedFileId = persisted?.id,
+                        uploadedLocalPath = persisted?.localPath,
+                        mimeType = persisted?.mimeType
+                    )
                     isPdf -> {
                         val bytes = try {
                             resolver.openInputStream(uri)?.use { it.readBytes() }
@@ -1126,13 +1264,38 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         }
                         if (bytes == null || bytes.size > 15 * 1024 * 1024) null
                         else AttachmentItem(
-                            uri, displayName, false,
-                            pdfBase64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+                            uri = uri,
+                            name = displayName,
+                            isImage = false,
+                            pdfBase64 = Base64.encodeToString(bytes, Base64.NO_WRAP),
+                            uploadedFileId = persisted?.id,
+                            uploadedLocalPath = persisted?.localPath,
+                            mimeType = persisted?.mimeType
                         )
                     }
                     else -> {
                         val text = readTextAttachment(uri, lower)
-                        if (text == null) null else AttachmentItem(uri, displayName, false, textContent = text)
+                        if (text != null) {
+                            AttachmentItem(
+                                uri = uri,
+                                name = displayName,
+                                isImage = false,
+                                textContent = text,
+                                uploadedFileId = persisted?.id,
+                                uploadedLocalPath = persisted?.localPath,
+                                mimeType = persisted?.mimeType
+                            )
+                        } else if (persisted != null) {
+                            // Binary asset (SVG/font/media/etc.) is now fully supported via real internal upload storage!
+                            AttachmentItem(
+                                uri = uri,
+                                name = displayName,
+                                isImage = false,
+                                uploadedFileId = persisted.id,
+                                uploadedLocalPath = persisted.localPath,
+                                mimeType = persisted.mimeType
+                            )
+                        } else null
                     }
                 }
             }
@@ -1140,7 +1303,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 val hint = if (isPdf) {
                     "This PDF is too large (max 15 MB) or could not be read."
                 } else {
-                    "Could not attach \"$displayName\". Supported: images, PDF, APK/AAB, text/code files, .docx and .zip."
+                    "Could not attach \"$displayName\". Try picking the file again."
                 }
                 _uiState.update { it.copy(failoverNotice = hint) }
                 return@launch
@@ -1262,13 +1425,27 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val conv = _uiState.value.activeConversation ?: return
         val attachments = _uiState.value.pendingAttachments
         if (promptText.isBlank() && attachments.isEmpty()) return
-        if (_uiState.value.isPreparing) return
-        if (agentEngine.isRunning.value) {
-            _uiState.update { it.copy(failoverNotice = "The agent is still working. Wait for it or press Stop.") }
+
+        val trimmedInput = promptText.trim()
+
+        // STOP COMMAND INTERCEPT: Always works immediately—even while the agent is running or waiting!
+        if (attachments.isEmpty() && com.example.data.agent.AgentEngine.isStopCommand(trimmedInput)) {
+            saveDraftForCurrentChat("")
+            _uiState.update { it.copy(isPreparing = false, failoverNotice = "⏹ Stopping active task…") }
+            viewModelScope.launch {
+                chatRepo.addUserMessage(conv.id, trimmedInput, status = "SUCCESS")
+                agentEngine.cancelAndConfirmStop(proj.id, conv.id, trimmedInput)
+                _uiState.update { it.copy(failoverNotice = null) }
+            }
             return
         }
 
-        val trimmedInput = promptText.trim()
+        if (_uiState.value.isPreparing) return
+        if (agentEngine.isRunning.value) {
+            _uiState.update { it.copy(failoverNotice = "The agent is still working. Type 'stop' or press Stop to cancel.") }
+            return
+        }
+
         if (attachments.isEmpty() && (trimmedInput.equals("/push", ignoreCase = true) || trimmedInput.equals("/build", ignoreCase = true))) {
             saveDraftForCurrentChat("")
             pushAndBuild()
@@ -1299,6 +1476,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 append("I uploaded the project ZIP \"${zip.name}\". Explore it, summarize what it contains, and ask me what to do next.")
             } else {
                 append("Please look at the attached file(s)/image(s) and help.")
+            }
+            // Give the agent exact real internal file IDs & paths for EVERY uploaded attachment!
+            val persistedAttachments = attachments.filter { !it.uploadedFileId.isNullOrBlank() }
+            if (persistedAttachments.isNotEmpty()) {
+                append("\n\n[Uploaded File References (real persisted files — use import_uploaded_file or replace_app_icon):]")
+                for (a in persistedAttachments) {
+                    append("\n- file_id=${a.uploadedFileId}, name=\"${a.name}\", mime=${a.mimeType ?: "unknown"}, local_path=${a.uploadedLocalPath}")
+                }
             }
             for (f in files) {
                 append("\n\n[Attached file: ${f.name}]\n```\n${f.textContent}\n```")

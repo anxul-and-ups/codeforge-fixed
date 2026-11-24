@@ -21,11 +21,16 @@ class CodeForgeApp : Application() {
 
     val settingsStore by lazy { SettingsStore(this) }
     val database by lazy { AppDatabase.getInstance(this) }
+    val terminalExecutionTracker by lazy { com.example.data.termux.TerminalExecutionTracker() }
+    val globalMemoryStore by lazy { com.example.data.agent.GlobalMemoryStore(this) }
+    val uploadedFileManager by lazy { com.example.data.repository.UploadedFileManager(this) }
+    val clonedRepoManager by lazy { com.example.data.repository.ClonedRepoManager(this) }
     val termuxBridge by lazy {
         TermuxBridge(
             context = this,
             settings = settingsStore,
-            scope = agentScope
+            scope = agentScope,
+            executionTracker = terminalExecutionTracker
         )
     }
     val projectRepository by lazy {
@@ -61,7 +66,8 @@ class CodeForgeApp : Application() {
             projects = projectRepository,
             log = gitLogStore,
             buildLogs = buildLogStore,
-            scope = agentScope
+            scope = agentScope,
+            clonedRepoManager = clonedRepoManager
         )
     }
     val agentEngine by lazy {
@@ -81,7 +87,10 @@ class CodeForgeApp : Application() {
             githubManager = githubManager,
             manualEditTracker = manualEditTracker,
             webSearchClient = webSearchClient,
-            localhostServerManager = localhostServerManager
+            localhostServerManager = localhostServerManager,
+            globalMemoryStore = globalMemoryStore,
+            uploadedFileManager = uploadedFileManager,
+            clonedRepoManager = clonedRepoManager
         )
     }
 

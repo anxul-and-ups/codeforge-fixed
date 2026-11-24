@@ -429,6 +429,9 @@ fun MainScreen(
                             chatViewModel = chatViewModel,
                             projectRepository = app.projectRepository,
                             onOpenBuilds = { currentScreen = Screen.GhBuild },
+                            app = app,
+                            onOpenCodebase = { currentScreen = Screen.Codebase },
+                            onOpenChat = { currentScreen = Screen.Chat },
                             modifier = Modifier.fillMaxSize()
                         )
                     }
